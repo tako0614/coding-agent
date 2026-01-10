@@ -1,0 +1,30 @@
+{
+  "name": "@supervisor/executor-claude",
+  "version": "0.1.0",
+  "description": "Claude Agent SDK Adapter for Supervisor Agent",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@supervisor/protocol": "workspace:*",
+    "@supervisor/tool-runtime": "workspace:*",
+    "@anthropic-ai/claude-agent-sdk": "^0.1.74"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8",
+    "@types/node": "^22.10.2"
+  }
+}

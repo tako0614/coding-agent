@@ -1,0 +1,23 @@
+{
+  "name": "supervisor-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Supervisor Agent - Orchestrating Claude Code and Codex",
+  "scripts": {
+    "build": "pnpm -r build",
+    "build:ui": "pnpm --filter @supervisor/ui build",
+    "dev": "pnpm --filter @supervisor/backend dev",
+    "test": "pnpm -r test",
+    "lint": "pnpm -r lint",
+    "clean": "pnpm -r clean"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "prettier": "^3.4.2",
+    "@types/node": "^22.10.2"
+  },
+  "packageManager": "pnpm@9.15.0",
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

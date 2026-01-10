@@ -1,0 +1,54 @@
+{
+  "name": "@supervisor/backend",
+  "version": "0.1.0",
+  "description": "Supervisor Backend - LangGraph orchestration + OpenAI-compatible API",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "supervisor": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "bundle": "esbuild src/server.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/server.bundle.cjs --external:@langchain/* --packages=bundle",
+    "bundle:standalone": "esbuild src/server.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/server.bundle.cjs --packages=bundle \"--banner:js=if(typeof globalThis.import_meta_url==='undefined'){globalThis.import_meta_url=require('url').pathToFileURL(__filename).href}\" --define:import.meta.url=globalThis.import_meta_url && pkg dist/server.bundle.cjs --target node20-win-x64 --output dist/supervisor-backend.exe",
+    "test": "vitest run",
+    "clean": "rm -rf dist"
+  },
+  "pkg": {
+    "assets": [
+      "public/**/*"
+    ],
+    "outputPath": "dist"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.7",
+    "@langchain/core": "^0.3.26",
+    "@langchain/langgraph": "^0.2.38",
+    "@langchain/openai": "^0.3.0",
+    "@supervisor/executor-claude": "workspace:*",
+    "@supervisor/executor-codex": "workspace:*",
+    "@supervisor/protocol": "workspace:*",
+    "@supervisor/provider-copilot": "workspace:*",
+    "@supervisor/tool-runtime": "workspace:*",
+    "better-sqlite3": "^11.5.0",
+    "hono": "^4.6.14",
+    "node-pty": "^1.1.0",
+    "uuid": "^11.0.3",
+    "ws": "^8.19.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.7",
+    "@types/node": "^22.10.2",
+    "@types/uuid": "^10.0.0",
+    "@types/ws": "^8.18.1",
+    "@yao-pkg/pkg": "^5.15.0",
+    "esbuild": "^0.24.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

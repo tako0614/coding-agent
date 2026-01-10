@@ -1,0 +1,31 @@
+{
+  "name": "@supervisor/tool-runtime",
+  "version": "0.1.0",
+  "description": "Unified tool layer for Shell, Git, FS, and system operations",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@supervisor/protocol": "workspace:*",
+    "execa": "^9.5.2",
+    "glob": "^11.0.0",
+    "simple-git": "^3.27.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8",
+    "@types/node": "^22.10.2"
+  }
+}

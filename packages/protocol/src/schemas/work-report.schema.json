@@ -1,0 +1,169 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://supervisor-agent/schemas/work-report.v1.json",
+  "title": "WorkReport",
+  "description": "Work report from Executor to Supervisor",
+  "type": "object",
+  "required": ["report_id", "order_id", "run_id", "status", "commands_run", "verification"],
+  "properties": {
+    "report_id": {
+      "type": "string",
+      "description": "Unique identifier for this report",
+      "pattern": "^wr_[a-zA-Z0-9]{16}$"
+    },
+    "order_id": {
+      "type": "string",
+      "description": "The work order this report responds to",
+      "pattern": "^wo_[a-zA-Z0-9]{16}$"
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Parent run identifier",
+      "pattern": "^run_[a-zA-Z0-9]{16}$"
+    },
+    "executor": {
+      "type": "string",
+      "enum": ["codex", "claude"],
+      "description": "Which executor produced this report"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["done", "blocked", "failed", "needs_input"],
+      "description": "Current status of the work"
+    },
+    "summary": {
+      "type": "string",
+      "description": "Human-readable summary of what was done"
+    },
+    "changes": {
+      "type": "object",
+      "properties": {
+        "files_created": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "files_modified": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "files_deleted": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "diff_patch": {
+          "type": "string",
+          "description": "Unified diff of all changes"
+        }
+      }
+    },
+    "commands_run": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["cmd", "exit_code"],
+        "properties": {
+          "cmd": {
+            "type": "string",
+            "description": "Command that was executed"
+          },
+          "exit_code": {
+            "type": "integer",
+            "description": "Exit code of the command"
+          },
+          "stdout": {
+            "type": "string",
+            "description": "Standard output (may be truncated)"
+          },
+          "stderr": {
+            "type": "string",
+            "description": "Standard error (may be truncated)"
+          },
+          "duration_ms": {
+            "type": "integer",
+            "description": "Execution time in milliseconds"
+          }
+        }
+      },
+      "description": "Commands executed during the work"
+    },
+    "verification": {
+      "type": "object",
+      "required": ["passed"],
+      "properties": {
+        "passed": {
+          "type": "boolean",
+          "description": "Executor's self-assessment of verification (advisory only)"
+        },
+        "details": {
+          "type": "string",
+          "description": "Details about verification results"
+        }
+      }
+    },
+    "questions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["question"],
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "Question requiring human decision"
+          },
+          "options": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Possible answers (if applicable)"
+          },
+          "context": {
+            "type": "string",
+            "description": "Additional context for the question"
+          }
+        }
+      },
+      "description": "Questions that need human input to proceed"
+    },
+    "error": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "Error code for programmatic handling"
+        },
+        "message": {
+          "type": "string",
+          "description": "Human-readable error message"
+        },
+        "stack": {
+          "type": "string",
+          "description": "Stack trace if available"
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "completed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "tokens_used": {
+          "type": "object",
+          "properties": {
+            "input": { "type": "integer" },
+            "output": { "type": "integer" }
+          }
+        },
+        "model": {
+          "type": "string",
+          "description": "Model used by the executor"
+        }
+      }
+    }
+  },
+  "additionalProperties": false
+}

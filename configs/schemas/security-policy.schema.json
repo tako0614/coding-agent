@@ -1,0 +1,114 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://supervisor-agent/schemas/security-policy.v1.json",
+  "title": "SecurityPolicy",
+  "description": "Security policy configuration for Supervisor Agent",
+  "type": "object",
+  "required": ["version", "shell", "filesystem", "network", "approval"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "shell": {
+      "type": "object",
+      "properties": {
+        "allowlist": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Commands that are always allowed"
+        },
+        "denylist": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Commands/patterns that are always denied"
+        },
+        "argument_patterns": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "forbidden_flags": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "require_confirmation": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            }
+          }
+        },
+        "max_execution_time_ms": {
+          "type": "integer",
+          "minimum": 1000
+        },
+        "max_output_size_bytes": {
+          "type": "integer",
+          "minimum": 1024
+        }
+      }
+    },
+    "filesystem": {
+      "type": "object",
+      "properties": {
+        "write_roots": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "forbidden_paths": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "max_file_size_bytes": {
+          "type": "integer"
+        }
+      }
+    },
+    "network": {
+      "type": "object",
+      "properties": {
+        "default_policy": {
+          "type": "string",
+          "enum": ["allow", "deny"]
+        },
+        "allowed_hosts": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "allowed_ports": {
+          "type": "array",
+          "items": { "type": "integer" }
+        }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "properties": {
+        "always_require": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "auto_approve": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "sandbox": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "container_image": { "type": ["string", "null"] },
+        "resource_limits": {
+          "type": "object",
+          "properties": {
+            "memory_mb": { "type": "integer" },
+            "cpu_cores": { "type": "integer" },
+            "disk_mb": { "type": "integer" }
+          }
+        }
+      }
+    }
+  }
+}

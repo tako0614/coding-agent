@@ -1,0 +1,176 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://supervisor-agent/schemas/work-order.v1.json",
+  "title": "WorkOrder",
+  "description": "Work order from Supervisor to Executor (Claude Code / Codex)",
+  "type": "object",
+  "required": ["order_id", "run_id", "task_kind", "repo", "objective", "acceptance_criteria", "verification", "tooling"],
+  "properties": {
+    "order_id": {
+      "type": "string",
+      "description": "Unique identifier for this work order",
+      "pattern": "^wo_[a-zA-Z0-9]{16}$"
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Parent run identifier",
+      "pattern": "^run_[a-zA-Z0-9]{16}$"
+    },
+    "parent_order_id": {
+      "type": "string",
+      "description": "Parent work order ID (for debug/follow-up orders)",
+      "pattern": "^wo_[a-zA-Z0-9]{16}$"
+    },
+    "task_kind": {
+      "type": "string",
+      "enum": ["spec", "implement", "debug", "refactor", "test", "review"],
+      "description": "Type of task to perform"
+    },
+    "repo": {
+      "type": "object",
+      "required": ["path"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Absolute or relative path to the repository"
+        },
+        "branch": {
+          "type": "string",
+          "description": "Target branch for changes"
+        },
+        "base_commit": {
+          "type": "string",
+          "description": "Base commit SHA for diff tracking"
+        }
+      }
+    },
+    "objective": {
+      "type": "string",
+      "description": "Clear description of what needs to be done"
+    },
+    "background": {
+      "type": "string",
+      "description": "Context, previous attempts, error logs (especially for debug tasks)"
+    },
+    "constraints": {
+      "type": "object",
+      "properties": {
+        "allowed_paths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Glob patterns for paths the executor may modify"
+        },
+        "forbidden_paths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Glob patterns for paths the executor must NOT modify"
+        },
+        "dependency_policy": {
+          "type": "string",
+          "enum": ["allow", "existing_only", "deny"],
+          "default": "existing_only",
+          "description": "Policy for adding new dependencies"
+        },
+        "network_policy": {
+          "type": "string",
+          "enum": ["allow", "deny"],
+          "default": "deny",
+          "description": "Policy for network access during execution"
+        }
+      }
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1,
+      "description": "List of criteria that must be met for the task to be considered complete"
+    },
+    "verification": {
+      "type": "object",
+      "required": ["commands"],
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["cmd"],
+            "properties": {
+              "cmd": {
+                "type": "string",
+                "description": "Command to run for verification"
+              },
+              "working_dir": {
+                "type": "string",
+                "description": "Working directory for the command (relative to repo.path)"
+              },
+              "must_pass": {
+                "type": "boolean",
+                "default": true,
+                "description": "Whether this command must succeed for verification to pass"
+              },
+              "timeout_ms": {
+                "type": "integer",
+                "default": 300000,
+                "description": "Timeout in milliseconds"
+              }
+            }
+          },
+          "description": "Commands to run for automated verification"
+        }
+      }
+    },
+    "tooling": {
+      "type": "object",
+      "properties": {
+        "sandbox": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether to run in sandbox mode"
+        },
+        "approval_required": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether to require manual approval for dangerous operations"
+        },
+        "write_roots": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Directories where file writes are allowed"
+        },
+        "rate_limit": {
+          "type": "object",
+          "properties": {
+            "max_tokens_per_minute": { "type": "integer" },
+            "max_requests_per_minute": { "type": "integer" }
+          }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "default": 5
+        },
+        "retry_count": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        },
+        "max_retries": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 3
+        }
+      }
+    }
+  },
+  "additionalProperties": false
+}

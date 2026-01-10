@@ -1,0 +1,4 @@
+packages:
+  - 'packages/*'
+  - 'apps/supervisor-backend'
+  - 'apps/supervisor-ui'

@@ -1,0 +1,119 @@
+{
+  "$schema": "../schemas/security-policy.schema.json",
+  "version": "1.0.0",
+  "shell": {
+    "allowlist": [
+      "npm",
+      "npx",
+      "pnpm",
+      "yarn",
+      "node",
+      "tsc",
+      "vitest",
+      "jest",
+      "eslint",
+      "prettier",
+      "git",
+      "cat",
+      "head",
+      "tail",
+      "grep",
+      "find",
+      "ls",
+      "pwd",
+      "echo",
+      "mkdir",
+      "cp",
+      "mv",
+      "touch"
+    ],
+    "denylist": [
+      "rm -rf /",
+      "rm -rf ~",
+      "rm -rf *",
+      "sudo",
+      "su",
+      "chmod 777",
+      "curl | sh",
+      "wget | sh",
+      "eval",
+      "> /dev/sd",
+      "mkfs",
+      "dd if=",
+      ":(){:|:&};:",
+      "shutdown",
+      "reboot",
+      "halt",
+      "poweroff"
+    ],
+    "argument_patterns": {
+      "rm": {
+        "forbidden_flags": ["-rf /", "-rf ~", "-rf /*"],
+        "require_confirmation": ["-r", "-f", "--recursive", "--force"]
+      },
+      "git": {
+        "forbidden_flags": ["push --force origin main", "push --force origin master", "push -f origin main", "push -f origin master"],
+        "require_confirmation": ["push", "reset --hard", "clean -fd"]
+      }
+    },
+    "max_execution_time_ms": 300000,
+    "max_output_size_bytes": 10485760
+  },
+  "filesystem": {
+    "write_roots": [
+      "./",
+      "/tmp/supervisor-agent"
+    ],
+    "forbidden_paths": [
+      "~/.ssh",
+      "~/.gnupg",
+      "~/.aws",
+      "~/.config/gh",
+      "/etc",
+      "/usr",
+      "/bin",
+      "/sbin",
+      "C:\\Windows",
+      "C:\\Program Files"
+    ],
+    "max_file_size_bytes": 52428800
+  },
+  "network": {
+    "default_policy": "deny",
+    "allowed_hosts": [
+      "localhost",
+      "127.0.0.1",
+      "registry.npmjs.org",
+      "github.com",
+      "api.github.com"
+    ],
+    "allowed_ports": [80, 443, 3000, 8080]
+  },
+  "approval": {
+    "always_require": [
+      "delete_files",
+      "modify_git_history",
+      "network_request_external",
+      "install_global_package",
+      "modify_system_config"
+    ],
+    "auto_approve": [
+      "read_files",
+      "create_files_in_write_roots",
+      "run_tests",
+      "run_linter",
+      "git_status",
+      "git_diff",
+      "git_log"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "container_image": null,
+    "resource_limits": {
+      "memory_mb": 4096,
+      "cpu_cores": 2,
+      "disk_mb": 10240
+    }
+  }
+}
