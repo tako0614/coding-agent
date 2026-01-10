@@ -1,32 +1,31 @@
-# Supervisor Agent
+# Tako Agent
 
-**使役する側（Supervisor）エージェント** - Claude Code と Codex をオーケストレーションして、検証が通るまで自動でタスクを完遂する AI エージェントシステム。
+**タコのように複数の腕で同時に作業する** - Claude と Codex をオーケストレーションして、DAG ベースの並列実行でタスクを効率的に完遂する AI エージェントシステム。
 
 ## 概要
 
-Supervisor Agent は、ユーザーの指示を受け取り、Claude Code や Codex といった「使役されるエージェント」に作業を指示し、検証・デバッグまでを自動で行うオーケストレーターです。
+Tako Agent は、ユーザーの指示を受け取り、タスクを DAG（有向非巡回グラフ）に分解して、Claude や Codex といった複数のワーカーに並列で作業を指示するオーケストレーターです。
 
 ### 主な機能
 
-- **LangGraph による実行グラフ**: 仕様策定 → 実装 → 検証 → デバッグ → 完了判定までのループ
+- **LangGraph による DAG 実行**: ゴール受付 → コンテキスト読み取り → DAG 構築 → 並列ディスパッチ → 検証 → 完了
+- **並列ワーカープール**: 複数の Claude/Codex インスタンスが同時にタスクを実行
 - **OpenAI 互換 API**: `/v1/chat/completions` として外部から操作可能
 - **デュアルエグゼキュータ**: Claude Code と Codex の両方に対応
-- **自動検証・デバッグ**: 検証が通るまで自動でリトライ
-- **Copilot API 連携**: usage 監視とモデル自動切替
-- **WebUI**: Run 管理、ストリーミングログ、ショートカット実行
-- **Tauri デスクトップアプリ**: スクリーンショット、クリック、キー入力
-- **セキュリティポリシー**: Shell コマンドの allowlist/denylist、ファイルシステム制限
+- **Copilot API 連携**: GitHub Copilot を OpenAI 互換プロキシとして使用
+- **WebUI**: プロジェクト管理、チャットUI、ストリーミングログ
+- **セッション復元**: ページを離れても実行継続、復帰時に自動復元
 
 ## プロジェクト構成
 
 ```
-supervisor-agent/
+tako-agent/
 ├── packages/
 │   ├── protocol/           # WorkOrder/WorkReport の JSON Schema + TypeScript 型
 │   ├── tool-runtime/       # Shell/Git/FS/Desktop 操作の統一ツール層
 │   ├── executor-codex/     # Codex CLI Adapter
 │   ├── executor-claude/    # Claude Code CLI Adapter
-│   └── provider-copilot/   # Copilot API Provider (usage監視・モデル切替)
+│   └── provider-copilot/   # Copilot API Provider
 ├── apps/
 │   ├── supervisor-backend/ # LangGraph + OpenAI 互換 API サーバー
 │   ├── supervisor-ui/      # React WebUI
@@ -42,7 +41,7 @@ supervisor-agent/
 - Node.js 20+
 - pnpm 9+
 - Codex CLI または Claude Code CLI（少なくとも一方）
-- Rust（Tauri ビルド用、オプション）
+- GitHub Token（Copilot API 使用時）
 
 ### インストール
 
@@ -56,17 +55,7 @@ pnpm build
 
 ## 使い方
 
-### CLI での実行
-
-```bash
-# タスクを直接実行
-pnpm --filter @supervisor/backend dev -- run "Add a login button to the homepage" --repo /path/to/project
-
-# API サーバーを起動
-pnpm --filter @supervisor/backend dev -- serve --port 3000
-```
-
-### WebUI での実行
+### WebUI での実行（推奨）
 
 ```bash
 # バックエンドを起動
@@ -78,29 +67,20 @@ pnpm --filter @supervisor/ui dev
 # ブラウザで http://localhost:5173 を開く
 ```
 
-### Tauri デスクトップアプリ
+### CLI での実行
 
 ```bash
-# 開発モード
-pnpm --filter @supervisor/tauri dev
+# タスクを直接実行
+pnpm --filter @supervisor/backend dev -- run "Add a login button to the homepage" --repo /path/to/project
 
-# ビルド
-pnpm --filter @supervisor/tauri build
+# API サーバーのみ起動
+pnpm --filter @supervisor/backend dev -- serve --port 3000
 ```
 
 ### API 経由での実行
 
 ```bash
-# OpenAI 互換 API
-curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "supervisor-v1",
-    "messages": [{"role": "user", "content": "Add a login button"}],
-    "repo_path": "/path/to/project"
-  }'
-
-# Run 管理 API
+# Run 作成
 curl -X POST http://localhost:3000/api/runs \
   -H "Content-Type: application/json" \
   -d '{
@@ -111,30 +91,14 @@ curl -X POST http://localhost:3000/api/runs \
 # Run のステータス確認
 curl http://localhost:3000/api/runs/{run_id}
 
-# 最終レポート取得
-curl http://localhost:3000/api/runs/{run_id}/report
+# DAG の状態確認
+curl http://localhost:3000/api/runs/{run_id}/dag
 
-# ストリーミングログ
+# ワーカープールの状態確認
+curl http://localhost:3000/api/runs/{run_id}/workers
+
+# ストリーミングログ (SSE)
 curl http://localhost:3000/api/events?run_id={run_id}
-
-# Usage 確認
-curl http://localhost:3000/api/usage
-
-# ショートカット一覧
-curl http://localhost:3000/api/shortcuts
-
-# Shell コマンド実行
-curl -X POST http://localhost:3000/api/shell/execute \
-  -H "Content-Type: application/json" \
-  -d '{"command": "npm test"}'
-
-# スクリーンショット取得
-curl http://localhost:3000/api/desktop/screenshot
-
-# クリック実行
-curl -X POST http://localhost:3000/api/desktop/click \
-  -H "Content-Type: application/json" \
-  -d '{"x": 100, "y": 200}'
 ```
 
 ## アーキテクチャ
@@ -142,89 +106,49 @@ curl -X POST http://localhost:3000/api/desktop/click \
 ### LangGraph 実行フロー
 
 ```
-START → Intake → SpecDraft → Decompose → RouteExecutor → Dispatch
-                                              ↑              ↓
-                                       AnalyzeFailures ← Verify → LoopControl
-                                                                      ↓
-                                                                  Finalize → END
+START → Intake → ReadContext → BuildDAG → ParallelDispatch → Verify → Finalize → END
+                                              ↑                  ↓
+                                              └──────────────────┘
+                                              (タスク完了まで繰り返し)
 ```
 
-### WorkOrder / WorkReport プロトコル
+### DAG ベースの並列実行
 
-Supervisor と Executor 間の通信は、JSON Schema で定義された WorkOrder / WorkReport で行われます。
+1. **Intake**: ユーザーゴールを受け取り、実行を初期化
+2. **ReadContext**: リポジトリ構造とコンテキストを読み取り
+3. **BuildDAG**: ゴールをタスクに分解し、依存関係グラフを構築
+4. **ParallelDispatch**: 依存関係が解決したタスクを並列でワーカーに割り当て
+5. **Verify**: 完了したタスクの検証
+6. **Finalize**: 最終レポート生成
 
-**WorkOrder** (Supervisor → Executor):
-- `task_kind`: spec | implement | debug | refactor | test | review
-- `objective`: 作業目標
-- `acceptance_criteria`: 受入条件
-- `verification.commands`: 検証コマンド
-- `constraints`: 制約（パス制限、依存追加ポリシー等）
+### ワーカータイプ
 
-**WorkReport** (Executor → Supervisor):
-- `status`: done | blocked | failed | needs_input
-- `commands_run`: 実行したコマンドと結果
-- `changes`: 変更されたファイル
-- `verification.passed`: 自己検証結果（参考値）
+- **Claude**: 設計・アーキテクチャ決定・複雑な判断が必要なタスク
+- **Codex**: 実装・コーディング・ファイル操作タスク
 
-### Copilot API 連携
-
-`provider-copilot` パッケージで Copilot API と連携し、以下を実現：
-
-- `/usage` エンドポイントで利用状況を監視
-- 利用上限に近づいたら軽量モデルへ自動切替
-- レート制限時のバックオフ処理
-
-```bash
-# Copilot 連携を有効化
-ENABLE_COPILOT=true COPILOT_API_URL=http://localhost:4141 pnpm --filter @supervisor/backend dev -- serve
-```
+各タスクは `executor_preference` で適切なワーカーに振り分けられます。
 
 ## WebUI 機能
 
-- **Runs**: Run の作成・管理・詳細表示
-- **Shortcuts**: よく使うコマンドのショートカット管理
-- **Shell**: 対話的なシェル実行
-- **Settings**: 設定と使用状況の確認
+- **Projects**: プロジェクトの作成・管理
+- **Chat**: チャット形式でタスクを指示、リアルタイムログ表示
+- **DAG Visualization**: タスクの依存関係と進捗をビジュアル表示
+- **Shell**: 対話的なターミナル
+- **Settings**: API キー設定、GitHub Token 設定
 
-## Tauri デスクトップアプリ機能
+## 設定
 
-- WebUI を内包
-- バックエンドの sidecar 起動
-- GUI 操作（スクリーンショット、クリック、キー入力）
+### GitHub Token（Copilot API 用）
 
-## セキュリティ
+Settings ページで GitHub Token を設定すると、Copilot API が自動的に有効化されます。
 
-`configs/policy/default.json` でセキュリティポリシーを設定できます：
-
-- **Shell allowlist/denylist**: 実行可能なコマンドの制限
-- **Filesystem write_roots**: 書き込み可能なディレクトリの制限
-- **Network policy**: ネットワークアクセスの制限（デフォルト: deny）
-- **Approval required**: 危険な操作に対する手動承認
-
-## 開発
-
-```bash
-# 開発サーバー起動（ホットリロード）
-pnpm dev
-
-# テスト実行
-pnpm test
-
-# 型チェック
-pnpm build
-
-# 全パッケージのクリーン
-pnpm clean
+```
+Settings → GitHub Copilot API → GitHub Token を入力
 ```
 
-## 実装済みフェーズ
+### モデル選択
 
-- [x] Phase 0: プロトコル定義、セキュリティポリシー
-- [x] Phase 1: Supervisor MVP (Codex/Claude)
-- [x] Phase 2: Claude Adapter 追加 & ルーティング
-- [x] Phase 3: Copilot API 連携 (usage/モデル切替)
-- [x] Phase 4: WebUI
-- [x] Phase 5: Tauri デスクトップアプリ + GUI 操作 MVP
+チャット入力エリアのドロップダウンから DAG 構築に使用するモデルを選択できます。Copilot API が有効な場合、利用可能なモデル一覧が自動的に取得されます。
 
 ## API エンドポイント一覧
 
@@ -236,36 +160,47 @@ pnpm clean
 - `GET /api/runs` - Run 一覧
 - `POST /api/runs` - Run 作成
 - `GET /api/runs/:id` - Run 詳細
-- `GET /api/runs/:id/logs` - ログ取得
-- `GET /api/runs/:id/report` - レポート取得
+- `GET /api/runs/:id/dag` - DAG 状態
+- `GET /api/runs/:id/workers` - ワーカープール状態
+- `GET /api/runs/:id/plan` - プラン取得
 - `DELETE /api/runs/:id` - Run 削除
 
-### Usage
-- `GET /api/usage` - 使用状況
-- `GET /api/usage/model` - モデル推奨
-- `GET /api/usage/copilot/status` - Copilot 状態
+### Projects
+- `GET /api/projects` - プロジェクト一覧
+- `POST /api/projects` - プロジェクト作成
+- `GET /api/projects/:id` - プロジェクト詳細
+- `PUT /api/projects/:id` - プロジェクト更新
+- `DELETE /api/projects/:id` - プロジェクト削除
 
-### Shortcuts
-- `GET /api/shortcuts` - ショートカット一覧
-- `POST /api/shortcuts` - 作成
-- `PUT /api/shortcuts/:id` - 更新
-- `DELETE /api/shortcuts/:id` - 削除
-- `POST /api/shortcuts/:id/execute` - 実行
+### Settings
+- `GET /api/settings` - 設定取得
+- `PUT /api/settings` - 設定更新
+
+### Copilot API
+- `GET /api/copilot/status` - Copilot API 状態
+- `GET /api/copilot/models` - 利用可能なモデル一覧
+- `POST /api/copilot/start` - Copilot API 開始
+- `POST /api/copilot/stop` - Copilot API 停止
 
 ### Shell
 - `POST /api/shell/execute` - コマンド実行
-- `POST /api/shell/check` - ポリシーチェック
-
-### Desktop
-- `GET /api/desktop/screenshot` - スクリーンショット
-- `GET /api/desktop/screen-size` - 画面サイズ
-- `POST /api/desktop/click` - クリック
-- `POST /api/desktop/type` - テキスト入力
-- `POST /api/desktop/key` - キー入力
 
 ### Events
 - `GET /api/events` - SSE ストリーミング
 - `GET /api/logs/:runId` - バッファされたログ
+
+## 開発
+
+```bash
+# 開発サーバー起動（ホットリロード）
+pnpm dev
+
+# 型チェック
+pnpm build
+
+# フロントエンドビルド（本番用）
+pnpm --filter @supervisor/ui build
+```
 
 ## ライセンス
 

@@ -2,7 +2,6 @@ import { Routes, Route, Navigate } from 'react-router-dom';
 import Layout from './components/Layout';
 import ProjectsPage from './pages/ProjectsPage';
 import ProjectDetailPage from './pages/ProjectDetailPage';
-import ShortcutsPage from './pages/ShortcutsPage';
 import ShellPage from './pages/ShellPage';
 import SettingsPage from './pages/SettingsPage';
 
@@ -16,7 +15,6 @@ function App() {
         {/* Legacy routes redirect to new paths */}
         <Route path="/runs" element={<Navigate to="/projects" replace />} />
         <Route path="/runs/:runId" element={<Navigate to="/projects/:runId" replace />} />
-        <Route path="/shortcuts" element={<ShortcutsPage />} />
         <Route path="/shell" element={<ShellPage />} />
         <Route path="/settings" element={<SettingsPage />} />
       </Routes>

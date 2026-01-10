@@ -20,7 +20,6 @@
   },
   "nav": {
     "projects": "Projects",
-    "shortcuts": "Shortcuts",
     "shell": "Shell",
     "settings": "Settings"
   },
@@ -139,21 +138,6 @@
     "specsFolderNamePlaceholder": "new-folder",
     "specsSpecificationPlaceholder": "Specification details, scope, constraints...",
     "specsImplementationStatusPlaceholder": "Implementation status, progress, gaps..."
-  },
-  "shortcuts": {
-    "title": "Shortcuts",
-    "subtitle": "Quick access to common commands",
-    "newShortcut": "New Shortcut",
-    "noShortcuts": "No shortcuts yet. Create one to get started!",
-    "name": "Name",
-    "command": "Command",
-    "description": "Description",
-    "descriptionOptional": "Description (optional)",
-    "category": "Category",
-    "categoryOptional": "Category (optional)",
-    "categoryPlaceholder": "e.g., build, test, git",
-    "createShortcut": "Create Shortcut",
-    "exitCode": "Exit code"
   },
   "shell": {
     "title": "Terminal",

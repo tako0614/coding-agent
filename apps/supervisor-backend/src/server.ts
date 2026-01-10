@@ -14,7 +14,6 @@ import { chat } from './api/routes/chat.js';
 import { runs } from './api/routes/runs.js';
 import { projects } from './api/routes/projects.js';
 import { usage } from './api/routes/usage.js';
-import { shortcuts } from './api/routes/shortcuts.js';
 import { shell } from './api/routes/shell.js';
 import { files } from './api/routes/files.js';
 import { desktop } from './api/routes/desktop.js';
@@ -150,9 +149,6 @@ app.route('/api/runs', runs);
 
 // Usage and model routing endpoints
 app.route('/api/usage', usage);
-
-// Shortcuts endpoints
-app.route('/api/shortcuts', shortcuts);
 
 // Shell execution endpoints
 app.route('/api/shell', shell);

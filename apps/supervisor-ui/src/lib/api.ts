@@ -49,17 +49,6 @@ export interface LogEntry {
   metadata?: Record<string, unknown>;
 }
 
-export interface Shortcut {
-  id: string;
-  name: string;
-  description?: string;
-  command: string;
-  category?: string;
-  icon?: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
 export interface ShellResult {
   exitCode: number;
   stdout: string;
@@ -197,38 +186,6 @@ export async function fetchLogs(runId: string, since?: string): Promise<{ logs: 
   const res = await fetch(url.toString());
   if (!res.ok) throw new Error('Failed to fetch logs');
   return res.json();
-}
-
-// Shortcuts API
-export async function fetchShortcuts(category?: string): Promise<{ shortcuts: Shortcut[] }> {
-  const url = new URL(`${API_BASE}/api/shortcuts`, window.location.origin);
-  if (category) url.searchParams.set('category', category);
-  const res = await fetch(url.toString());
-  if (!res.ok) throw new Error('Failed to fetch shortcuts');
-  return res.json();
-}
-
-export async function createShortcut(data: Omit<Shortcut, 'id' | 'createdAt' | 'updatedAt'>): Promise<Shortcut> {
-  const res = await fetch(`${API_BASE}/api/shortcuts`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-  });
-  if (!res.ok) throw new Error('Failed to create shortcut');
-  return res.json();
-}
-
-export async function executeShortcut(id: string, cwd?: string): Promise<{ result: ShellResult }> {
-  const url = new URL(`${API_BASE}/api/shortcuts/${id}/execute`, window.location.origin);
-  if (cwd) url.searchParams.set('cwd', cwd);
-  const res = await fetch(url.toString(), { method: 'POST' });
-  if (!res.ok) throw new Error('Failed to execute shortcut');
-  return res.json();
-}
-
-export async function deleteShortcut(id: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/shortcuts/${id}`, { method: 'DELETE' });
-  if (!res.ok) throw new Error('Failed to delete shortcut');
 }
 
 // Usage API

@@ -20,7 +20,6 @@
   },
   "nav": {
     "projects": "プロジェクト",
-    "shortcuts": "ショートカット",
     "shell": "シェル",
     "settings": "設定"
   },
@@ -145,21 +144,6 @@
     "specsFolderNamePlaceholder": "new-folder",
     "specsSpecificationPlaceholder": "仕様の詳細、スコープ、制約など...",
     "specsImplementationStatusPlaceholder": "実装状況、進捗、未対応項目など..."
-  },
-  "shortcuts": {
-    "title": "ショートカット",
-    "subtitle": "よく使うコマンドへのクイックアクセス",
-    "newShortcut": "新規ショートカット",
-    "noShortcuts": "ショートカットがありません。新規作成してください。",
-    "name": "名前",
-    "command": "コマンド",
-    "description": "説明",
-    "descriptionOptional": "説明（任意）",
-    "category": "カテゴリ",
-    "categoryOptional": "カテゴリ（任意）",
-    "categoryPlaceholder": "例: build, test, git",
-    "createShortcut": "ショートカット作成",
-    "exitCode": "終了コード"
   },
   "shell": {
     "title": "ターミナル",
