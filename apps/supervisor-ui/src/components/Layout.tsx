@@ -19,7 +19,6 @@ interface LayoutProps {
 
 const navItems = [
   { path: '/projects', labelKey: 'nav.projects', icon: FolderKanban },
-  { path: '/shortcuts', labelKey: 'nav.shortcuts', icon: Zap },
   { path: '/shell', labelKey: 'nav.shell', icon: Terminal },
   { path: '/settings', labelKey: 'nav.settings', icon: Settings },
 ];
