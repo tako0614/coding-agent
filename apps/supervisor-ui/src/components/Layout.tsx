@@ -4,7 +4,6 @@ import { useTranslation } from 'react-i18next';
 import {
   FolderKanban,
   Terminal,
-  Zap,
   Settings,
   Activity,
   Menu,
