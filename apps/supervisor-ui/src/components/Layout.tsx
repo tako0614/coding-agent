@@ -6,10 +6,8 @@ import {
   Terminal,
   Settings,
   Activity,
-  Menu,
-  X,
+  Bot,
 } from 'lucide-react';
-import { useState } from 'react';
 import { fetchHealth } from '../lib/api';
 import clsx from 'clsx';
 
@@ -19,6 +17,7 @@ interface LayoutProps {
 
 const navItems = [
   { path: '/projects', labelKey: 'nav.projects', icon: FolderKanban },
+  { path: '/agents', labelKey: 'nav.agents', icon: Bot },
   { path: '/shell', labelKey: 'nav.shell', icon: Terminal },
   { path: '/settings', labelKey: 'nav.settings', icon: Settings },
 ];
@@ -26,7 +25,6 @@ const navItems = [
 export default function Layout({ children }: LayoutProps) {
   const { t } = useTranslation();
   const location = useLocation();
-  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   const { data: health } = useQuery({
     queryKey: ['health'],
@@ -36,24 +34,8 @@ export default function Layout({ children }: LayoutProps) {
 
   return (
     <div className="min-h-screen bg-slate-50">
-      {/* Mobile header */}
-      <header className="lg:hidden fixed top-0 left-0 right-0 h-14 bg-white border-b border-slate-200 flex items-center px-4 z-50">
-        <button
-          onClick={() => setSidebarOpen(!sidebarOpen)}
-          className="p-2 hover:bg-slate-100 rounded-lg"
-        >
-          {sidebarOpen ? <X size={20} /> : <Menu size={20} />}
-        </button>
-        <h1 className="ml-3 font-semibold text-slate-800">Tako Agent</h1>
-      </header>
-
-      {/* Sidebar */}
-      <aside
-        className={clsx(
-          'fixed top-0 left-0 h-full w-64 bg-white border-r border-slate-200 z-40 transition-transform lg:translate-x-0',
-          sidebarOpen ? 'translate-x-0' : '-translate-x-full'
-        )}
-      >
+      {/* Desktop Sidebar */}
+      <aside className="hidden lg:block fixed top-0 left-0 h-full w-64 bg-white border-r border-slate-200 z-40">
         <div className="h-14 flex items-center px-4 border-b border-slate-200">
           <Activity className="text-primary-600" size={24} />
           <h1 className="ml-2 font-bold text-slate-800">Tako Agent</h1>
@@ -64,7 +46,6 @@ export default function Layout({ children }: LayoutProps) {
             <Link
               key={path}
               to={path}
-              onClick={() => setSidebarOpen(false)}
               className={clsx(
                 'flex items-center gap-3 px-3 py-2 rounded-lg transition-colors',
                 location.pathname.startsWith(path)
@@ -96,17 +77,30 @@ export default function Layout({ children }: LayoutProps) {
       </aside>
 
       {/* Main content */}
-      <main className="lg:ml-64 pt-14 lg:pt-0 min-h-screen">
-        <div className="6">{children}</div>
+      <main className="lg:ml-64 pb-16 lg:pb-0 min-h-screen">
+        {children}
       </main>
 
-      {/* Overlay for mobile */}
-      {sidebarOpen && (
-        <div
-          className="fixed inset-0 bg-black/20 z-30 lg:hidden"
-          onClick={() => setSidebarOpen(false)}
-        />
-      )}
+      {/* Mobile Bottom Navigation */}
+      <nav className="lg:hidden fixed bottom-0 left-0 right-0 h-14 bg-white border-t border-slate-200 z-50 flex items-center justify-around px-4 safe-area-pb">
+        {navItems.map(({ path, icon: Icon }) => {
+          const isActive = location.pathname.startsWith(path);
+          return (
+            <Link
+              key={path}
+              to={path}
+              className={clsx(
+                'flex items-center justify-center p-3 rounded-full transition-colors',
+                isActive
+                  ? 'text-primary-600 bg-primary-50'
+                  : 'text-slate-400 active:bg-slate-100'
+              )}
+            >
+              <Icon size={24} strokeWidth={isActive ? 2.5 : 2} />
+            </Link>
+          );
+        })}
+      </nav>
     </div>
   );
 }

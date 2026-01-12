@@ -44,7 +44,20 @@
       "Bash(git commit:*)",
       "Bash(npm ls:*)",
       "Bash(npx tsx:*)",
-      "Bash(where:*)"
+      "Bash(where:*)",
+      "Bash(npm install:*)",
+      "Bash(powershell -Command \"cd ''C:\\\\Users\\\\shout\\\\desktop\\\\github\\\\agent\\\\apps\\\\supervisor-ui''; npx tsc --noEmit 2>&1 | Select-Object -First 50\")",
+      "Bash(powershell -Command \"cd ''C:\\\\Users\\\\shout\\\\desktop\\\\github\\\\agent\\\\apps\\\\supervisor-ui''; npx tsc --noEmit 2>&1 | Select-Object -First 30\")",
+      "Bash(powershell -Command \"cd ''C:\\\\Users\\\\shout\\\\desktop\\\\github\\\\agent\\\\apps\\\\supervisor-backend''; npx tsc --noEmit 2>&1 | Select-Object -First 30\")",
+      "Bash(powershell -Command \"cd ''C:\\\\Users\\\\shout\\\\desktop\\\\github\\\\agent\\\\apps\\\\supervisor-ui''; npx tsc --noEmit 2>&1 | Select-Object -First 20\")",
+      "Bash(powershell -Command \"\\(Get-Content ''C:\\\\Users\\\\shout\\\\desktop\\\\github\\\\agent\\\\apps\\\\supervisor-ui\\\\src\\\\lib\\\\api.ts'' | Measure-Object -Line\\).Lines\")",
+      "Bash(powershell -Command \"\\(Get-Content ''C:\\\\Users\\\\shout\\\\desktop\\\\github\\\\agent\\\\apps\\\\supervisor-ui\\\\src\\\\pages\\\\SettingsPage.tsx'' | Measure-Object -Line\\).Lines\")",
+      "Bash(powershell:*)",
+      "Bash(ls:*)",
+      "Bash(unzip:*)",
+      "Bash(tasklist:*)",
+      "Bash(/c/Users/shout/desktop/github/agent/apps/supervisor-backend/vendor/winvnc.exe --help)",
+      "Bash(cmd /c \"taskkill /PID 1843268 /F\")"
     ]
   }
 }

@@ -25,7 +25,8 @@ export type MessageType =
   | 'tool_use'
   | 'tool_result'
   | 'result'
-  | 'system';
+  | 'system'
+  | 'agent';
 
 export interface ChatMessageData {
   id: string;
@@ -41,6 +42,14 @@ export interface ChatMessageData {
   isThinking?: boolean;
   // Executor info
   executor?: 'claude' | 'codex';
+  // Agent messages (simplified)
+  status?: 'success' | 'error' | 'pending';
+  metadata?: Record<string, unknown>;
+}
+
+interface MessageProps {
+  message: ChatMessageData;
+  compact?: boolean;
 }
 
 // Tool icon helper
@@ -270,8 +279,42 @@ export function SystemMessage({ message }: { message: ChatMessageData }) {
   );
 }
 
+// Compact Agent Message (for multi-column view)
+function CompactMessage({ message }: MessageProps) {
+  const isUser = message.type === 'user';
+  const isError = message.status === 'error' || message.isError;
+
+  return (
+    <div className={clsx(
+      'px-2 py-1.5 text-xs rounded',
+      isUser ? 'bg-blue-50 text-blue-800' : isError ? 'bg-red-50 text-red-700' : 'bg-slate-50 text-slate-700'
+    )}>
+      <div className="flex items-start gap-1.5">
+        {isUser ? (
+          <User size={12} className="text-blue-500 shrink-0 mt-0.5" />
+        ) : message.executor === 'codex' ? (
+          <Bot size={12} className="text-green-500 shrink-0 mt-0.5" />
+        ) : (
+          <Bot size={12} className="text-purple-500 shrink-0 mt-0.5" />
+        )}
+        <span className="break-words">{message.content}</span>
+      </div>
+    </div>
+  );
+}
+
 // Main ChatMessage router
-export function ChatMessage({ message }: { message: ChatMessageData }) {
+export function ChatMessage({ message, compact }: MessageProps) {
+  // Use compact mode for agent columns
+  if (compact) {
+    return <CompactMessage message={message} />;
+  }
+
+  // For 'agent' type messages (from AgentsPage), use compact-like rendering
+  if (message.type === 'agent' as MessageType) {
+    return <CompactMessage message={message} compact />;
+  }
+
   switch (message.type) {
     case 'user':
       return <UserMessage message={message} />;
@@ -287,6 +330,6 @@ export function ChatMessage({ message }: { message: ChatMessageData }) {
     case 'system':
       return <SystemMessage message={message} />;
     default:
-      return null;
+      return <CompactMessage message={message} />;
   }
 }

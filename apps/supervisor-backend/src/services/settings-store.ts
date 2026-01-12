@@ -5,6 +5,8 @@
 
 import { db } from './db.js';
 
+export type ExecutorMode = 'agent' | 'codex_only' | 'claude_only';
+
 export interface AppSettings {
   openai_api_key?: string;
   anthropic_api_key?: string;
@@ -15,6 +17,8 @@ export interface AppSettings {
   use_copilot_api?: boolean;
   // DAG building model (for LangGraph)
   dag_model?: string;
+  // Executor mode: auto, codex_only, claude_only
+  executor_mode?: ExecutorMode;
 }
 
 // Known setting keys
@@ -26,6 +30,7 @@ export const SETTING_KEYS = {
   GITHUB_TOKEN: 'github_token',
   USE_COPILOT_API: 'use_copilot_api',
   DAG_MODEL: 'dag_model',
+  EXECUTOR_MODE: 'executor_mode',
 } as const;
 
 type SettingKey = typeof SETTING_KEYS[keyof typeof SETTING_KEYS];
@@ -98,6 +103,9 @@ export function getAllSettings(): AppSettings {
       case SETTING_KEYS.DAG_MODEL:
         settings.dag_model = row.value;
         break;
+      case SETTING_KEYS.EXECUTOR_MODE:
+        settings.executor_mode = row.value as ExecutorMode;
+        break;
     }
   }
 
@@ -161,6 +169,26 @@ export function updateSettings(settings: Partial<AppSettings>): void {
       deleteStmt.run(SETTING_KEYS.DAG_MODEL);
     }
   }
+
+  if (settings.executor_mode !== undefined) {
+    if (settings.executor_mode) {
+      upsertStmt.run({ key: SETTING_KEYS.EXECUTOR_MODE, value: settings.executor_mode, updated_at: now });
+    } else {
+      deleteStmt.run(SETTING_KEYS.EXECUTOR_MODE);
+    }
+  }
+}
+
+/**
+ * Get executor mode setting
+ * Defaults to 'agent' (respects DAG node's executor_preference)
+ */
+export function getExecutorMode(): ExecutorMode {
+  const fromSettings = getSetting(SETTING_KEYS.EXECUTOR_MODE);
+  if (fromSettings && ['agent', 'codex_only', 'claude_only'].includes(fromSettings)) {
+    return fromSettings as ExecutorMode;
+  }
+  return 'agent';
 }
 
 /**

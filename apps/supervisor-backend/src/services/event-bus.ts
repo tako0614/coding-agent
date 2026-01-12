@@ -52,6 +52,31 @@ const deleteLogsStmt = db.prepare(`
   DELETE FROM run_logs WHERE run_id = ?
 `);
 
+// Get orphaned log sessions (logs exist but no completed/failed run record)
+// These are from interrupted runs where server stopped before completion
+const getOrphanedLogSessionsStmt = db.prepare(`
+  SELECT DISTINCT
+    rl.run_id,
+    MIN(rl.timestamp) as first_log,
+    MAX(rl.timestamp) as last_log,
+    COUNT(*) as log_count,
+    (SELECT message FROM run_logs WHERE run_id = rl.run_id ORDER BY timestamp ASC LIMIT 1) as first_message
+  FROM run_logs rl
+  LEFT JOIN runs r ON rl.run_id = r.run_id
+  WHERE r.run_id IS NULL
+  GROUP BY rl.run_id
+  ORDER BY last_log DESC
+  LIMIT 50
+`);
+
+interface OrphanedSession {
+  run_id: string;
+  first_log: string;
+  last_log: string;
+  log_count: number;
+  first_message: string | null;
+}
+
 interface LogRow {
   id: number;
   run_id: string;
@@ -172,6 +197,19 @@ class EventBus extends EventEmitter {
       deleteLogsStmt.run(runId);
     } catch (err) {
       console.error('[EventBus] Failed to delete logs from DB:', err);
+    }
+  }
+
+  /**
+   * Get orphaned log sessions (interrupted runs)
+   * These are logs that exist but have no completed run record
+   */
+  getOrphanedSessions(): OrphanedSession[] {
+    try {
+      return getOrphanedLogSessionsStmt.all() as OrphanedSession[];
+    } catch (err) {
+      console.error('[EventBus] Failed to get orphaned sessions:', err);
+      return [];
     }
   }
 

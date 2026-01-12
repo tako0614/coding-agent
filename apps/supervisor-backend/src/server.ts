@@ -16,13 +16,14 @@ import { projects } from './api/routes/projects.js';
 import { usage } from './api/routes/usage.js';
 import { shell } from './api/routes/shell.js';
 import { files } from './api/routes/files.js';
-import { desktop } from './api/routes/desktop.js';
 import { settings } from './api/routes/settings.js';
 import { copilot } from './api/routes/copilot.js';
 import { eventBus } from './services/event-bus.js';
 import { getModelRouter } from './services/model-router.js';
 import { copilotAPIManager } from './services/copilot-api-manager.js';
 import { ptyService } from './services/pty-service.js';
+import * as fs from 'fs';
+import * as pathModule from 'path';
 
 // Check if running inside pkg bundle (snapshot filesystem)
 // In ESM, we check process.pkg which is set by pkg runtime
@@ -63,56 +64,42 @@ const MIME_TYPES: Record<string, string> = {
   '.eot': 'application/vnd.ms-fontobject',
 };
 
-// Serve static files for WebUI
+// Serve static files for WebUI - synchronous setup
 // Built frontend is placed in public/ui by vite build
-// Dynamic import to avoid import.meta.url issues in CJS bundle
-async function setupStaticFiles() {
-  if (isPackaged) {
-    console.log('[Server] Static file serving disabled (packaged mode)');
-    return;
-  }
-  try {
-    const fs = await import('fs');
-    const pathModule = await import('path');
+if (!isPackaged) {
+  // Custom static file handler with proper MIME types - registered FIRST
+  app.use('/*', async (c, next) => {
+    const urlPath = c.req.path;
 
-    // Custom static file handler with proper MIME types
-    app.use('/*', async (c, next) => {
-      const urlPath = c.req.path;
-
-      // Skip API routes
-      if (urlPath.startsWith('/api/') || urlPath.startsWith('/v1/')) {
-        return next();
-      }
-
-      // Try to serve static file
-      const filePath = pathModule.join('./public/ui', urlPath);
-
-      try {
-        if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-          const ext = pathModule.extname(filePath).toLowerCase();
-          const mimeType = MIME_TYPES[ext] || 'application/octet-stream';
-          const content = fs.readFileSync(filePath);
-
-          return new Response(content, {
-            headers: {
-              'Content-Type': mimeType,
-              'Cache-Control': 'public, max-age=31536000',
-            },
-          });
-        }
-      } catch {
-        // Fall through to next handler
-      }
-
+    // Skip API routes
+    if (urlPath.startsWith('/api/') || urlPath.startsWith('/v1/')) {
       return next();
-    });
+    }
 
-    console.log('[Server] Static file serving enabled');
-  } catch (err) {
-    console.log('[Server] Static file serving unavailable:', err);
-  }
+    // Try to serve static file
+    const filePath = pathModule.join('./public/ui', urlPath === '/' ? '/index.html' : urlPath);
+
+    try {
+      if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+        const ext = pathModule.extname(filePath).toLowerCase();
+        const mimeType = MIME_TYPES[ext] || 'application/octet-stream';
+        const content = fs.readFileSync(filePath);
+
+        return new Response(content, {
+          headers: {
+            'Content-Type': mimeType,
+            'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=31536000',
+          },
+        });
+      }
+    } catch {
+      // Fall through to next handler
+    }
+
+    return next();
+  });
+  console.log('[Server] Static file serving enabled');
 }
-setupStaticFiles();
 
 // Health check
 app.get('/health', (c) => {
@@ -158,9 +145,6 @@ app.route('/api/files', files);
 
 // Settings endpoints
 app.route('/api/settings', settings);
-
-// Desktop control endpoints
-app.route('/api/desktop', desktop);
 
 // Copilot API management endpoints
 app.route('/api/copilot', copilot);
@@ -236,6 +220,19 @@ app.get('/api/logs/:runId', (c) => {
   const logs = eventBus.getLogs(runId, since);
 
   return c.json({ logs });
+});
+
+// Get orphaned sessions (interrupted runs with logs but no completed run)
+app.get('/api/sessions/orphaned', (c) => {
+  const sessions = eventBus.getOrphanedSessions();
+  return c.json({ sessions });
+});
+
+// Delete orphaned session logs
+app.delete('/api/sessions/orphaned/:runId', (c) => {
+  const runId = c.req.param('runId');
+  eventBus.deleteLogs(runId);
+  return c.json({ deleted: true });
 });
 
 // Error handling

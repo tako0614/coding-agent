@@ -1,40 +1,16 @@
 /**
  * Read Context Node
- * Reads relevant files from the repository to understand the project
- * Supports AGENTS.md, CLAUDE.md, README.md, SPECS.md, and other common formats
+ * Reads AGENTS.md from the repository to understand the project
  */
 
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import type { ParallelSupervisorStateType } from '../parallel-state.js';
 import { log as eventLog } from '../../services/event-bus.js';
 
-// Files to look for (in priority order)
+// Files to look for (AGENTS.md only)
 const CONTEXT_FILES = [
-  // Agent instructions (highest priority)
   'AGENTS.md',
-  'CLAUDE.md',
-  'CODEX.md',
-  '.agents.md',
-  '.claude.md',
-
-  // Specifications
-  'SPECS.md',
-  'SPECIFICATION.md',
-  'specs/README.md',
-  'docs/specs.md',
-  'docs/SPECS.md',
-
-  // Project documentation
-  'README.md',
-  'CONTRIBUTING.md',
-  'ARCHITECTURE.md',
-  'docs/README.md',
-
-  // Task/TODO files
-  'TODO.md',
-  'TASKS.md',
-  'ROADMAP.md',
 ];
 
 // Project config files (for detecting project type)
@@ -155,25 +131,6 @@ async function readRepoContext(repoPath: string): Promise<RepoContext> {
   context.projectType = await detectProjectType(repoPath);
   if (context.projectType) {
     sections.unshift(`Project Type: ${context.projectType}`);
-  }
-
-  // Check for specs directory
-  const specsDir = join(repoPath, 'specs');
-  if (await exists(specsDir)) {
-    try {
-      const files = await readdir(specsDir);
-      for (const file of files.slice(0, 10)) { // Limit to 10 files
-        if (file.endsWith('.md')) {
-          const content = await readFileSafe(join(specsDir, file));
-          if (content) {
-            context.filesRead.push(`specs/${file}`);
-            sections.push(`## specs/${file}\n\n${content}`);
-          }
-        }
-      }
-    } catch {
-      // Ignore errors reading specs directory
-    }
   }
 
   context.fullContext = sections.join('\n\n---\n\n');

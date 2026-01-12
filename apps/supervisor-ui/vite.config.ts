@@ -15,6 +15,7 @@ export default defineConfig({
       '/api': {
         target: 'http://localhost:3000',
         changeOrigin: true,
+        ws: true,
       },
       '/v1': {
         target: 'http://localhost:3000',
@@ -25,5 +26,16 @@ export default defineConfig({
   build: {
     outDir: '../supervisor-backend/public/ui',
     emptyOutDir: true,
+    target: 'esnext',
+    rollupOptions: {
+      output: {
+        format: 'es',
+      },
+    },
+  },
+  optimizeDeps: {
+    esbuildOptions: {
+      target: 'esnext',
+    },
   },
 });

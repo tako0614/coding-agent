@@ -56,3 +56,15 @@ body {
 .log-entry.debug {
   color: #6b7280;
 }
+
+/* Safe area for iOS devices */
+.safe-area-pb {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* Adjust main content for bottom nav on mobile */
+@media (max-width: 1023px) {
+  main {
+    padding-bottom: calc(64px + env(safe-area-inset-bottom, 0px));
+  }
+}

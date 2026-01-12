@@ -13,3 +13,6 @@ export { loopControlNode, shouldContinue } from './loop-control.js';
 export { finalizeNode } from './finalize.js';
 export { buildDAGNode } from './build-dag.js';
 export { parallelDispatchNode } from './parallel-dispatch.js';
+export { analyzeStatusNode } from './analyze-status.js';
+export { planNextNode } from './plan-next.js';
+export { adjustDispatchNode } from './adjust-dispatch.js';

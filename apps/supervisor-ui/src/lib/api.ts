@@ -25,6 +25,7 @@ export interface Plan {
 
 export interface Run {
   run_id: string;
+  project_id?: string;
   status: string;
   user_goal: string;
   created_at: string;
@@ -188,6 +189,26 @@ export async function fetchLogs(runId: string, since?: string): Promise<{ logs: 
   return res.json();
 }
 
+// Orphaned Sessions API (interrupted runs)
+export interface OrphanedSession {
+  run_id: string;
+  first_log: string;
+  last_log: string;
+  log_count: number;
+  first_message: string | null;
+}
+
+export async function fetchOrphanedSessions(): Promise<{ sessions: OrphanedSession[] }> {
+  const res = await fetch(`${API_BASE}/api/sessions/orphaned`);
+  if (!res.ok) throw new Error('Failed to fetch orphaned sessions');
+  return res.json();
+}
+
+export async function deleteOrphanedSession(runId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/sessions/orphaned/${runId}`, { method: 'DELETE' });
+  if (!res.ok) throw new Error('Failed to delete orphaned session');
+}
+
 // Usage API
 export async function fetchUsage(): Promise<UsageStats> {
   const res = await fetch(`${API_BASE}/api/usage`);
@@ -342,6 +363,8 @@ export async function generatePlanWithAI(runId: string): Promise<Plan> {
 }
 
 // Settings types
+export type ExecutorMode = 'agent' | 'codex_only' | 'claude_only';
+
 export interface AppSettings {
   openai_api_key?: string;
   anthropic_api_key?: string;
@@ -355,6 +378,8 @@ export interface AppSettings {
   use_copilot_api?: boolean;
   // DAG building model (for LangGraph)
   dag_model?: string;
+  // Executor mode: auto, codex_only, claude_only
+  executor_mode?: ExecutorMode;
 }
 
 // Copilot API status
@@ -427,5 +452,117 @@ export interface CopilotModel {
 export async function fetchCopilotModels(): Promise<{ models: CopilotModel[] }> {
   const res = await fetch(`${API_BASE}/api/copilot/models`);
   if (!res.ok) throw new Error('Failed to fetch copilot models');
+  return res.json();
+}
+
+// File API types
+export interface FileEntry {
+  name: string;
+  path: string;
+  isFile: boolean;
+  isDirectory: boolean;
+  size: number;
+  modifiedAt: string;
+}
+
+export interface FileListResponse {
+  path: string;
+  entries: FileEntry[];
+  recursive: boolean;
+}
+
+export interface FileReadResponse {
+  path: string;
+  content: string;
+  encoding: 'utf-8' | 'base64';
+  size: number;
+}
+
+export interface FileWriteResponse {
+  path: string;
+  success: boolean;
+  size: number;
+}
+
+// File API functions
+export async function listFiles(dirPath: string, cwd: string, recursive = false): Promise<FileListResponse> {
+  const res = await fetch(`${API_BASE}/api/files/list`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: dirPath, cwd, recursive }),
+  });
+  if (!res.ok) throw new Error('Failed to list files');
+  return res.json();
+}
+
+export async function readFile(filePath: string, cwd: string): Promise<FileReadResponse> {
+  const res = await fetch(`${API_BASE}/api/files/read`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: filePath, cwd }),
+  });
+  if (!res.ok) throw new Error('Failed to read file');
+  return res.json();
+}
+
+export async function writeFile(filePath: string, content: string, cwd: string): Promise<FileWriteResponse> {
+  const res = await fetch(`${API_BASE}/api/files/write`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: filePath, content, cwd }),
+  });
+  if (!res.ok) throw new Error('Failed to write file');
+  return res.json();
+}
+
+export async function createDirectory(dirPath: string, cwd: string): Promise<{ path: string; created: boolean }> {
+  const res = await fetch(`${API_BASE}/api/files/mkdir`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: dirPath, cwd }),
+  });
+  if (!res.ok) throw new Error('Failed to create directory');
+  return res.json();
+}
+
+export async function deleteFile(filePath: string, cwd: string): Promise<{ path: string; deleted: boolean }> {
+  const res = await fetch(`${API_BASE}/api/files/delete`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: filePath, cwd }),
+  });
+  if (!res.ok) throw new Error('Failed to delete file');
+  return res.json();
+}
+
+export async function renameFile(source: string, destination: string, cwd: string): Promise<{ source: string; destination: string; moved: boolean }> {
+  const res = await fetch(`${API_BASE}/api/files/move`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source, destination, cwd }),
+  });
+  if (!res.ok) throw new Error('Failed to rename file');
+  return res.json();
+}
+
+// Desktop Applications API
+export interface GUIApplication {
+  pid: number;
+  name: string;
+  title: string;
+  path?: string;
+}
+
+export async function fetchApplications(): Promise<{ applications: GUIApplication[] }> {
+  const res = await fetch(`${API_BASE}/api/desktop/applications`);
+  if (!res.ok) throw new Error('Failed to fetch applications');
+  return res.json();
+}
+
+export async function focusApplication(pid: number): Promise<{ success: boolean }> {
+  const res = await fetch(`${API_BASE}/api/desktop/applications/${pid}/focus`, {
+    method: 'POST',
+  });
+  if (!res.ok) throw new Error('Failed to focus application');
   return res.json();
 }

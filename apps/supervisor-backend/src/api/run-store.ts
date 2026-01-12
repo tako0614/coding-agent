@@ -9,13 +9,14 @@ import type { RunResponse, DAGResponse, WorkerPoolResponse } from './types.js';
 import { db } from '../services/db.js';
 
 // Prepared statements for runs table
+// Note: status is NOT stored in DB - it's derived from actual data
 const insertRunStmt = db.prepare(`
   INSERT OR REPLACE INTO runs (
-    run_id, project_id, status, user_goal, repo_path,
+    run_id, project_id, user_goal, repo_path,
     final_report, error, dag_json, dag_progress_json,
     created_at, updated_at
   ) VALUES (
-    @run_id, @project_id, @status, @user_goal, @repo_path,
+    @run_id, @project_id, @user_goal, @repo_path,
     @final_report, @error, @dag_json, @dag_progress_json,
     @created_at, @updated_at
   )
@@ -37,8 +38,9 @@ const deleteRunStmt = db.prepare(`
   DELETE FROM runs WHERE run_id = ?
 `);
 
-const updateRunStatusStmt = db.prepare(`
-  UPDATE runs SET status = @status, updated_at = @updated_at,
+// Update run data (no status field - derived from data)
+const updateRunStmt = db.prepare(`
+  UPDATE runs SET updated_at = @updated_at,
     final_report = @final_report, error = @error,
     dag_json = @dag_json, dag_progress_json = @dag_progress_json
   WHERE run_id = @run_id
@@ -47,7 +49,6 @@ const updateRunStatusStmt = db.prepare(`
 interface RunRow {
   run_id: string;
   project_id: string | null;
-  status: string;
   user_goal: string;
   repo_path: string;
   final_report: string | null;
@@ -153,15 +154,33 @@ export const runStore = new RunStore();
 
 /**
  * Helper to convert DB row to RunResponse
+ * Derives actual status from the data, NOT from stored status field
+ * - If has final_report → completed
+ * - If has error → failed
+ * - Otherwise (was running when server crashed) → interrupted
  */
 function rowToRunResponse(row: RunRow): RunResponse {
+  // Derive actual status from data, ignore stored status
+  let actualStatus: RunResponse['status'];
+
+  if (row.final_report) {
+    actualStatus = 'completed';
+  } else if (row.error) {
+    actualStatus = 'failed';
+  } else {
+    // No final_report and no error means it was interrupted
+    // (was running when server crashed)
+    actualStatus = 'interrupted';
+  }
+
   return {
     run_id: row.run_id,
-    status: row.status as RunResponse['status'],
+    project_id: row.project_id ?? undefined,
+    status: actualStatus,
     user_goal: row.user_goal,
     created_at: row.created_at,
     updated_at: row.updated_at,
-    verification_passed: row.status === 'completed',
+    verification_passed: actualStatus === 'completed',
     error: row.error ?? undefined,
     final_report: row.final_report ?? undefined,
   };
@@ -195,13 +214,13 @@ class ParallelRunStore {
 
   /**
    * Persist run state to database
+   * Note: status is NOT stored - it's derived from final_report/error
    */
   private persistToDb(runId: string, state: ParallelSupervisorStateType): void {
     try {
       insertRunStmt.run({
         run_id: state.run_id,
         project_id: state.project_id || this.runProjectIds.get(runId) || null,
-        status: state.status,
         user_goal: state.user_goal,
         repo_path: state.repo_path || this.runRepoPaths.get(runId) || '',
         final_report: state.final_report || null,
@@ -217,13 +236,13 @@ class ParallelRunStore {
   }
 
   /**
-   * Update run status in database
+   * Update run data in database
+   * Note: status is NOT stored - it's derived from final_report/error
    */
-  updateStatus(runId: string, state: ParallelSupervisorStateType): void {
+  updateRun(runId: string, state: ParallelSupervisorStateType): void {
     try {
-      updateRunStatusStmt.run({
+      updateRunStmt.run({
         run_id: runId,
-        status: state.status,
         updated_at: state.updated_at,
         final_report: state.final_report || null,
         error: state.error || null,
@@ -231,12 +250,13 @@ class ParallelRunStore {
         dag_progress_json: state.dag_progress ? JSON.stringify(state.dag_progress) : null,
       });
     } catch (err) {
-      console.error('[ParallelRunStore] Failed to update run status in DB:', err);
+      console.error('[ParallelRunStore] Failed to update run in DB:', err);
     }
   }
 
   /**
    * Get a run state (from memory or DB)
+   * Derives status from actual data, not stored status field
    */
   get(runId: string): ParallelSupervisorStateType | undefined {
     // Check in-memory first
@@ -247,11 +267,23 @@ class ParallelRunStore {
     try {
       const row = getRunStmt.get(runId) as RunRow | undefined;
       if (row) {
+        // Derive actual status from data, ignore stored status
+        let actualStatus: ParallelSupervisorStateType['status'];
+        if (row.final_report) {
+          actualStatus = 'completed';
+        } else if (row.error) {
+          actualStatus = 'failed';
+        } else {
+          // No final_report and no error means it was interrupted
+          // Cast to any because 'interrupted' may not be in the strict type
+          actualStatus = 'failed' as ParallelSupervisorStateType['status'];
+        }
+
         // Reconstruct state from DB with required default values
         const state = {
           run_id: row.run_id,
           project_id: row.project_id || undefined,
-          status: row.status as ParallelSupervisorStateType['status'],
+          status: actualStatus,
           user_goal: row.user_goal,
           repo_path: row.repo_path,
           created_at: row.created_at,
@@ -313,56 +345,53 @@ class ParallelRunStore {
   }
 
   /**
-   * List all runs (from memory and DB)
+   * List all runs
+   * Running: from memory only
+   * Completed/Failed: from DB only
    */
   list(): RunResponse[] {
     // Get running runs from memory
-    const runningIds = Array.from(this.runningPromises.keys());
-    const running = runningIds.map(runId => ({
+    const running = Array.from(this.runningPromises.keys()).map(runId => ({
       run_id: runId,
+      project_id: this.runProjectIds.get(runId),
       status: 'running' as const,
       user_goal: this.runningGoals.get(runId) ?? 'Unknown goal',
       created_at: this.runningStartTimes.get(runId) ?? new Date().toISOString(),
       updated_at: new Date().toISOString(),
     }));
 
-    // Get completed runs from DB
+    // Get completed/failed runs from DB
     try {
       const rows = listRunsStmt.all() as RunRow[];
-      const fromDb = rows
-        .filter(row => !runningIds.includes(row.run_id)) // Exclude running ones
-        .map(rowToRunResponse);
-
+      const fromDb = rows.map(rowToRunResponse);
       return [...running, ...fromDb];
     } catch (err) {
       console.error('[ParallelRunStore] Failed to list runs from DB:', err);
-      // Fallback to in-memory only
-      const completed = Array.from(this.runs.values()).map(state => this.toResponse(state));
-      return [...running, ...completed];
+      return running;
     }
   }
 
   /**
    * List runs by project ID
+   * Running: from memory, Completed/Failed: from DB
    */
   listByProject(projectId: string): RunResponse[] {
-    const runningIds = Array.from(this.runningPromises.keys());
-    const running = runningIds
+    // Get running runs for this project from memory
+    const running = Array.from(this.runningPromises.keys())
       .filter(runId => this.runProjectIds.get(runId) === projectId)
       .map(runId => ({
         run_id: runId,
+        project_id: projectId,
         status: 'running' as const,
         user_goal: this.runningGoals.get(runId) ?? 'Unknown goal',
         created_at: this.runningStartTimes.get(runId) ?? new Date().toISOString(),
         updated_at: new Date().toISOString(),
       }));
 
+    // Get completed/failed runs from DB
     try {
       const rows = listRunsByProjectStmt.all(projectId) as RunRow[];
-      const fromDb = rows
-        .filter(row => !runningIds.includes(row.run_id))
-        .map(rowToRunResponse);
-
+      const fromDb = rows.map(rowToRunResponse);
       return [...running, ...fromDb];
     } catch (err) {
       console.error('[ParallelRunStore] Failed to list project runs from DB:', err);
@@ -372,6 +401,8 @@ class ParallelRunStore {
 
   /**
    * Track a running promise
+   * Note: We don't persist to DB here - only when run completes/fails
+   * This avoids status inconsistency if server crashes
    */
   setRunning(runId: string, promise: Promise<ParallelSupervisorStateType>, goal?: string, projectId?: string, repoPath?: string): void {
     this.runningPromises.set(runId, promise);
@@ -385,25 +416,8 @@ class ParallelRunStore {
       this.runRepoPaths.set(runId, repoPath);
     }
     this.runningStartTimes.set(runId, new Date().toISOString());
-
-    // Insert initial run record to DB
-    try {
-      insertRunStmt.run({
-        run_id: runId,
-        project_id: projectId || null,
-        status: 'running',
-        user_goal: goal || 'Unknown goal',
-        repo_path: repoPath || '',
-        final_report: null,
-        error: null,
-        dag_json: null,
-        dag_progress_json: null,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      });
-    } catch (err) {
-      console.error('[ParallelRunStore] Failed to insert initial run to DB:', err);
-    }
+    // Don't insert to DB - logs are saved separately via eventBus
+    // Run record is only created when it completes/fails
   }
 
   /**
@@ -430,6 +444,7 @@ class ParallelRunStore {
   toResponse(state: ParallelSupervisorStateType): RunResponse {
     return {
       run_id: state.run_id,
+      project_id: state.project_id,
       status: state.status,
       user_goal: state.user_goal,
       created_at: state.created_at,

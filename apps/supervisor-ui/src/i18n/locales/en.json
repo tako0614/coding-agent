@@ -20,6 +20,7 @@
   },
   "nav": {
     "projects": "Projects",
+    "agents": "Agents",
     "shell": "Shell",
     "settings": "Settings"
   },

@@ -43,13 +43,3 @@ export {
   checkFilesystemWritePolicy,
   loadPolicyFromConfig,
 } from './policy-checker.js';
-
-// Desktop Control
-export {
-  DesktopControl,
-  createDesktopControl,
-  type ScreenshotResult,
-  type ScreenSize,
-  type ClickOptions,
-  type KeyOptions,
-} from './desktop.js';

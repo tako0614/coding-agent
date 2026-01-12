@@ -40,7 +40,6 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY,
     project_id TEXT,
-    status TEXT NOT NULL DEFAULT 'pending',
     user_goal TEXT NOT NULL,
     repo_path TEXT NOT NULL,
     final_report TEXT,
@@ -53,8 +52,11 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_runs_project_id ON runs(project_id);
-  CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
   CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at DESC);
+
+  -- Drop status column if it exists (migration for existing DBs)
+  -- SQLite 3.35.0+ supports ALTER TABLE DROP COLUMN
+  DROP INDEX IF EXISTS idx_runs_status;
 
   CREATE TABLE IF NOT EXISTS run_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

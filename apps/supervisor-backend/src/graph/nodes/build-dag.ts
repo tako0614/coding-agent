@@ -11,18 +11,40 @@ import type { ParallelSupervisorStateType } from '../parallel-state.js';
 import { getOpenAIConfig, getDAGModel, type OpenAIConfig } from '../../services/settings-store.js';
 import { log as eventLog } from '../../services/event-bus.js';
 
-// Minimal system prompt - let the repo's own docs guide behavior
+// System prompt for task decomposition
 const SYSTEM_PROMPT = `You decompose goals into executable tasks.
 
-Read the repository context carefully - it may contain AGENTS.md or similar files with specific instructions for how to work in this codebase.
+Read the repository context carefully - it contains AGENTS.md with specific instructions.
 
-Output a JSON object with tasks array:
+## Step-by-Step Workflow
+This is an iterative, step-by-step process:
+1. You receive the current status and context
+2. You create 1-15 tasks for the next step
+3. Tasks are executed by workers
+4. Results are reviewed
+5. You decide next actions based on results
+
+Focus on the immediate next step, not the entire goal at once.
+
+## Task Count: 1-15 tasks
+- Create only what's needed for the current step
+- Fewer focused tasks are better than many vague ones
+- Consider dependencies - independent tasks run in parallel
+
+## Available Tools for Workers
+Workers can:
+- Read and write files
+- Run shell commands
+- Search code
+- Edit files
+
+## Output Format
 {
   "tasks": [
     {
       "id": "task_1",
       "name": "Short task name",
-      "description": "Detailed description including relevant context from the repo",
+      "description": "Detailed description with context",
       "dependencies": ["task_id"],
       "executor_preference": "codex" | "claude" | "any",
       "priority": 1-10
@@ -30,46 +52,10 @@ Output a JSON object with tasks array:
   ]
 }
 
-## Guidelines
-- Follow any instructions in AGENTS.md, CLAUDE.md, or similar files
-- Create parallel tasks when possible (empty dependencies)
-- Add dependencies only when strictly required
-- Include enough context in descriptions for autonomous execution
-
-## Executor Selection - IMPORTANT
-Choose executor_preference based on task characteristics:
-
-### Use "claude" for (simple implementation tasks):
-- Simple file edits (add import, rename variable, fix typo)
-- Straightforward code changes with clear patterns
-- Running commands and scripts
-- File operations (create, copy, move, delete)
-- Quick bug fixes with obvious solutions
-- Code formatting and cleanup
-- Simple test additions
-
-### Use "codex" for (complex tasks requiring reasoning):
-- Architectural decisions and system design
-- Planning implementation strategy
-- Complex feature implementation
-- Multi-file refactoring with design considerations
-- Writing new features that require understanding context
-- Debugging complex issues requiring analysis
-- Code review and quality assessment
-- API design and interface planning
-- Security analysis and vulnerability fixes
-- Performance analysis and optimization
-- Writing comprehensive tests
-- Documentation and technical writing
-- Complex problem solving
-- Any task requiring deep thinking or multi-step reasoning
-
-### Use "any" for:
-- Tasks that either executor can handle equally well
-- When unsure which is better
-
-Prefer "claude" for simple, mechanical tasks.
-Prefer "codex" for complex tasks requiring thinking, reasoning, or design.`;
+## Executor Selection
+- "claude": Simple file edits, straightforward changes, running commands
+- "codex": Complex reasoning, architecture, multi-file refactoring, debugging
+- "any": When either works`;
 
 interface ParsedTask {
   id: string;
@@ -102,8 +88,9 @@ function checkOpenAIConfig(): { config: OpenAIConfig } | { error: string } {
 export async function buildDAGNode(
   state: ParallelSupervisorStateType
 ): Promise<Partial<ParallelSupervisorStateType>> {
-  console.log('[BuildDAG] Building task DAG from goal...');
-  eventLog(state.run_id, 'info', 'supervisor', '🧠 Building task DAG from goal...', { node: 'build_dag' });
+  const iteration = (state.iteration_count ?? 0) + 1;
+  console.log(`[BuildDAG] Building task DAG from goal... (iteration ${iteration})`);
+  eventLog(state.run_id, 'info', 'supervisor', `🧠 Building task DAG (iteration ${iteration})...`, { node: 'build_dag', iteration });
 
   // Check for API configuration before attempting to use the model
   const configCheck = checkOpenAIConfig();
@@ -115,6 +102,7 @@ export async function buildDAGNode(
     return {
       dag: fallbackDag,
       status: 'building_dag',
+      iteration_count: iteration,
       error: configCheck.error,
       updated_at: new Date().toISOString(),
     };
@@ -192,6 +180,7 @@ export async function buildDAGNode(
       dag,
       messages: updatedMessages,
       status: 'building_dag',
+      iteration_count: iteration,
       updated_at: new Date().toISOString(),
     };
   } catch (error) {
@@ -239,13 +228,14 @@ function createFallbackDAG(state: ParallelSupervisorStateType): DAG {
 
 function buildUserPrompt(state: ParallelSupervisorStateType): string {
   const lines: string[] = [];
+  const iteration = state.iteration_count ?? 0;
 
   lines.push(`# Goal\n${state.user_goal}`);
   lines.push('');
   lines.push(`# Repository\n${state.repo_path}`);
   lines.push('');
 
-  // Include repo context (AGENTS.md, README.md, etc.)
+  // Include repo context (AGENTS.md)
   if (state.repo_context) {
     lines.push('# Repository Context');
     lines.push('');
@@ -256,7 +246,46 @@ function buildUserPrompt(state: ParallelSupervisorStateType): string {
       : state.repo_context;
     lines.push(context);
   } else {
-    lines.push('# Repository Context\nNo AGENTS.md, README.md, or spec files found.');
+    lines.push('# Repository Context\nNo AGENTS.md found.');
+  }
+
+  // Include previous iteration results if this is a retry
+  if (iteration > 0 && state.reports && state.reports.length > 0) {
+    lines.push('');
+    lines.push(`# Previous Iteration Results (Iteration ${iteration})`);
+    lines.push('');
+
+    const progress = state.dag_progress;
+    if (progress) {
+      lines.push(`- Completed: ${progress.completed}/${progress.total}`);
+      lines.push(`- Failed: ${progress.failed}`);
+      lines.push('');
+    }
+
+    // Include failed task reports
+    const failedReports = state.reports.filter(r => r.status !== 'done');
+    if (failedReports.length > 0) {
+      lines.push('## Failed Tasks:');
+      for (const report of failedReports) {
+        lines.push(`- ${report.order_id}: ${report.summary}`);
+        if (report.error) {
+          lines.push(`  Error: ${report.error.message}`);
+        }
+      }
+      lines.push('');
+    }
+
+    // Include successful task summaries
+    const successReports = state.reports.filter(r => r.status === 'done');
+    if (successReports.length > 0) {
+      lines.push('## Completed Tasks:');
+      for (const report of successReports) {
+        lines.push(`- ${report.order_id}: ${report.summary}`);
+      }
+    }
+
+    lines.push('');
+    lines.push('Create new tasks to address the failed items and complete the goal.');
   }
 
   return lines.join('\n');

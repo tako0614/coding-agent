@@ -20,13 +20,13 @@ function ProjectCard({ project, onDelete }: { project: Project; onDelete: () => 
   return (
     <Link
       to={`/projects/${project.project_id}`}
-      className="block bg-white rounded-xl border border-slate-200 p-5 hover:shadow-lg hover:border-primary-300 transition-all group"
+      className="block bg-white rounded-xl border border-slate-200 p-4 sm:p-5 hover:shadow-lg hover:border-primary-300 active:bg-slate-50 transition-all group"
     >
-      <div className="flex items-start justify-between gap-3">
+      <div className="flex items-start justify-between gap-2 sm:gap-3">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-2">
-            <FolderKanban size={20} className="text-primary-500" />
-            <h3 className="font-semibold text-slate-800 truncate text-lg">
+            <FolderKanban size={20} className="text-primary-500 flex-shrink-0" />
+            <h3 className="font-semibold text-slate-800 truncate text-base sm:text-lg">
               {project.name}
             </h3>
           </div>
@@ -35,10 +35,10 @@ function ProjectCard({ project, onDelete }: { project: Project; onDelete: () => 
               {project.description}
             </p>
           )}
-          <div className="flex items-center gap-4 text-xs text-slate-400">
+          <div className="flex flex-wrap items-center gap-3 sm:gap-4 text-xs text-slate-400">
             <div className="flex items-center gap-1">
               <GitBranch size={12} />
-              <span className="truncate max-w-[200px]" title={project.repo_path}>
+              <span className="truncate max-w-[150px] sm:max-w-[200px]" title={project.repo_path}>
                 {project.repo_path.split(/[/\\]/).pop()}
               </span>
             </div>
@@ -48,16 +48,17 @@ function ProjectCard({ project, onDelete }: { project: Project; onDelete: () => 
             </div>
           </div>
         </div>
+        {/* Always visible on mobile, hover on desktop */}
         <button
           onClick={(e) => {
             e.preventDefault();
             e.stopPropagation();
             onDelete();
           }}
-          className="p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors opacity-0 group-hover:opacity-100"
+          className="p-2.5 sm:p-2 text-slate-400 sm:text-slate-300 hover:text-red-500 hover:bg-red-50 active:bg-red-100 rounded-lg transition-colors sm:opacity-0 sm:group-hover:opacity-100"
           title={t('common.delete')}
         >
-          <Trash2 size={16} />
+          <Trash2 size={18} className="sm:w-4 sm:h-4" />
         </button>
       </div>
     </Link>
@@ -110,15 +111,15 @@ export default function ProjectsPage() {
   };
 
   return (
-    <div className="mx-auto max-w-4xl">
-      <div className="flex items-center justify-between mb-8">
+    <div className="mx-auto max-w-4xl px-4 sm:px-6 py-4 sm:py-6">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6 sm:mb-8">
         <div>
-          <h1 className="text-2xl font-bold text-slate-800">{t('projects.title')}</h1>
-          <p className="text-slate-500 mt-1">{t('projects.subtitle')}</p>
+          <h1 className="text-xl sm:text-2xl font-bold text-slate-800">{t('projects.title')}</h1>
+          <p className="text-slate-500 mt-1 text-sm sm:text-base">{t('projects.subtitle')}</p>
         </div>
         <button
           onClick={() => setShowNewProject(true)}
-          className="flex items-center gap-2 px-4 py-2.5 bg-primary-600 text-white rounded-xl hover:bg-primary-700 transition-colors shadow-sm"
+          className="flex items-center justify-center gap-2 px-4 py-3 sm:py-2.5 bg-primary-600 text-white rounded-xl hover:bg-primary-700 active:bg-primary-800 transition-colors shadow-sm w-full sm:w-auto"
         >
           <Plus size={18} />
           {t('projects.newProject')}
@@ -127,9 +128,9 @@ export default function ProjectsPage() {
 
       {/* New Project Modal */}
       {showNewProject && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6">
-            <h2 className="text-xl font-semibold mb-4">{t('projects.newProject')}</h2>
+        <div className="fixed inset-0 bg-black/50 flex items-end sm:items-center justify-center z-50 p-0 sm:p-4">
+          <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-xl w-full sm:max-w-md p-5 sm:p-6 max-h-[90vh] overflow-y-auto">
+            <h2 className="text-lg sm:text-xl font-semibold mb-4">{t('projects.newProject')}</h2>
             <form
               onSubmit={(e) => {
                 e.preventDefault();
@@ -152,7 +153,7 @@ export default function ProjectsPage() {
                     value={name}
                     onChange={(e) => setName(e.target.value)}
                     placeholder={t('projects.namePlaceholder')}
-                    className="w-full px-4 py-3 border border-slate-300 rounded-xl focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                    className="w-full px-4 py-3 text-base border border-slate-300 rounded-xl focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
                     autoFocus
                     required
                   />
@@ -165,7 +166,7 @@ export default function ProjectsPage() {
                     value={description}
                     onChange={(e) => setDescription(e.target.value)}
                     placeholder={t('projects.descriptionPlaceholder')}
-                    className="w-full px-4 py-3 border border-slate-300 rounded-xl focus:ring-2 focus:ring-primary-500 focus:border-primary-500 resize-none"
+                    className="w-full px-4 py-3 text-base border border-slate-300 rounded-xl focus:ring-2 focus:ring-primary-500 focus:border-primary-500 resize-none"
                     rows={2}
                   />
                 </div>
@@ -180,14 +181,14 @@ export default function ProjectsPage() {
                       value={folderPath}
                       onChange={(e) => setFolderPath(e.target.value)}
                       placeholder={t('projects.repoPathPlaceholder')}
-                      className="flex-1 px-4 py-3 border border-slate-300 rounded-xl focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                      className="flex-1 px-4 py-3 text-base border border-slate-300 rounded-xl focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
                       required
                     />
                     {isTauri && (
                       <button
                         type="button"
                         onClick={handleBrowseFolder}
-                        className="px-4 py-3 bg-slate-100 text-slate-700 rounded-xl hover:bg-slate-200 transition-colors"
+                        className="px-4 py-3 bg-slate-100 text-slate-700 rounded-xl hover:bg-slate-200 active:bg-slate-300 transition-colors"
                         title={t('projects.browse')}
                       >
                         <FolderOpen size={18} />
@@ -196,7 +197,7 @@ export default function ProjectsPage() {
                   </div>
                 </div>
               </div>
-              <div className="flex justify-end gap-3 mt-6">
+              <div className="flex flex-col-reverse sm:flex-row justify-end gap-3 mt-6">
                 <button
                   type="button"
                   onClick={() => {
@@ -205,14 +206,14 @@ export default function ProjectsPage() {
                     setDescription('');
                     setFolderPath('');
                   }}
-                  className="px-4 py-2.5 text-slate-600 hover:bg-slate-100 rounded-xl transition-colors"
+                  className="px-4 py-3 sm:py-2.5 text-slate-600 hover:bg-slate-100 active:bg-slate-200 rounded-xl transition-colors"
                 >
                   {t('common.cancel')}
                 </button>
                 <button
                   type="submit"
                   disabled={createMutation.isPending || !name.trim() || !folderPath.trim()}
-                  className="flex items-center gap-2 px-5 py-2.5 bg-primary-600 text-white rounded-xl hover:bg-primary-700 disabled:opacity-50 transition-colors"
+                  className="flex items-center justify-center gap-2 px-5 py-3 sm:py-2.5 bg-primary-600 text-white rounded-xl hover:bg-primary-700 active:bg-primary-800 disabled:opacity-50 transition-colors"
                 >
                   {createMutation.isPending && (
                     <Loader2 size={18} className="animate-spin" />
@@ -241,7 +242,7 @@ export default function ProjectsPage() {
           <p className="text-sm text-slate-400">{t('projects.createFirst')}</p>
         </div>
       ) : (
-        <div className="grid gap-4 sm:grid-cols-2">
+        <div className="grid gap-3 sm:gap-4 grid-cols-1 sm:grid-cols-2">
           {data?.projects.map((project) => (
             <ProjectCard
               key={project.project_id}

@@ -29,6 +29,7 @@ export type ParallelRunStatus =
   | 'building_dag'
   | 'executing'
   | 'verifying'
+  | 'adjusting'
   | 'completed'
   | 'failed'
   | 'cancelled';
@@ -82,6 +83,14 @@ export const ParallelSupervisorState = Annotation.Root({
   repo_path: Annotation<string>(),
   repo_context: Annotation<string | undefined>(), // Content from AGENTS.md, README.md, etc.
   base_commit: Annotation<string | undefined>(),
+
+  // Iteration tracking (no limit, just for logging)
+  iteration_count: Annotation<number>({
+    default: () => 0,
+  }),
+
+  // Adjustment reason (set by plan_next when ADJUST decision is made)
+  adjust_reason: Annotation<string | undefined>(),
 
   // Final output
   final_report: Annotation<string | undefined>(),

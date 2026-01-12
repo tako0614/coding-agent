@@ -16,10 +16,13 @@ import { DEFAULT_WORKER_POOL_CONFIG } from '@supervisor/protocol';
 import { WorkerInstance, createWorkerInstance, type TaskContext } from './worker-instance.js';
 import { EventEmitter } from 'events';
 
+export type ExecutorMode = 'agent' | 'codex_only' | 'claude_only';
+
 export interface PoolContext {
   userGoal: string;
   repoContext?: string;
   dag?: DAG;
+  executorMode?: ExecutorMode;
 }
 
 export interface WorkerPoolEvents {
@@ -69,21 +72,50 @@ export class WorkerPool extends EventEmitter {
    * Initialize the worker pool with minimum workers
    */
   async initialize(): Promise<void> {
-    console.log(`[WorkerPool] Initializing with ${this.config.min_workers} workers`);
+    const executorMode = this.poolContext.executorMode ?? 'agent';
+    console.log(`[WorkerPool] Initializing with ${this.config.min_workers} workers (mode: ${executorMode})`);
 
-    // Calculate initial worker distribution
-    const codexCount = Math.floor(this.config.min_workers * this.config.codex_ratio);
-    const claudeCount = this.config.min_workers - codexCount;
-
-    // Create Codex workers
     const createPromises: Promise<void>[] = [];
-    for (let i = 0; i < codexCount; i++) {
-      createPromises.push(this.createWorker('codex'));
-    }
 
-    // Create Claude workers
-    for (let i = 0; i < claudeCount; i++) {
-      createPromises.push(this.createWorker('claude'));
+    if (executorMode === 'codex_only') {
+      // Only create Codex workers
+      for (let i = 0; i < this.config.min_workers; i++) {
+        createPromises.push(this.createWorker('codex'));
+      }
+    } else if (executorMode === 'claude_only') {
+      // Only create Claude workers
+      for (let i = 0; i < this.config.min_workers; i++) {
+        createPromises.push(this.createWorker('claude'));
+      }
+    } else {
+      // Agent mode: Create workers based on DAG executor preferences
+      // Analyze DAG to determine initial worker distribution
+      const dag = this.poolContext.dag;
+      if (dag && dag.nodes.length > 0) {
+        const codexTasks = dag.nodes.filter(n => n.executor_preference === 'codex').length;
+        const claudeTasks = dag.nodes.filter(n => n.executor_preference === 'claude').length;
+        const totalTasks = codexTasks + claudeTasks || 1;
+        const codexRatio = codexTasks / totalTasks;
+        const codexCount = Math.max(1, Math.floor(this.config.min_workers * codexRatio));
+        const claudeCount = Math.max(1, this.config.min_workers - codexCount);
+
+        for (let i = 0; i < codexCount; i++) {
+          createPromises.push(this.createWorker('codex'));
+        }
+        for (let i = 0; i < claudeCount; i++) {
+          createPromises.push(this.createWorker('claude'));
+        }
+      } else {
+        // No DAG yet, create balanced workers
+        const codexCount = Math.ceil(this.config.min_workers / 2);
+        const claudeCount = this.config.min_workers - codexCount;
+        for (let i = 0; i < codexCount; i++) {
+          createPromises.push(this.createWorker('codex'));
+        }
+        for (let i = 0; i < claudeCount; i++) {
+          createPromises.push(this.createWorker('claude'));
+        }
+      }
     }
 
     await Promise.all(createPromises);
@@ -151,9 +183,16 @@ export class WorkerPool extends EventEmitter {
   }
 
   /**
-   * Determine which executor type is needed based on current ratio
+   * Determine which executor type is needed based on current ratio and executor mode
    */
   private getNeededExecutorType(): WorkerExecutorType {
+    const executorMode = this.poolContext.executorMode ?? 'agent';
+
+    // If mode is specific, only return that type
+    if (executorMode === 'codex_only') return 'codex';
+    if (executorMode === 'claude_only') return 'claude';
+
+    // Agent mode: balance based on current worker distribution
     let codexCount = 0;
     let claudeCount = 0;
 
@@ -165,8 +204,8 @@ export class WorkerPool extends EventEmitter {
       }
     }
 
-    const currentRatio = codexCount / (codexCount + claudeCount);
-    return currentRatio < this.config.codex_ratio ? 'codex' : 'claude';
+    // Try to maintain balance
+    return codexCount <= claudeCount ? 'codex' : 'claude';
   }
 
   /**

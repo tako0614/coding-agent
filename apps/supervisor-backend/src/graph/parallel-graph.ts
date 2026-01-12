@@ -1,16 +1,24 @@
 /**
  * Parallel Supervisor LangGraph Definition
  *
- * Graph Flow:
+ * Step-by-Step Graph Flow:
  *
- * START -> intake -> read_context -> build_dag -> parallel_dispatch -> verify -> finalize -> END
+ * START -> intake -> read_context -> analyze_status -> build_dag -> parallel_dispatch -> plan_next
+ *                          ↑                                                                 │
+ *                          └─────────────────────── (CONTINUE) ──────────────────────────────┤
+ *                                                                                            │
+ *                                                        ┌───────── (ADJUST) ────────────────┤
+ *                                                        ↓                                   │
+ *                                                 adjust_dispatch ───────────────────────────┤
+ *                                                                                            │
+ *                                                                                       (FINISH)
+ *                                                                                            ↓
+ *                                                                                        finalize -> END
  *
- * read_context: Reads AGENTS.md, README.md, specs/, etc. from the repository
- * build_dag: Uses LLM to decompose goal into parallel tasks based on repo context
- * parallel_dispatch: Executes tasks using Codex/Claude workers
- *
- * Worker scaling is dynamic based on DAG complexity - the system automatically
- * determines the optimal number of workers based on task dependencies and concurrency.
+ * analyze_status: Reviews current state, browses files before planning
+ * build_dag: Creates 1-15 tasks for the next step
+ * plan_next: Reviews results and decides: CONTINUE, ADJUST, or FINISH
+ * adjust_dispatch: Executes 1-3 quick fix tasks, then returns to plan_next
  */
 
 import { StateGraph, END, START } from '@langchain/langgraph';
@@ -20,10 +28,13 @@ import {
   createInitialParallelState,
   type ChatMessageInput,
 } from './parallel-state.js';
-import { intakeNode, verifyNode, finalizeNode } from './nodes/index.js';
+import { intakeNode } from './nodes/index.js';
 import { readContextNode } from './nodes/read-context.js';
+import { analyzeStatusNode } from './nodes/analyze-status.js';
 import { buildDAGNode } from './nodes/build-dag.js';
 import { parallelDispatchNode } from './nodes/parallel-dispatch.js';
+import { planNextNode } from './nodes/plan-next.js';
+import { adjustDispatchNode } from './nodes/adjust-dispatch.js';
 import { log as eventLog } from '../services/event-bus.js';
 
 /**
@@ -34,37 +45,50 @@ export function createParallelSupervisorGraph() {
     // Add nodes
     .addNode('intake', intakeNode as (state: ParallelSupervisorStateType) => Promise<Partial<ParallelSupervisorStateType>>)
     .addNode('read_context', readContextNode)
+    .addNode('analyze_status', analyzeStatusNode)
     .addNode('build_dag', buildDAGNode)
     .addNode('parallel_dispatch', parallelDispatchNode)
-    .addNode('verify', verifyNode as (state: ParallelSupervisorStateType) => Promise<Partial<ParallelSupervisorStateType>>)
+    .addNode('plan_next', planNextNode)
+    .addNode('adjust_dispatch', adjustDispatchNode)
     .addNode('finalize', finalizeParallelNode)
 
     // Define edges
-    // START -> intake -> read_context -> build_dag -> parallel_dispatch -> verify -> finalize -> END
+    // START -> intake -> read_context -> analyze_status -> build_dag -> parallel_dispatch -> plan_next
     .addEdge(START, 'intake')
     .addEdge('intake', 'read_context')
-    .addEdge('read_context', 'build_dag')
+    .addEdge('read_context', 'analyze_status')
+    .addEdge('analyze_status', 'build_dag')
     .addEdge('build_dag', 'parallel_dispatch')
-    .addEdge('parallel_dispatch', 'verify')
+    .addEdge('parallel_dispatch', 'plan_next')
 
-    // Conditional edge from verify
-    .addConditionalEdges('verify', (state: ParallelSupervisorStateType) => {
-      // Check verification results
-      const progress = state.dag_progress;
-      if (!progress) {
+    // Conditional edge from plan_next - adjust, loop back, or finish
+    .addConditionalEdges('plan_next', (state: ParallelSupervisorStateType) => {
+      // Check the status set by planNextNode
+      if (state.status === 'completed') {
+        console.log('[Graph] Goal achieved, finalizing');
+        eventLog(state.run_id, 'info', 'supervisor', '🎯 Goal achieved, finalizing');
         return 'finalize';
       }
 
-      // If all tasks completed successfully and verification passed
-      if (progress.failed === 0 && progress.completed === progress.total) {
-        return 'finalize';
+      if (state.status === 'adjusting') {
+        console.log('[Graph] Adjustments needed, dispatching quick fixes');
+        eventLog(state.run_id, 'info', 'supervisor', '🔧 Dispatching adjustments');
+        return 'adjust_dispatch';
       }
 
-      // If there are failures, still finalize but with error status
-      return 'finalize';
+      // Continue with more tasks - go back to analyze_status
+      const iteration = state.iteration_count ?? 0;
+      console.log(`[Graph] Continuing to next iteration (${iteration + 1})`);
+      eventLog(state.run_id, 'info', 'supervisor', `🔄 Continuing to iteration ${iteration + 1}`);
+      return 'analyze_status';
     }, {
       finalize: 'finalize',
+      adjust_dispatch: 'adjust_dispatch',
+      analyze_status: 'analyze_status',
     })
+
+    // After adjustments, go back to plan_next to re-evaluate
+    .addEdge('adjust_dispatch', 'plan_next')
 
     .addEdge('finalize', END);
 

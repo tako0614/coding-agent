@@ -89,6 +89,7 @@ export type CreateRunRequest = z.infer<typeof CreateRunRequestSchema>;
 
 export interface RunResponse {
   run_id: string;
+  project_id?: string;
   status: string;
   user_goal: string;
   created_at: string;

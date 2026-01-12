@@ -12,6 +12,7 @@ import type { ParallelSupervisorStateType } from '../parallel-state.js';
 import { WorkerPool, createWorkerPool, DAGScheduler, createDAGScheduler } from '../../workers/index.js';
 import { EventEmitter } from 'events';
 import { log as eventLog } from '../../services/event-bus.js';
+import { getExecutorMode } from '../../services/settings-store.js';
 
 // Global event emitter for SSE updates
 export const parallelDispatchEvents = new EventEmitter();
@@ -32,14 +33,14 @@ export interface ParallelDispatchEvent {
 
 /**
  * Calculate optimal worker count based on DAG structure
+ * No hard limits - scales based on actual task count (1-15 tasks expected)
  */
 function calculateOptimalWorkerCount(dag: ParallelSupervisorStateType['dag']): Partial<WorkerPoolConfig> {
   if (!dag || dag.nodes.length === 0) {
-    return { min_workers: 2, max_workers: 5 };
+    return { min_workers: 1, max_workers: 1 };
   }
 
   // Find maximum parallelism (tasks that can run concurrently)
-  // This is approximated by finding tasks at each "level" of the DAG
   const nodeLevels = new Map<string, number>();
   const nodesByTaskId = new Map(dag.nodes.map(n => [n.task_id, n]));
 
@@ -50,7 +51,7 @@ function calculateOptimalWorkerCount(dag: ParallelSupervisorStateType['dag']): P
     }
 
     if (visited.has(taskId)) {
-      return 0; // Cycle detected, shouldn't happen in valid DAG
+      return 0;
     }
     visited.add(taskId);
 
@@ -66,7 +67,6 @@ function calculateOptimalWorkerCount(dag: ParallelSupervisorStateType['dag']): P
     return level;
   }
 
-  // Calculate levels for all nodes
   for (const node of dag.nodes) {
     getLevel(node.task_id);
   }
@@ -80,18 +80,14 @@ function calculateOptimalWorkerCount(dag: ParallelSupervisorStateType['dag']): P
   // Maximum concurrent tasks is the maximum nodes at any level
   const maxConcurrent = Math.max(...Array.from(levelCounts.values()), 1);
 
-  // Dynamic scaling:
-  // - min_workers: at least 2, or half of max concurrent
-  // - max_workers: min of (max concurrent, 20)
-  const minWorkers = Math.max(2, Math.ceil(maxConcurrent / 2));
-  const maxWorkers = Math.min(maxConcurrent, 20);
+  // Scale workers to match task concurrency (no artificial limits)
+  const workerCount = Math.max(1, maxConcurrent);
 
-  console.log(`[ParallelDispatch] DAG analysis: ${dag.nodes.length} tasks, max concurrency: ${maxConcurrent}`);
-  console.log(`[ParallelDispatch] Dynamic worker scaling: min=${minWorkers}, max=${maxWorkers}`);
+  console.log(`[ParallelDispatch] DAG: ${dag.nodes.length} tasks, max concurrency: ${maxConcurrent}, workers: ${workerCount}`);
 
   return {
-    min_workers: minWorkers,
-    max_workers: Math.max(minWorkers, maxWorkers),
+    min_workers: workerCount,
+    max_workers: workerCount,
   };
 }
 
@@ -115,7 +111,9 @@ export async function parallelDispatchNode(
   // Calculate optimal worker count based on DAG complexity
   const dynamicConfig = calculateOptimalWorkerCount(state.dag);
 
-  eventLog(state.run_id, 'info', 'system', `Worker pool config: ${dynamicConfig.min_workers}-${dynamicConfig.max_workers} workers`);
+  // Get executor mode from settings
+  const executorMode = getExecutorMode();
+  eventLog(state.run_id, 'info', 'system', `Worker pool config: ${dynamicConfig.min_workers}-${dynamicConfig.max_workers} workers (mode: ${executorMode})`);
 
   // Create worker pool with dynamic configuration and context
   const pool = createWorkerPool(
@@ -126,6 +124,7 @@ export async function parallelDispatchNode(
       userGoal: state.user_goal,
       repoContext: state.repo_context,
       dag: state.dag,
+      executorMode,
     }
   );
 
