@@ -135,7 +135,7 @@ class AutoUpdaterManager extends EventEmitter {
   /**
    * Format release notes for display
    */
-  private formatReleaseNotes(notes: string | ReleaseNoteInfo[] | null | undefined): string | undefined {
+  private formatReleaseNotes(notes: unknown): string | undefined {
     if (!notes) return undefined;
 
     if (typeof notes === 'string') {
@@ -143,7 +143,11 @@ class AutoUpdaterManager extends EventEmitter {
     }
 
     // If it's an array of release notes
-    return notes.map(note => note.note || '').join('\n\n');
+    if (Array.isArray(notes)) {
+      return notes.map((note: { note?: string | null }) => note.note ?? '').join('\n\n');
+    }
+
+    return undefined;
   }
 
   /**
@@ -275,12 +279,6 @@ class AutoUpdaterManager extends EventEmitter {
       this.checkInterval = undefined;
     }
   }
-}
-
-// Release note info type
-interface ReleaseNoteInfo {
-  version?: string;
-  note?: string;
 }
 
 // Singleton instance

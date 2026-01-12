@@ -171,14 +171,51 @@ function createTray(): void {
 function updateTrayStatus(status: string): void {
   if (!tray) return;
 
-  const contextMenu = tray.contextMenu;
-  if (contextMenu) {
-    const statusItem = contextMenu.getMenuItemById('server-status');
-    if (statusItem) {
-      statusItem.label = `Server: ${status}`;
-    }
-    tray.setContextMenu(contextMenu);
-  }
+  // Rebuild the context menu with updated status
+  const contextMenu = Menu.buildFromTemplate([
+    {
+      label: 'Open Supervisor Agent',
+      click: () => {
+        mainWindow?.show();
+        mainWindow?.focus();
+      },
+    },
+    {
+      label: 'Open in Browser',
+      click: () => {
+        shell.openExternal(`http://localhost:${SERVER_PORT}`);
+      },
+    },
+    { type: 'separator' },
+    {
+      label: `Server: ${status}`,
+      enabled: false,
+    },
+    {
+      label: 'Restart Server',
+      click: async () => {
+        await serverManager?.restart();
+      },
+    },
+    { type: 'separator' },
+    {
+      label: 'Check for Updates',
+      click: () => {
+        mainWindow?.webContents.send('update:check-requested');
+        setupAutoUpdater().checkForUpdates();
+      },
+    },
+    { type: 'separator' },
+    {
+      label: 'Quit',
+      click: () => {
+        isQuitting = true;
+        app.quit();
+      },
+    },
+  ]);
+
+  tray.setContextMenu(contextMenu);
 }
 
 /**
