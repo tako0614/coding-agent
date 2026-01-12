@@ -29,10 +29,13 @@ import {
   fetchCopilotStatus,
   fetchSettings,
   updateSettings,
+  fetchParallelSessions,
+  saveParallelSessions,
   type Project,
   type LogEntry,
   type CopilotModel,
   type ExecutorMode,
+  type ParallelSession,
 } from '../lib/api';
 import clsx from 'clsx';
 import { ChatMessage, type ChatMessageData } from '../components/chat';
@@ -48,6 +51,8 @@ interface AgentSession {
   input: string;
   messages: ChatMessageData[];
   logs: LogEntry[];
+  selectedModel?: string;
+  executorMode?: ExecutorMode;
 }
 
 // --- Shared Agent Panel Component ---
@@ -507,6 +512,9 @@ function ColumnsView({
   onAddFromHistory,
   onRemoveSession,
   onSwitchToTimeline,
+  defaultModel,
+  availableModels,
+  defaultExecutorMode,
 }: {
   sessions: AgentSession[];
   projects: Project[];
@@ -515,8 +523,12 @@ function ColumnsView({
   onAddFromHistory: (runId: string, projectId: string | undefined, goal: string) => void;
   onRemoveSession: (sessionId: string) => void;
   onSwitchToTimeline: () => void;
+  defaultModel: string;
+  availableModels: string[];
+  defaultExecutorMode: ExecutorMode;
 }) {
   const [showHistoryDropdown, setShowHistoryDropdown] = useState(false);
+  const columnsRef = useRef<HTMLDivElement>(null);
 
   // Fetch runs for history dropdown
   const { data: runsData } = useQuery({
@@ -524,6 +536,23 @@ function ColumnsView({
     queryFn: fetchRuns,
   });
   const runs = runsData?.runs || [];
+
+  // Handle mouse wheel for horizontal scroll
+  useEffect(() => {
+    const container = columnsRef.current;
+    if (!container) return;
+
+    const handleWheel = (e: WheelEvent) => {
+      // Only handle if we're scrolling vertically and there's horizontal overflow
+      if (Math.abs(e.deltaY) > Math.abs(e.deltaX) && container.scrollWidth > container.clientWidth) {
+        e.preventDefault();
+        container.scrollLeft += e.deltaY;
+      }
+    };
+
+    container.addEventListener('wheel', handleWheel, { passive: false });
+    return () => container.removeEventListener('wheel', handleWheel);
+  }, []);
 
   return (
     <div className="flex flex-col h-full bg-slate-100">
@@ -608,7 +637,7 @@ function ColumnsView({
       </div>
 
       {/* Columns */}
-      <div className="flex-1 flex overflow-x-auto">
+      <div ref={columnsRef} className="flex-1 flex overflow-x-auto">
         {sessions.length === 0 ? (
           <div className="flex-1 flex items-center justify-center">
             <button
@@ -627,6 +656,11 @@ function ColumnsView({
               projects={projects}
               onUpdate={(updates) => onUpdateSession(session.id, updates)}
               onClose={() => onRemoveSession(session.id)}
+              availableModels={availableModels}
+              selectedModel={session.selectedModel || defaultModel}
+              onModelChange={(model) => onUpdateSession(session.id, { selectedModel: model })}
+              executorMode={session.executorMode || defaultExecutorMode}
+              onExecutorModeChange={(mode) => onUpdateSession(session.id, { executorMode: mode })}
             />
           ))
         )}
@@ -683,6 +717,11 @@ function TimelineView({
     refetchInterval: 5000,
   });
   const runs = runsData?.runs || [];
+
+  // Debug: log runs data when it changes
+  useEffect(() => {
+    console.log('[TimelineView] runs updated:', runs.length, 'items', runs.map(r => r.run_id));
+  }, [runs]);
 
   // Fetch orphaned sessions
   const { data: orphanedData } = useQuery({
@@ -1003,11 +1042,29 @@ function TimelineView({
 // --- Main Page ---
 type ViewMode = 'timeline' | 'single' | 'columns';
 
+// Check if mobile device (screen width < 768px)
+function useIsMobile() {
+  const [isMobile, setIsMobile] = useState(() =>
+    typeof window !== 'undefined' && window.innerWidth < 768
+  );
+
+  useEffect(() => {
+    const handleResize = () => setIsMobile(window.innerWidth < 768);
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  return isMobile;
+}
+
 export default function AgentsPage() {
+  const isMobile = useIsMobile();
+  const [viewModeInitialized, setViewModeInitialized] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>('timeline');
   const [activeSession, setActiveSession] = useState<AgentSession | null>(null);
   const [parallelSessions, setParallelSessions] = useState<AgentSession[]>([]);
-  const [selectedModel, setSelectedModel] = useState('gpt-4.1');
+  const [parallelSessionsLoaded, setParallelSessionsLoaded] = useState(false);
+  const [selectedModel, setSelectedModel] = useState('gpt-5.2');
   const [executorMode, setExecutorMode] = useState<ExecutorMode>('agent');
 
   // Load projects
@@ -1016,6 +1073,65 @@ export default function AgentsPage() {
     queryFn: fetchProjects,
   });
   const projects = projectsData?.projects || [];
+
+  // Load parallel sessions from server
+  const { data: savedSessions } = useQuery({
+    queryKey: ['parallelSessions'],
+    queryFn: fetchParallelSessions,
+    staleTime: Infinity, // Don't refetch automatically
+  });
+
+  // Save parallel sessions mutation
+  const saveSessionsMutation = useMutation({
+    mutationFn: saveParallelSessions,
+  });
+
+  // Initialize view mode based on device type (only once)
+  useEffect(() => {
+    if (!viewModeInitialized) {
+      setViewMode(isMobile ? 'timeline' : 'columns');
+      setViewModeInitialized(true);
+    }
+  }, [isMobile, viewModeInitialized]);
+
+  // Load saved sessions on mount
+  useEffect(() => {
+    if (savedSessions?.sessions && !parallelSessionsLoaded) {
+      const loadedSessions: AgentSession[] = savedSessions.sessions.map((s: ParallelSession) => ({
+        id: s.id,
+        projectId: s.projectId,
+        runId: s.runId,
+        status: s.status,
+        input: s.input,
+        messages: [],
+        logs: [],
+        selectedModel: s.selectedModel,
+        executorMode: s.executorMode,
+      }));
+      setParallelSessions(loadedSessions);
+      setParallelSessionsLoaded(true);
+    }
+  }, [savedSessions, parallelSessionsLoaded]);
+
+  // Save sessions to server when they change (debounced)
+  useEffect(() => {
+    if (!parallelSessionsLoaded) return;
+
+    const timeout = setTimeout(() => {
+      const sessionsToSave: ParallelSession[] = parallelSessions.map(s => ({
+        id: s.id,
+        projectId: s.projectId,
+        runId: s.runId,
+        status: s.status,
+        input: s.input,
+        selectedModel: s.selectedModel,
+        executorMode: s.executorMode,
+      }));
+      saveSessionsMutation.mutate(sessionsToSave);
+    }, 500);
+
+    return () => clearTimeout(timeout);
+  }, [parallelSessions, parallelSessionsLoaded]);
 
   // Load copilot models
   const { data: copilotStatus } = useQuery({
@@ -1218,6 +1334,59 @@ export default function AgentsPage() {
     ));
   };
 
+  // Add session from history to parallel mode
+  const addFromHistoryToParallel = async (runId: string, projectId: string | undefined, goal: string) => {
+    try {
+      const run = await fetchRun(runId);
+      const status: AgentStatus = run.status === 'running' || run.status === 'pending'
+        ? 'running'
+        : run.status === 'completed'
+        ? 'completed'
+        : run.status === 'failed'
+        ? 'failed'
+        : run.status === 'interrupted'
+        ? 'interrupted'
+        : 'idle';
+
+      const { logs } = await fetchLogs(runId);
+
+      const messages: ChatMessageData[] = [
+        {
+          id: `user-${Date.now()}`,
+          type: 'user',
+          content: goal,
+          timestamp: run.created_at,
+        },
+        ...logs
+          .filter(l => l.level === 'info' || l.level === 'warn' || l.level === 'error')
+          .map(l => ({
+            id: `${l.timestamp}-${Math.random()}`,
+            type: 'agent' as const,
+            content: l.message,
+            timestamp: l.timestamp,
+            status: l.level === 'error' ? 'error' as const : 'success' as const,
+            executor: (l.source === 'claude' || l.source === 'codex')
+              ? l.source as 'claude' | 'codex'
+              : undefined,
+          })),
+      ];
+
+      const newSession: AgentSession = {
+        id: `session-${Date.now()}`,
+        projectId: projectId || null,
+        runId,
+        status,
+        input: '',
+        messages,
+        logs,
+      };
+
+      setParallelSessions([...parallelSessions, newSession]);
+    } catch (error) {
+      console.error('Failed to load run for parallel:', error);
+    }
+  };
+
   const switchToParallel = () => {
     setViewMode('columns');
     if (parallelSessions.length === 0) {
@@ -1253,8 +1422,12 @@ export default function AgentsPage() {
           projects={projects}
           onUpdateSession={updateParallelSession}
           onAddSession={addParallelSession}
+          onAddFromHistory={addFromHistoryToParallel}
           onRemoveSession={removeParallelSession}
           onSwitchToTimeline={switchToTimeline}
+          defaultModel={selectedModel}
+          availableModels={availableModels}
+          defaultExecutorMode={executorMode}
         />
       ) : (
         <TimelineView

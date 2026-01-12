@@ -6,8 +6,8 @@ import { Hono } from 'hono';
 import { v4 as uuidv4 } from 'uuid';
 import { createRunId } from '@supervisor/protocol';
 import { ChatCompletionRequestSchema, type ChatCompletionResponse } from '../types.js';
-import { parallelRunStore } from '../run-store.js';
-import { runParallelSupervisor } from '../../graph/parallel-graph.js';
+import { runStore } from '../run-store.js';
+import { runSimplifiedSupervisor } from '../../graph/index.js';
 
 const chat = new Hono();
 
@@ -53,15 +53,7 @@ chat.post('/completions', async (c) => {
     // Generate run ID
     const runId = request.run_id ?? createRunId();
 
-    // Convert messages to chat history format
-    const chatHistory = request.messages.map((m) => ({
-      role: m.role,
-      content: m.content,
-      name: m.name,
-    }));
-
     console.log(`[API] Starting supervisor run ${runId}`);
-    console.log(`[API] Chat history: ${chatHistory.length} messages`);
 
     // Handle streaming (not fully implemented for MVP)
     if (request.stream) {
@@ -70,14 +62,13 @@ chat.post('/completions', async (c) => {
       c.header('Cache-Control', 'no-cache');
       c.header('Connection', 'keep-alive');
 
-      // Start the run in background with chat history
-      const runPromise = runParallelSupervisor({
+      // Start the run in background
+      const runPromise = runSimplifiedSupervisor({
         userGoal,
         repoPath,
         runId,
-        chatHistory,
       });
-      parallelRunStore.setRunning(runId, runPromise, userGoal, undefined, repoPath);
+      runStore.setRunning(runId, runPromise, userGoal, undefined, repoPath);
 
       // Send initial chunk
       const initialChunk = {
@@ -94,7 +85,7 @@ chat.post('/completions', async (c) => {
 
       // Wait for completion and stream result
       const finalState = await runPromise;
-      parallelRunStore.set(runId, finalState);
+      runStore.set(runId, finalState);
 
       const finalChunk = {
         id: `chatcmpl-${uuidv4()}`,
@@ -103,7 +94,7 @@ chat.post('/completions', async (c) => {
         model: request.model,
         choices: [{
           index: 0,
-          delta: { content: finalState.final_report ?? `Run completed with status: ${finalState.status}` },
+          delta: { content: finalState.final_summary ?? `Run completed with status: ${finalState.status}` },
           finish_reason: 'stop',
         }],
       };
@@ -115,17 +106,16 @@ chat.post('/completions', async (c) => {
       );
     }
 
-    // Non-streaming: run synchronously with chat history
-    const runPromise = runParallelSupervisor({
+    // Non-streaming: run synchronously
+    const runPromise = runSimplifiedSupervisor({
       userGoal,
       repoPath,
       runId,
-      chatHistory,
     });
-    parallelRunStore.setRunning(runId, runPromise, userGoal);
+    runStore.setRunning(runId, runPromise, userGoal);
 
     const finalState = await runPromise;
-    parallelRunStore.set(runId, finalState);
+    runStore.set(runId, finalState);
 
     // Build response
     const response: ChatCompletionResponse = {
@@ -137,7 +127,7 @@ chat.post('/completions', async (c) => {
         index: 0,
         message: {
           role: 'assistant',
-          content: finalState.final_report ?? `Run completed with status: ${finalState.status}`,
+          content: finalState.final_summary ?? `Run completed with status: ${finalState.status}`,
         },
         finish_reason: 'stop',
       }],
@@ -149,8 +139,8 @@ chat.post('/completions', async (c) => {
       supervisor: {
         run_id: runId,
         status: finalState.status,
-        verification_passed: finalState.dag_progress?.failed === 0,
-        files_modified: finalState.reports.flatMap(r => r.changes?.files_modified ?? []),
+        verification_passed: finalState.status === 'completed',
+        files_modified: [],
       },
     };
 

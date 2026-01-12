@@ -57,7 +57,8 @@
       "Bash(unzip:*)",
       "Bash(tasklist:*)",
       "Bash(/c/Users/shout/desktop/github/agent/apps/supervisor-backend/vendor/winvnc.exe --help)",
-      "Bash(cmd /c \"taskkill /PID 1843268 /F\")"
+      "Bash(cmd /c \"taskkill /PID 1843268 /F\")",
+      "Bash(ping:*)"
     ]
   }
 }

@@ -3,13 +3,11 @@
  * Uses in-memory for running state, persists completed runs to database
  */
 
-import type { SupervisorStateType } from '../graph/state.js';
-import type { ParallelSupervisorStateType } from '../graph/parallel-state.js';
-import type { RunResponse, DAGResponse, WorkerPoolResponse } from './types.js';
+import type { SimplifiedSupervisorStateType } from '../graph/index.js';
+import type { RunResponse, WorkerPoolResponse } from './types.js';
 import { db } from '../services/db.js';
 
 // Prepared statements for runs table
-// Note: status is NOT stored in DB - it's derived from actual data
 const insertRunStmt = db.prepare(`
   INSERT OR REPLACE INTO runs (
     run_id, project_id, user_goal, repo_path,
@@ -38,11 +36,9 @@ const deleteRunStmt = db.prepare(`
   DELETE FROM runs WHERE run_id = ?
 `);
 
-// Update run data (no status field - derived from data)
 const updateRunStmt = db.prepare(`
   UPDATE runs SET updated_at = @updated_at,
-    final_report = @final_report, error = @error,
-    dag_json = @dag_json, dag_progress_json = @dag_progress_json
+    final_report = @final_report, error = @error
   WHERE run_id = @run_id
 `);
 
@@ -59,108 +55,10 @@ interface RunRow {
   updated_at: string;
 }
 
-class RunStore {
-  private runs: Map<string, SupervisorStateType> = new Map();
-  private runningPromises: Map<string, Promise<SupervisorStateType>> = new Map();
-
-  /**
-   * Store a run state
-   */
-  set(runId: string, state: SupervisorStateType): void {
-    this.runs.set(runId, state);
-  }
-
-  /**
-   * Get a run state
-   */
-  get(runId: string): SupervisorStateType | undefined {
-    return this.runs.get(runId);
-  }
-
-  /**
-   * Check if a run exists
-   */
-  has(runId: string): boolean {
-    return this.runs.has(runId);
-  }
-
-  /**
-   * Delete a run
-   */
-  delete(runId: string): boolean {
-    this.runningPromises.delete(runId);
-    return this.runs.delete(runId);
-  }
-
-  /**
-   * List all runs
-   */
-  list(): RunResponse[] {
-    return Array.from(this.runs.values()).map(state => this.toResponse(state));
-  }
-
-  /**
-   * Track a running promise
-   */
-  setRunning(runId: string, promise: Promise<SupervisorStateType>): void {
-    this.runningPromises.set(runId, promise);
-  }
-
-  /**
-   * Check if a run is currently executing
-   */
-  isRunning(runId: string): boolean {
-    return this.runningPromises.has(runId);
-  }
-
-  /**
-   * Wait for a run to complete
-   */
-  async waitFor(runId: string): Promise<SupervisorStateType | undefined> {
-    const promise = this.runningPromises.get(runId);
-    if (promise) {
-      return promise;
-    }
-    return this.runs.get(runId);
-  }
-
-  /**
-   * Convert state to response format
-   */
-  toResponse(state: SupervisorStateType): RunResponse {
-    return {
-      run_id: state.run_id,
-      status: state.status,
-      user_goal: state.user_goal,
-      created_at: state.created_at,
-      updated_at: state.updated_at,
-      verification_passed: state.verification_results?.all_passed,
-      error: state.error,
-      final_report: state.final_report,
-    };
-  }
-
-  /**
-   * Clear all runs
-   */
-  clear(): void {
-    this.runs.clear();
-    this.runningPromises.clear();
-  }
-}
-
-// Singleton instance
-export const runStore = new RunStore();
-
 /**
  * Helper to convert DB row to RunResponse
- * Derives actual status from the data, NOT from stored status field
- * - If has final_report → completed
- * - If has error → failed
- * - Otherwise (was running when server crashed) → interrupted
  */
 function rowToRunResponse(row: RunRow): RunResponse {
-  // Derive actual status from data, ignore stored status
   let actualStatus: RunResponse['status'];
 
   if (row.final_report) {
@@ -168,8 +66,6 @@ function rowToRunResponse(row: RunRow): RunResponse {
   } else if (row.error) {
     actualStatus = 'failed';
   } else {
-    // No final_report and no error means it was interrupted
-    // (was running when server crashed)
     actualStatus = 'interrupted';
   }
 
@@ -187,12 +83,12 @@ function rowToRunResponse(row: RunRow): RunResponse {
 }
 
 /**
- * Parallel run store for DAG-based parallel execution
+ * Run store for Supervisor Agent execution
  * Persists completed runs to SQLite database
  */
-class ParallelRunStore {
-  private runs: Map<string, ParallelSupervisorStateType> = new Map();
-  private runningPromises: Map<string, Promise<ParallelSupervisorStateType>> = new Map();
+class RunStore {
+  private runs: Map<string, SimplifiedSupervisorStateType> = new Map();
+  private runningPromises: Map<string, Promise<SimplifiedSupervisorStateType>> = new Map();
   private runningGoals: Map<string, string> = new Map();
   private runningStartTimes: Map<string, string> = new Map();
   private runProjectIds: Map<string, string> = new Map();
@@ -201,85 +97,73 @@ class ParallelRunStore {
   /**
    * Store a run state (and persist to DB)
    */
-  set(runId: string, state: ParallelSupervisorStateType): void {
+  set(runId: string, state: SimplifiedSupervisorStateType): void {
     this.runs.set(runId, state);
     this.runningPromises.delete(runId);
-
-    // Persist to database
     this.persistToDb(runId, state);
-
     this.runningGoals.delete(runId);
     this.runningStartTimes.delete(runId);
   }
 
   /**
    * Persist run state to database
-   * Note: status is NOT stored - it's derived from final_report/error
    */
-  private persistToDb(runId: string, state: ParallelSupervisorStateType): void {
+  private persistToDb(runId: string, state: SimplifiedSupervisorStateType): void {
     try {
+      console.log(`[RunStore] Persisting run ${runId} to DB`);
       insertRunStmt.run({
         run_id: state.run_id,
         project_id: state.project_id || this.runProjectIds.get(runId) || null,
         user_goal: state.user_goal,
         repo_path: state.repo_path || this.runRepoPaths.get(runId) || '',
-        final_report: state.final_report || null,
+        final_report: state.final_summary || null,
         error: state.error || null,
-        dag_json: state.dag ? JSON.stringify(state.dag) : null,
-        dag_progress_json: state.dag_progress ? JSON.stringify(state.dag_progress) : null,
+        dag_json: null,
+        dag_progress_json: null,
         created_at: state.created_at,
         updated_at: state.updated_at,
       });
+      console.log(`[RunStore] Successfully persisted run ${runId}`);
     } catch (err) {
-      console.error('[ParallelRunStore] Failed to persist run to DB:', err);
+      console.error('[RunStore] Failed to persist run to DB:', err);
     }
   }
 
   /**
    * Update run data in database
-   * Note: status is NOT stored - it's derived from final_report/error
    */
-  updateRun(runId: string, state: ParallelSupervisorStateType): void {
+  updateRun(runId: string, state: SimplifiedSupervisorStateType): void {
     try {
       updateRunStmt.run({
         run_id: runId,
         updated_at: state.updated_at,
-        final_report: state.final_report || null,
+        final_report: state.final_summary || null,
         error: state.error || null,
-        dag_json: state.dag ? JSON.stringify(state.dag) : null,
-        dag_progress_json: state.dag_progress ? JSON.stringify(state.dag_progress) : null,
       });
     } catch (err) {
-      console.error('[ParallelRunStore] Failed to update run in DB:', err);
+      console.error('[RunStore] Failed to update run in DB:', err);
     }
   }
 
   /**
    * Get a run state (from memory or DB)
-   * Derives status from actual data, not stored status field
    */
-  get(runId: string): ParallelSupervisorStateType | undefined {
-    // Check in-memory first
+  get(runId: string): SimplifiedSupervisorStateType | undefined {
     const memState = this.runs.get(runId);
     if (memState) return memState;
 
-    // Try loading from DB
     try {
       const row = getRunStmt.get(runId) as RunRow | undefined;
       if (row) {
-        // Derive actual status from data, ignore stored status
-        let actualStatus: ParallelSupervisorStateType['status'];
+        let actualStatus: SimplifiedSupervisorStateType['status'];
         if (row.final_report) {
           actualStatus = 'completed';
         } else if (row.error) {
           actualStatus = 'failed';
         } else {
-          // No final_report and no error means it was interrupted
-          // Cast to any because 'interrupted' may not be in the strict type
-          actualStatus = 'failed' as ParallelSupervisorStateType['status'];
+          actualStatus = 'failed';
         }
 
-        // Reconstruct state from DB with required default values
         const state = {
           run_id: row.run_id,
           project_id: row.project_id || undefined,
@@ -288,23 +172,14 @@ class ParallelRunStore {
           repo_path: row.repo_path,
           created_at: row.created_at,
           updated_at: row.updated_at,
-          final_report: row.final_report || undefined,
+          final_summary: row.final_report || undefined,
           error: row.error || undefined,
-          dag: row.dag_json ? JSON.parse(row.dag_json) : undefined,
-          dag_progress: row.dag_progress_json ? JSON.parse(row.dag_progress_json) : undefined,
-          // Required default values for type compatibility
-          spec: undefined,
-          worker_pool_status: undefined,
           reports: [],
-          artifacts: [],
-          messages: [],
-          model_policy: { auto_downgrade: true },
-          security_policy: { sandbox_enforced: true },
-        } as unknown as ParallelSupervisorStateType;
+        } as unknown as SimplifiedSupervisorStateType;
         return state;
       }
     } catch (err) {
-      console.error('[ParallelRunStore] Failed to load run from DB:', err);
+      console.error('[RunStore] Failed to load run from DB:', err);
     }
     return undefined;
   }
@@ -316,7 +191,6 @@ class ParallelRunStore {
     if (this.runs.has(runId) || this.runningPromises.has(runId)) {
       return true;
     }
-    // Check DB
     try {
       const row = getRunStmt.get(runId) as RunRow | undefined;
       return !!row;
@@ -334,24 +208,22 @@ class ParallelRunStore {
     this.runRepoPaths.delete(runId);
     const memDeleted = this.runs.delete(runId);
 
-    // Delete from DB
     try {
       const result = deleteRunStmt.run(runId);
       return memDeleted || result.changes > 0;
     } catch (err) {
-      console.error('[ParallelRunStore] Failed to delete run from DB:', err);
+      console.error('[RunStore] Failed to delete run from DB:', err);
       return memDeleted;
     }
   }
 
   /**
    * List all runs
-   * Running: from memory only
-   * Completed/Failed: from DB only
    */
   list(): RunResponse[] {
-    // Get running runs from memory
-    const running = Array.from(this.runningPromises.keys()).map(runId => ({
+    const runningIds = new Set(this.runningPromises.keys());
+
+    const running = Array.from(runningIds).map(runId => ({
       run_id: runId,
       project_id: this.runProjectIds.get(runId),
       status: 'running' as const,
@@ -360,51 +232,52 @@ class ParallelRunStore {
       updated_at: new Date().toISOString(),
     }));
 
-    // Get completed/failed runs from DB
     try {
       const rows = listRunsStmt.all() as RunRow[];
-      const fromDb = rows.map(rowToRunResponse);
+      const fromDb = rows
+        .filter(row => !runningIds.has(row.run_id))
+        .map(rowToRunResponse);
       return [...running, ...fromDb];
     } catch (err) {
-      console.error('[ParallelRunStore] Failed to list runs from DB:', err);
+      console.error('[RunStore] Failed to list runs from DB:', err);
       return running;
     }
   }
 
   /**
    * List runs by project ID
-   * Running: from memory, Completed/Failed: from DB
    */
   listByProject(projectId: string): RunResponse[] {
-    // Get running runs for this project from memory
-    const running = Array.from(this.runningPromises.keys())
-      .filter(runId => this.runProjectIds.get(runId) === projectId)
-      .map(runId => ({
-        run_id: runId,
-        project_id: projectId,
-        status: 'running' as const,
-        user_goal: this.runningGoals.get(runId) ?? 'Unknown goal',
-        created_at: this.runningStartTimes.get(runId) ?? new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      }));
+    const runningIds = new Set(
+      Array.from(this.runningPromises.keys())
+        .filter(runId => this.runProjectIds.get(runId) === projectId)
+    );
 
-    // Get completed/failed runs from DB
+    const running = Array.from(runningIds).map(runId => ({
+      run_id: runId,
+      project_id: projectId,
+      status: 'running' as const,
+      user_goal: this.runningGoals.get(runId) ?? 'Unknown goal',
+      created_at: this.runningStartTimes.get(runId) ?? new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }));
+
     try {
       const rows = listRunsByProjectStmt.all(projectId) as RunRow[];
-      const fromDb = rows.map(rowToRunResponse);
+      const fromDb = rows
+        .filter(row => !runningIds.has(row.run_id))
+        .map(rowToRunResponse);
       return [...running, ...fromDb];
     } catch (err) {
-      console.error('[ParallelRunStore] Failed to list project runs from DB:', err);
+      console.error('[RunStore] Failed to list project runs from DB:', err);
       return running;
     }
   }
 
   /**
    * Track a running promise
-   * Note: We don't persist to DB here - only when run completes/fails
-   * This avoids status inconsistency if server crashes
    */
-  setRunning(runId: string, promise: Promise<ParallelSupervisorStateType>, goal?: string, projectId?: string, repoPath?: string): void {
+  setRunning(runId: string, promise: Promise<SimplifiedSupervisorStateType>, goal?: string, projectId?: string, repoPath?: string): void {
     this.runningPromises.set(runId, promise);
     if (goal) {
       this.runningGoals.set(runId, goal);
@@ -415,9 +288,25 @@ class ParallelRunStore {
     if (repoPath) {
       this.runRepoPaths.set(runId, repoPath);
     }
-    this.runningStartTimes.set(runId, new Date().toISOString());
-    // Don't insert to DB - logs are saved separately via eventBus
-    // Run record is only created when it completes/fails
+    const now = new Date().toISOString();
+    this.runningStartTimes.set(runId, now);
+
+    try {
+      insertRunStmt.run({
+        run_id: runId,
+        project_id: projectId || null,
+        user_goal: goal || '',
+        repo_path: repoPath || '',
+        final_report: null,
+        error: null,
+        dag_json: null,
+        dag_progress_json: null,
+        created_at: now,
+        updated_at: now,
+      });
+    } catch (err) {
+      console.error('[RunStore] Failed to insert placeholder run:', err);
+    }
   }
 
   /**
@@ -430,7 +319,7 @@ class ParallelRunStore {
   /**
    * Wait for a run to complete
    */
-  async waitFor(runId: string): Promise<ParallelSupervisorStateType | undefined> {
+  async waitFor(runId: string): Promise<SimplifiedSupervisorStateType | undefined> {
     const promise = this.runningPromises.get(runId);
     if (promise) {
       return promise;
@@ -441,7 +330,7 @@ class ParallelRunStore {
   /**
    * Convert state to response format
    */
-  toResponse(state: ParallelSupervisorStateType): RunResponse {
+  toResponse(state: SimplifiedSupervisorStateType): RunResponse {
     return {
       run_id: state.run_id,
       project_id: state.project_id,
@@ -449,75 +338,17 @@ class ParallelRunStore {
       user_goal: state.user_goal,
       created_at: state.created_at,
       updated_at: state.updated_at,
-      verification_passed: state.dag_progress?.failed === 0,
+      verification_passed: state.status === 'completed',
       error: state.error,
-      final_report: state.final_report,
+      final_report: state.final_summary,
     };
   }
 
   /**
-   * Get DAG response
+   * Get Worker Pool response (not available in simplified state)
    */
-  getDAG(runId: string): DAGResponse | null {
-    const state = this.runs.get(runId);
-    if (!state?.dag) return null;
-
-    return {
-      dag_id: state.dag.dag_id,
-      run_id: state.dag.run_id,
-      nodes: state.dag.nodes.map(node => ({
-        task_id: node.task_id,
-        name: node.name,
-        description: node.description,
-        dependencies: node.dependencies,
-        executor_preference: node.executor_preference,
-        priority: node.priority,
-        status: node.status,
-        assigned_worker_id: node.assigned_worker_id,
-        started_at: node.started_at,
-        completed_at: node.completed_at,
-        error: node.error,
-      })),
-      edges: state.dag.edges,
-      progress: state.dag_progress ?? {
-        total: state.dag.nodes.length,
-        completed: 0,
-        failed: 0,
-        running: 0,
-        ready: 0,
-        pending: state.dag.nodes.length,
-        percentage: 0,
-      },
-      created_at: state.dag.created_at,
-      updated_at: state.dag.updated_at,
-    };
-  }
-
-  /**
-   * Get Worker Pool response
-   */
-  getWorkerPool(runId: string): WorkerPoolResponse | null {
-    const state = this.runs.get(runId);
-    if (!state?.worker_pool_status) return null;
-
-    return {
-      total_workers: state.worker_pool_status.total_workers,
-      idle_workers: state.worker_pool_status.idle_workers,
-      busy_workers: state.worker_pool_status.busy_workers,
-      error_workers: state.worker_pool_status.error_workers,
-      workers: state.worker_pool_status.workers.map(worker => ({
-        worker_id: worker.worker_id,
-        executor_type: worker.executor_type,
-        status: worker.status,
-        current_task_id: worker.current_task_id,
-        created_at: worker.created_at,
-        completed_tasks: worker.completed_tasks,
-        failed_tasks: worker.failed_tasks,
-        avg_task_duration_ms: worker.avg_task_duration_ms,
-      })),
-      total_tasks_completed: state.worker_pool_status.total_tasks_completed,
-      total_tasks_failed: state.worker_pool_status.total_tasks_failed,
-    };
+  getWorkerPool(_runId: string): WorkerPoolResponse | null {
+    return null;
   }
 
   /**
@@ -529,5 +360,8 @@ class ParallelRunStore {
   }
 }
 
-// Singleton instance for parallel runs
-export const parallelRunStore = new ParallelRunStore();
+// Singleton instances
+export const runStore = new RunStore();
+
+// Alias for backwards compatibility
+export const parallelRunStore = runStore;

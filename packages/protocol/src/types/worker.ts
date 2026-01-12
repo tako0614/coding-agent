@@ -3,7 +3,21 @@
  * For parallel executor pool management
  */
 
-export type WorkerStatus = 'idle' | 'busy' | 'error' | 'shutdown' | 'starting';
+// =============================================================================
+// Constants
+// =============================================================================
+
+/** Context truncation limit (characters) */
+export const CONTEXT_TRUNCATION_LIMIT = 4_000;
+
+/** Log preview length (characters) */
+export const LOG_PREVIEW_LENGTH = 300;
+
+// =============================================================================
+// Types
+// =============================================================================
+
+export type WorkerStatus = 'idle' | 'running' | 'completed' | 'error';
 export type WorkerExecutorType = 'codex' | 'claude';
 
 export interface Worker {
@@ -17,8 +31,6 @@ export interface Worker {
   current_task_id?: string;
   /** When the worker was created */
   created_at: string;
-  /** When the worker became idle (for idle timeout) */
-  idle_since?: string;
   /** Number of tasks completed by this worker */
   completed_tasks: number;
   /** Number of failed tasks */
@@ -27,53 +39,6 @@ export interface Worker {
   avg_task_duration_ms?: number;
   /** Last error message */
   last_error?: string;
-}
-
-export interface WorkerPoolConfig {
-  /** Minimum number of workers to maintain */
-  min_workers: number;
-  /** Maximum number of workers allowed */
-  max_workers: number;
-  /** Ratio of Codex workers (0.0 - 1.0) */
-  codex_ratio: number;
-  /** Idle timeout before shutting down extra workers (ms) */
-  idle_timeout_ms: number;
-  /** Health check interval (ms) */
-  health_check_interval_ms: number;
-  /** Task timeout (ms) */
-  task_timeout_ms: number;
-  /** Max retries for failed tasks */
-  max_task_retries: number;
-}
-
-export interface WorkerPoolStatus {
-  /** Total number of active workers */
-  total_workers: number;
-  /** Number of idle workers */
-  idle_workers: number;
-  /** Number of busy workers */
-  busy_workers: number;
-  /** Number of workers in error state */
-  error_workers: number;
-  /** All worker details */
-  workers: Worker[];
-  /** Pool configuration */
-  config: WorkerPoolConfig;
-  /** Total tasks completed by the pool */
-  total_tasks_completed: number;
-  /** Total tasks failed */
-  total_tasks_failed: number;
-}
-
-export interface WorkerTaskAssignment {
-  /** Worker ID */
-  worker_id: string;
-  /** Task ID */
-  task_id: string;
-  /** When the assignment was made */
-  assigned_at: string;
-  /** Timeout for this assignment */
-  timeout_at: string;
 }
 
 // Factory function
@@ -97,16 +62,40 @@ export function isWorkerExecutorType(value: unknown): value is WorkerExecutorTyp
 
 export function isWorkerStatus(value: unknown): value is WorkerStatus {
   return typeof value === 'string' &&
-    ['idle', 'busy', 'error', 'shutdown', 'starting'].includes(value);
+    ['idle', 'running', 'completed', 'error'].includes(value);
 }
 
-// Default configuration
-export const DEFAULT_WORKER_POOL_CONFIG: WorkerPoolConfig = {
-  min_workers: 5,
-  max_workers: 20,
-  codex_ratio: 0.6,
-  idle_timeout_ms: 60000,        // 1 minute
-  health_check_interval_ms: 10000, // 10 seconds
-  task_timeout_ms: 300000,       // 5 minutes
-  max_task_retries: 3,
-};
+// =============================================================================
+// Cost Tracking
+// =============================================================================
+
+export interface CostMetrics {
+  /** Total API calls made */
+  api_calls: number;
+  /** Estimated input tokens */
+  input_tokens: number;
+  /** Estimated output tokens */
+  output_tokens: number;
+  /** Estimated cost in USD */
+  estimated_cost_usd: number;
+  /** Breakdown by executor type */
+  by_executor: Record<WorkerExecutorType, {
+    api_calls: number;
+    input_tokens: number;
+    output_tokens: number;
+    estimated_cost_usd: number;
+  }>;
+}
+
+export function createEmptyCostMetrics(): CostMetrics {
+  return {
+    api_calls: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    estimated_cost_usd: 0,
+    by_executor: {
+      codex: { api_calls: 0, input_tokens: 0, output_tokens: 0, estimated_cost_usd: 0 },
+      claude: { api_calls: 0, input_tokens: 0, output_tokens: 0, estimated_cost_usd: 0 },
+    },
+  };
+}

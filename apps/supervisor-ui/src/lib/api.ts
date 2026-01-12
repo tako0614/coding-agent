@@ -209,6 +209,32 @@ export async function deleteOrphanedSession(runId: string): Promise<void> {
   if (!res.ok) throw new Error('Failed to delete orphaned session');
 }
 
+// Parallel Sessions API
+export interface ParallelSession {
+  id: string;
+  projectId: string | null;
+  runId: string | null;
+  status: 'idle' | 'running' | 'completed' | 'failed' | 'interrupted';
+  input: string;
+  selectedModel?: string;
+  executorMode?: ExecutorMode;
+}
+
+export async function fetchParallelSessions(): Promise<{ sessions: ParallelSession[] }> {
+  const res = await fetch(`${API_BASE}/api/sessions/parallel`);
+  if (!res.ok) throw new Error('Failed to fetch parallel sessions');
+  return res.json();
+}
+
+export async function saveParallelSessions(sessions: ParallelSession[]): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/sessions/parallel`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessions }),
+  });
+  if (!res.ok) throw new Error('Failed to save parallel sessions');
+}
+
 // Usage API
 export async function fetchUsage(): Promise<UsageStats> {
   const res = await fetch(`${API_BASE}/api/usage`);

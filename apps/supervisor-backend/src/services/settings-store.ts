@@ -19,6 +19,12 @@ export interface AppSettings {
   dag_model?: string;
   // Executor mode: auto, codex_only, claude_only
   executor_mode?: ExecutorMode;
+  // Shell command configuration
+  shell_allowlist?: string[];
+  shell_denylist?: string[];
+  // Worker pool configuration
+  max_workers?: number;
+  task_timeout_ms?: number;
 }
 
 // Known setting keys
@@ -31,7 +37,26 @@ export const SETTING_KEYS = {
   USE_COPILOT_API: 'use_copilot_api',
   DAG_MODEL: 'dag_model',
   EXECUTOR_MODE: 'executor_mode',
+  SHELL_ALLOWLIST: 'shell_allowlist',
+  SHELL_DENYLIST: 'shell_denylist',
+  MAX_WORKERS: 'max_workers',
+  TASK_TIMEOUT_MS: 'task_timeout_ms',
 } as const;
+
+// Default shell command allowlist
+export const DEFAULT_SHELL_ALLOWLIST = [
+  'npm', 'npx', 'pnpm', 'yarn', 'bun',
+  'node', 'deno', 'tsx', 'ts-node',
+  'tsc', 'vitest', 'jest', 'mocha', 'ava',
+  'eslint', 'prettier', 'biome',
+  'git', 'gh',
+  'cat', 'ls', 'pwd', 'echo', 'grep', 'find', 'head', 'tail',
+  'mkdir', 'rm', 'cp', 'mv', 'touch',
+  'curl', 'wget',
+  'python', 'python3', 'pip', 'pip3',
+  'go', 'cargo', 'rustc',
+  'docker', 'docker-compose',
+];
 
 type SettingKey = typeof SETTING_KEYS[keyof typeof SETTING_KEYS];
 
@@ -288,4 +313,116 @@ export function getGitHubToken(): string | undefined {
     return fromSettings;
   }
   return process.env['GITHUB_TOKEN'];
+}
+
+/**
+ * Get shell command allowlist
+ */
+export function getShellAllowlist(): string[] {
+  const fromSettings = getSetting(SETTING_KEYS.SHELL_ALLOWLIST);
+  if (fromSettings) {
+    try {
+      const parsed = JSON.parse(fromSettings);
+      if (Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch {
+      // Fall through to default
+    }
+  }
+  return DEFAULT_SHELL_ALLOWLIST;
+}
+
+/**
+ * Set shell command allowlist
+ */
+export function setShellAllowlist(allowlist: string[]): void {
+  setSetting(SETTING_KEYS.SHELL_ALLOWLIST, JSON.stringify(allowlist));
+}
+
+/**
+ * Get shell command denylist
+ */
+export function getShellDenylist(): string[] {
+  const fromSettings = getSetting(SETTING_KEYS.SHELL_DENYLIST);
+  if (fromSettings) {
+    try {
+      const parsed = JSON.parse(fromSettings);
+      if (Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch {
+      // Fall through to default
+    }
+  }
+  return [];
+}
+
+/**
+ * Set shell command denylist
+ */
+export function setShellDenylist(denylist: string[]): void {
+  setSetting(SETTING_KEYS.SHELL_DENYLIST, JSON.stringify(denylist));
+}
+
+/**
+ * Get max workers setting
+ */
+export function getMaxWorkers(): number {
+  const fromSettings = getSetting(SETTING_KEYS.MAX_WORKERS);
+  if (fromSettings) {
+    const parsed = parseInt(fromSettings, 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  // Import constant at runtime to avoid circular dependency
+  return 5; // DEFAULT from protocol
+}
+
+/**
+ * Set max workers
+ */
+export function setMaxWorkers(maxWorkers: number): void {
+  setSetting(SETTING_KEYS.MAX_WORKERS, String(maxWorkers));
+}
+
+/**
+ * Get task timeout in milliseconds
+ */
+export function getTaskTimeoutMs(): number {
+  const fromSettings = getSetting(SETTING_KEYS.TASK_TIMEOUT_MS);
+  if (fromSettings) {
+    const parsed = parseInt(fromSettings, 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return 300_000; // 5 minutes default
+}
+
+/**
+ * Set task timeout in milliseconds
+ */
+export function setTaskTimeoutMs(timeoutMs: number): void {
+  setSetting(SETTING_KEYS.TASK_TIMEOUT_MS, String(timeoutMs));
+}
+
+/**
+ * Get complete shell execution configuration
+ */
+export interface ShellConfig {
+  allowlist: string[];
+  denylist: string[];
+  maxExecutionTimeMs: number;
+  maxOutputSizeBytes: number;
+}
+
+export function getShellConfig(): ShellConfig {
+  return {
+    allowlist: getShellAllowlist(),
+    denylist: getShellDenylist(),
+    maxExecutionTimeMs: getTaskTimeoutMs(),
+    maxOutputSizeBytes: 10 * 1024 * 1024, // 10MB
+  };
 }

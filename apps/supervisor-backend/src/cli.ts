@@ -4,7 +4,7 @@
  * Command-line interface for running the supervisor
  */
 
-import { runParallelSupervisor } from './graph/parallel-graph.js';
+import { runSimplifiedSupervisor } from './graph/index.js';
 
 async function main() {
   const args = process.argv.slice(2);
@@ -61,7 +61,10 @@ Examples:
       console.log('');
 
       try {
-        const finalState = await runParallelSupervisor(goal, repoPath);
+        const finalState = await runSimplifiedSupervisor({
+          userGoal: goal,
+          repoPath: repoPath,
+        });
 
         console.log('');
         console.log('=' .repeat(60));
@@ -70,19 +73,15 @@ Examples:
         console.log(`Status: ${finalState.status}`);
         console.log(`Run ID: ${finalState.run_id}`);
 
-        if (finalState.verification_results) {
-          console.log(`Verification: ${finalState.verification_results.all_passed ? 'PASSED' : 'FAILED'}`);
-        }
-
         if (finalState.error) {
           console.log(`Error: ${finalState.error}`);
         }
 
-        if (finalState.final_report) {
+        if (finalState.final_summary) {
           console.log('');
-          console.log('FINAL REPORT:');
+          console.log('FINAL SUMMARY:');
           console.log('-'.repeat(60));
-          console.log(finalState.final_report);
+          console.log(finalState.final_summary);
         }
 
         process.exit(finalState.status === 'completed' ? 0 : 1);

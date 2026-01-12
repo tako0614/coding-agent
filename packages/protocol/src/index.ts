@@ -54,9 +54,7 @@ export type {
   Worker,
   WorkerStatus,
   WorkerExecutorType,
-  WorkerPoolConfig,
-  WorkerPoolStatus,
-  WorkerTaskAssignment,
+  CostMetrics,
 } from './types/worker.js';
 
 // Type guards
@@ -92,7 +90,10 @@ export {
   isWorkerId,
   isWorkerExecutorType,
   isWorkerStatus,
-  DEFAULT_WORKER_POOL_CONFIG,
+  createEmptyCostMetrics,
+  // Constants
+  CONTEXT_TRUNCATION_LIMIT,
+  LOG_PREVIEW_LENGTH,
 } from './types/worker.js';
 
 // Validation

@@ -1,21 +1,24 @@
 /**
- * WorkerInstance - A single executor instance (Codex or Claude)
- * Manages lifecycle and task execution for one worker
+ * WorkerInstance - An executor instance (Codex or Claude)
+ * Workers can be reused across multiple tasks
  */
 
 import type {
   Worker,
-  WorkerStatus,
   WorkerExecutorType,
   WorkOrder,
   WorkReport,
   DAGNode,
   DAG,
 } from '@supervisor/protocol';
-import { createWorkerId, createWorkOrderId } from '@supervisor/protocol';
-import { createCodexAdapter, type CodexAdapter } from '@supervisor/executor-codex';
-import { createClaudeAdapter, type ClaudeAdapter, type ClaudeAgentMessage } from '@supervisor/executor-claude';
+import { createWorkerId, createWorkOrderId, LOG_PREVIEW_LENGTH, CONTEXT_TRUNCATION_LIMIT } from '@supervisor/protocol';
+import { createCodexAdapter, type CodexAdapter, type CodexExecutionOptions, type CodexEvent } from '@supervisor/executor-codex';
+import { createClaudeAdapter, type ClaudeAdapter, type ClaudeExecutionOptions, type ClaudeAgentMessage } from '@supervisor/executor-claude';
 import { log as eventLog } from '../services/event-bus.js';
+import { logger } from '../services/logger.js';
+
+/** Unified execution options for both adapters */
+type ExecutionOptions = ClaudeExecutionOptions | CodexExecutionOptions;
 
 export interface WorkerInstanceConfig {
   executorType: WorkerExecutorType;
@@ -43,7 +46,6 @@ export class WorkerInstance {
   private worker: Worker;
   private adapter: ExecutorAdapter;
   private config: WorkerInstanceConfig;
-  private taskDurations: number[] = [];
 
   constructor(config: WorkerInstanceConfig) {
     this.config = config;
@@ -52,7 +54,7 @@ export class WorkerInstance {
     this.worker = {
       worker_id: createWorkerId(),
       executor_type: config.executorType,
-      status: 'starting',
+      status: 'idle',
       created_at: now,
       completed_tasks: 0,
       failed_tasks: 0,
@@ -70,46 +72,23 @@ export class WorkerInstance {
   }
 
   /**
-   * Initialize the worker (check adapter availability)
+   * Check if executor is available
    */
-  async initialize(): Promise<boolean> {
+  async isAvailable(): Promise<boolean> {
     try {
-      console.log(`[WorkerInstance] Initializing ${this.config.executorType} worker...`);
-      const available = await this.adapter.isAvailable();
-      console.log(`[WorkerInstance] ${this.config.executorType} adapter available: ${available}`);
-      if (available) {
-        this.worker.status = 'idle';
-        this.worker.idle_since = new Date().toISOString();
-        return true;
-      } else {
-        this.worker.status = 'error';
-        this.worker.last_error = 'Adapter not available';
-        console.error(`[WorkerInstance] ${this.config.executorType} adapter not available`);
-        return false;
-      }
-    } catch (error) {
-      this.worker.status = 'error';
-      this.worker.last_error = error instanceof Error ? error.message : String(error);
-      console.error(`[WorkerInstance] ${this.config.executorType} initialization failed:`, error);
+      return await this.adapter.isAvailable();
+    } catch {
       return false;
     }
   }
 
   /**
-   * Execute a DAG task
+   * Execute a DAG task - this is the main entry point
+   * Worker can be reused for multiple tasks
    */
   async executeTask(node: DAGNode, context?: TaskContext): Promise<TaskExecutionResult> {
     const startTime = Date.now();
-
-    if (this.worker.status !== 'idle') {
-      return {
-        success: false,
-        error: `Worker is not idle (status: ${this.worker.status})`,
-        durationMs: 0,
-      };
-    }
-
-    this.worker.status = 'busy';
+    this.worker.status = 'running';
     this.worker.current_task_id = node.task_id;
 
     try {
@@ -117,50 +96,81 @@ export class WorkerInstance {
       const workOrder = this.createWorkOrder(node, context);
 
       // Message handler to forward agent messages to event bus
-      const handleMessage = (message: ClaudeAgentMessage) => {
+      const handleClaudeMessage = (message: ClaudeAgentMessage): void => {
         this.forwardAgentMessage(message, node.task_id);
       };
 
-      // Execute
-      const report = await this.adapter.execute(workOrder, {
-        cwd: this.config.repoPath,
-        onMessage: this.config.executorType === 'claude' ? handleMessage : undefined,
-      });
+      // Event handler for Codex
+      const handleCodexEvent = (event: CodexEvent): void => {
+        if (event.type === 'complete' && event.result) {
+          const preview = event.result.length > LOG_PREVIEW_LENGTH
+            ? event.result.slice(0, LOG_PREVIEW_LENGTH) + '...'
+            : event.result;
+          eventLog(this.config.runId, 'info', 'codex', `Result: ${preview}`, {
+            task_id: node.task_id,
+            worker_id: this.worker.worker_id,
+          });
+        }
+      };
 
-      const durationMs = Date.now() - startTime;
-      this.taskDurations.push(durationMs);
-
-      // Update worker stats
-      if (report.status === 'done') {
-        this.worker.completed_tasks++;
+      // Build execution options based on executor type
+      let executionOptions: ExecutionOptions;
+      if (this.config.executorType === 'claude') {
+        executionOptions = {
+          cwd: this.config.repoPath,
+          onMessage: handleClaudeMessage,
+        } satisfies ClaudeExecutionOptions;
       } else {
-        this.worker.failed_tasks++;
+        executionOptions = {
+          cwd: this.config.repoPath,
+          onEvent: handleCodexEvent,
+        } satisfies CodexExecutionOptions;
       }
 
-      // Update average duration
-      this.worker.avg_task_duration_ms =
-        this.taskDurations.reduce((a, b) => a + b, 0) / this.taskDurations.length;
+      // Execute with appropriate options
+      const report = await this.adapter.execute(workOrder, executionOptions);
 
-      // Reset to idle
-      this.worker.status = 'idle';
+      const durationMs = Date.now() - startTime;
+
+      if (report.status === 'done') {
+        this.worker.status = 'idle';
+        this.worker.completed_tasks++;
+      } else {
+        this.worker.status = 'idle';
+        this.worker.failed_tasks++;
+        this.worker.last_error = report.error?.message ?? report.summary;
+      }
+
       this.worker.current_task_id = undefined;
-      this.worker.idle_since = new Date().toISOString();
+      this.worker.avg_task_duration_ms = durationMs;
 
       return {
         success: report.status === 'done',
         report,
         durationMs,
+        error: report.status !== 'done'
+          ? (report.error?.message ?? report.summary ?? 'Task failed')
+          : undefined,
       };
     } catch (error) {
       const durationMs = Date.now() - startTime;
+      const errorMsg = error instanceof Error ? error.message : String(error);
+
+      this.worker.status = 'idle';
       this.worker.failed_tasks++;
-      this.worker.status = 'error';
-      this.worker.last_error = error instanceof Error ? error.message : String(error);
+      this.worker.last_error = errorMsg;
       this.worker.current_task_id = undefined;
+
+      logger.error('Task execution failed', {
+        taskId: node.task_id,
+        workerId: this.worker.worker_id,
+        error: errorMsg,
+        durationMs,
+      });
 
       return {
         success: false,
-        error: error instanceof Error ? error.message : String(error),
+        error: errorMsg,
         durationMs,
       };
     }
@@ -170,24 +180,19 @@ export class WorkerInstance {
    * Convert DAGNode to WorkOrder with context
    */
   private createWorkOrder(node: DAGNode, context?: TaskContext): WorkOrder {
-    // Build a comprehensive objective with context
     const objectiveParts: string[] = [];
 
-    // Add overall goal context
     if (context?.userGoal) {
       objectiveParts.push(`## Overall Goal\n${context.userGoal}`);
     }
 
-    // Add repository context (AGENTS.md, etc.)
     if (context?.repoContext) {
-      // Limit context to avoid token overflow
-      const limitedContext = context.repoContext.length > 4000
-        ? context.repoContext.slice(0, 4000) + '\n\n... (truncated)'
+      const limitedContext = context.repoContext.length > CONTEXT_TRUNCATION_LIMIT
+        ? context.repoContext.slice(0, CONTEXT_TRUNCATION_LIMIT) + '\n\n... (truncated)'
         : context.repoContext;
       objectiveParts.push(`## Repository Context\n${limitedContext}`);
     }
 
-    // Add DAG overview (other tasks)
     if (context?.dag) {
       const otherTasks = context.dag.nodes
         .filter(n => n.task_id !== node.task_id)
@@ -201,7 +206,6 @@ export class WorkerInstance {
       }
     }
 
-    // Add completed tasks summary
     if (context?.completedTasks && Object.keys(context.completedTasks).length > 0) {
       const completedSummary = Object.entries(context.completedTasks)
         .map(([, summary]) => `- ${summary}`)
@@ -209,7 +213,6 @@ export class WorkerInstance {
       objectiveParts.push(`## Already Completed\n${completedSummary}`);
     }
 
-    // Add the current task
     objectiveParts.push(`## Your Task\n**${node.name}**\n\n${node.description}`);
 
     const fullObjective = objectiveParts.join('\n\n---\n\n');
@@ -257,7 +260,7 @@ export class WorkerInstance {
   /**
    * Get worker status
    */
-  getStatus(): WorkerStatus {
+  getStatus(): Worker['status'] {
     return this.worker.status;
   }
 
@@ -269,49 +272,29 @@ export class WorkerInstance {
   }
 
   /**
-   * Check if worker is idle
+   * Check if worker is currently running a task
+   */
+  isRunning(): boolean {
+    return this.worker.status === 'running';
+  }
+
+  /**
+   * Check if worker is idle and ready for new tasks
    */
   isIdle(): boolean {
     return this.worker.status === 'idle';
   }
 
   /**
-   * Check if worker is in error state
+   * Dispose the worker and release resources
    */
-  isError(): boolean {
-    return this.worker.status === 'error';
-  }
-
-  /**
-   * Get idle duration in milliseconds
-   */
-  getIdleDuration(): number {
-    if (!this.worker.idle_since || this.worker.status !== 'idle') {
-      return 0;
-    }
-    return Date.now() - new Date(this.worker.idle_since).getTime();
-  }
-
-  /**
-   * Reset error state and try to recover
-   */
-  async recover(): Promise<boolean> {
-    if (this.worker.status !== 'error') {
-      return true;
-    }
-
-    this.worker.status = 'starting';
-    this.worker.last_error = undefined;
-
-    return this.initialize();
-  }
-
-  /**
-   * Shutdown the worker
-   */
-  shutdown(): void {
-    this.worker.status = 'shutdown';
-    this.worker.current_task_id = undefined;
+  dispose(): void {
+    this.worker.status = 'completed';
+    logger.debug('Worker disposed', {
+      workerId: this.worker.worker_id,
+      completedTasks: this.worker.completed_tasks,
+      failedTasks: this.worker.failed_tasks,
+    });
   }
 
   /**
@@ -320,58 +303,46 @@ export class WorkerInstance {
   private forwardAgentMessage(message: ClaudeAgentMessage, taskId: string): void {
     const source = this.config.executorType === 'claude' ? 'claude' : 'codex';
 
-    // Type guard helper
-    const hasType = (msg: unknown, t: string): boolean =>
-      typeof msg === 'object' && msg !== null && 'type' in msg && (msg as Record<string, unknown>)['type'] === t;
-
-    if (hasType(message, 'system')) {
-      const sysMsg = message as { subtype?: string; session_id?: string; message?: string };
-      eventLog(
-        this.config.runId,
-        sysMsg.subtype === 'error' ? 'error' : 'info',
-        source,
-        `[system:${sysMsg.subtype}] ${sysMsg.message || 'initialized'}`,
-        { type: 'system', subtype: sysMsg.subtype, session_id: sysMsg.session_id, task_id: taskId }
-      );
-    } else if (hasType(message, 'assistant')) {
-      const asstMsg = message as { content: string };
-      if (asstMsg.content) {
-        eventLog(
-          this.config.runId,
-          'info',
-          source,
-          asstMsg.content.length > 200 ? asstMsg.content.slice(0, 200) + '...' : asstMsg.content,
-          { type: 'assistant', full_content: asstMsg.content, task_id: taskId }
-        );
+    // Type-safe message handling based on discriminated union
+    if (message.type === 'system') {
+      const content = 'message' in message ? message.message : undefined;
+      const subtype = 'subtype' in message ? message.subtype : undefined;
+      if (content) {
+        eventLog(this.config.runId, 'info', source, `[${subtype ?? 'system'}] ${content}`, {
+          task_id: taskId,
+          worker_id: this.worker.worker_id,
+        });
       }
-    } else if (hasType(message, 'tool_use')) {
-      const toolMsg = message as { tool_use_id: string; tool_name: string; tool_input: Record<string, unknown> };
-      const inputStr = JSON.stringify(toolMsg.tool_input);
-      eventLog(
-        this.config.runId,
-        'info',
-        source,
-        `[tool_use] ${toolMsg.tool_name}: ${inputStr.length > 100 ? inputStr.slice(0, 100) + '...' : inputStr}`,
-        { type: 'tool_use', tool_name: toolMsg.tool_name, tool_input: toolMsg.tool_input, tool_use_id: toolMsg.tool_use_id, task_id: taskId }
-      );
-    } else if (hasType(message, 'tool_result')) {
-      const resultMsg = message as { tool_use_id: string; content: string; is_error?: boolean };
-      eventLog(
-        this.config.runId,
-        resultMsg.is_error ? 'error' : 'info',
-        source,
-        `[tool_result] ${resultMsg.is_error ? 'ERROR: ' : ''}${resultMsg.content.length > 200 ? resultMsg.content.slice(0, 200) + '...' : resultMsg.content}`,
-        { type: 'tool_result', tool_use_id: resultMsg.tool_use_id, is_error: resultMsg.is_error, full_content: resultMsg.content, task_id: taskId }
-      );
-    } else if (hasType(message, 'result')) {
-      const resMsg = message as { result: string; session_id: string };
-      eventLog(
-        this.config.runId,
-        'info',
-        source,
-        `[result] ${resMsg.result.length > 200 ? resMsg.result.slice(0, 200) + '...' : resMsg.result}`,
-        { type: 'result', session_id: resMsg.session_id, full_result: resMsg.result, task_id: taskId }
-      );
+    }
+
+    // Log assistant text messages
+    if (message.type === 'assistant') {
+      const content = 'content' in message ? message.content : undefined;
+      if (content) {
+        // Show first 200 chars of assistant response
+        const preview = content.length > LOG_PREVIEW_LENGTH
+          ? content.slice(0, LOG_PREVIEW_LENGTH) + '...'
+          : content;
+        eventLog(this.config.runId, 'info', source, preview, {
+          task_id: taskId,
+          worker_id: this.worker.worker_id,
+          full_content: content,
+        });
+      }
+    }
+
+    // Log result messages
+    if (message.type === 'result') {
+      const result = 'result' in message ? message.result : undefined;
+      if (result) {
+        const preview = result.length > LOG_PREVIEW_LENGTH
+          ? result.slice(0, LOG_PREVIEW_LENGTH) + '...'
+          : result;
+        eventLog(this.config.runId, 'info', source, `Result: ${preview}`, {
+          task_id: taskId,
+          worker_id: this.worker.worker_id,
+        });
+      }
     }
   }
 }

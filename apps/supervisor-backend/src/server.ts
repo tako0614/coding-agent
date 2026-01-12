@@ -22,12 +22,19 @@ import { eventBus } from './services/event-bus.js';
 import { getModelRouter } from './services/model-router.js';
 import { copilotAPIManager } from './services/copilot-api-manager.js';
 import { ptyService } from './services/pty-service.js';
+import { db } from './services/db.js';
 import * as fs from 'fs';
 import * as pathModule from 'path';
+import { fileURLToPath } from 'url';
 
 // Check if running inside pkg bundle (snapshot filesystem)
 // In ESM, we check process.pkg which is set by pkg runtime
 const isPackaged = (process as NodeJS.Process & { pkg?: unknown }).pkg !== undefined;
+
+// Get the directory of this module for resolving static files
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = pathModule.dirname(__filename);
+const publicUiPath = pathModule.resolve(__dirname, '..', 'public', 'ui');
 
 const app = new Hono();
 
@@ -77,7 +84,7 @@ if (!isPackaged) {
     }
 
     // Try to serve static file
-    const filePath = pathModule.join('./public/ui', urlPath === '/' ? '/index.html' : urlPath);
+    const filePath = pathModule.join(publicUiPath, urlPath === '/' ? '/index.html' : urlPath);
 
     try {
       if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
@@ -98,7 +105,7 @@ if (!isPackaged) {
 
     return next();
   });
-  console.log('[Server] Static file serving enabled');
+  console.log(`[Server] Static file serving enabled from: ${publicUiPath}`);
 }
 
 // Health check
@@ -235,6 +242,37 @@ app.delete('/api/sessions/orphaned/:runId', (c) => {
   return c.json({ deleted: true });
 });
 
+// Parallel sessions management
+const getParallelSessionsStmt = db.prepare('SELECT sessions_json FROM parallel_sessions WHERE id = 1');
+const updateParallelSessionsStmt = db.prepare(
+  'UPDATE parallel_sessions SET sessions_json = ?, updated_at = ? WHERE id = 1'
+);
+
+// Get parallel sessions state
+app.get('/api/sessions/parallel', (c) => {
+  try {
+    const row = getParallelSessionsStmt.get() as { sessions_json: string } | undefined;
+    const sessions = row ? JSON.parse(row.sessions_json) : [];
+    return c.json({ sessions });
+  } catch (error) {
+    console.error('[Server] Failed to get parallel sessions:', error);
+    return c.json({ sessions: [] });
+  }
+});
+
+// Save parallel sessions state
+app.put('/api/sessions/parallel', async (c) => {
+  try {
+    const body = await c.req.json();
+    const sessions = body.sessions || [];
+    updateParallelSessionsStmt.run(JSON.stringify(sessions), new Date().toISOString());
+    return c.json({ success: true });
+  } catch (error) {
+    console.error('[Server] Failed to save parallel sessions:', error);
+    return c.json({ error: 'Failed to save sessions' }, 500);
+  }
+});
+
 // Error handling
 app.onError((err, c) => {
   console.error('[Server] Error:', err);
@@ -252,6 +290,7 @@ app.notFound(async (c) => {
 
   // API endpoints return JSON 404
   if (path.startsWith('/api/') || path.startsWith('/v1/')) {
+    console.log(`[Server] API 404: ${path}`);
     return c.json({
       error: {
         message: `Not found: ${path}`,
@@ -262,14 +301,15 @@ app.notFound(async (c) => {
 
   // SPA fallback: serve index.html for frontend routes
   try {
-    const fs = await import('fs');
-    const indexPath = './public/ui/index.html';
+    const indexPath = pathModule.join(publicUiPath, 'index.html');
     if (fs.existsSync(indexPath)) {
       const html = fs.readFileSync(indexPath, 'utf-8');
       return c.html(html);
+    } else {
+      console.log(`[Server] SPA fallback failed: ${indexPath} not found`);
     }
-  } catch {
-    // Fall through to 404
+  } catch (err) {
+    console.log(`[Server] SPA fallback error:`, err);
   }
 
   return c.json({

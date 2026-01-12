@@ -18,6 +18,7 @@ if (!existsSync(dbDir)) {
 }
 
 export const db: DatabaseType = new Database(dbPath);
+console.log(`[DB] Using database: ${dbPath}`);
 
 db.pragma('journal_mode = WAL');
 
@@ -71,4 +72,43 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_run_logs_run_id ON run_logs(run_id);
   CREATE INDEX IF NOT EXISTS idx_run_logs_timestamp ON run_logs(run_id, timestamp);
+
+  -- Parallel sessions state (stored as JSON array)
+  CREATE TABLE IF NOT EXISTS parallel_sessions (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    sessions_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  -- Initialize with empty array if not exists
+  INSERT OR IGNORE INTO parallel_sessions (id, sessions_json, updated_at)
+  VALUES (1, '[]', datetime('now'));
+
+  -- Checkpoints for run state recovery
+  CREATE TABLE IF NOT EXISTS checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    node_name TEXT NOT NULL,
+    state_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_checkpoints_run_id ON checkpoints(run_id);
+  CREATE INDEX IF NOT EXISTS idx_checkpoints_created_at ON checkpoints(run_id, created_at DESC);
+
+  -- Cost tracking
+  CREATE TABLE IF NOT EXISTS cost_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    executor_type TEXT NOT NULL,
+    api_calls INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    estimated_cost_usd REAL NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_cost_metrics_run_id ON cost_metrics(run_id);
 `);

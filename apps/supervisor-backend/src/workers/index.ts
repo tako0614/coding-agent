@@ -16,6 +16,7 @@ export {
   createWorkerPool,
   type WorkerPoolEvents,
   type PoolContext,
+  type ExecutorMode,
 } from './worker-pool.js';
 
 export {
