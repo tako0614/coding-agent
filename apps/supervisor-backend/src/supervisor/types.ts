@@ -69,6 +69,8 @@ export interface WorkerTask {
   context?: string;
   priority: number;
   created_at: string;
+  /** Callback for output logs (for progress tracking) */
+  onOutput?: (output: string) => void;
 }
 
 export interface WorkerTaskResult {

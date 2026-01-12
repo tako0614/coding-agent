@@ -14,7 +14,8 @@ import type {
 import { SUPERVISOR_TOOLS, ToolExecutor } from './tools.js';
 import { createRunId } from '@supervisor/protocol';
 import { logger } from '../services/logger.js';
-import { getCopilotAPIConfig, getDAGModel, getMaxContextTokens } from '../services/settings-store.js';
+import { getCopilotAPIConfig, getDAGModel, getMaxContextTokens, DEFAULT_MAX_CONTEXT_TOKENS, COPILOT_PROXY_KEY } from '../services/settings-store.js';
+import { getErrorMessage, isRetryableError as checkRetryableError } from '../services/errors.js';
 
 // =============================================================================
 // Constants
@@ -25,9 +26,6 @@ const MAX_API_RETRIES = 3;
 
 /** Base delay for exponential backoff (ms) */
 const BASE_RETRY_DELAY_MS = 1000;
-
-/** Default max tokens for context (leave room for response) */
-const DEFAULT_MAX_CONTEXT_TOKENS = 150000;
 
 /** Max consecutive responses without tool calls before warning */
 const MAX_NO_TOOL_RESPONSES = 5;
@@ -69,7 +67,7 @@ function countTokens(text: string): number {
   } catch (error) {
     // Fallback to rough estimation if tiktoken fails
     logger.warn('Tiktoken encoding failed, using fallback estimation', {
-      error: error instanceof Error ? error.message : String(error),
+      error: getErrorMessage(error),
     });
     // Use conservative estimate: ~2 tokens per character for CJK, ~0.25 for ASCII
     const cjkChars = (text.match(/[\u3000-\u9fff\uac00-\ud7af]/g) || []).length;
@@ -85,24 +83,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-/**
- * Check if an error is retryable
- */
-function isRetryableError(error: unknown): boolean {
-  if (error instanceof Error) {
-    const message = error.message.toLowerCase();
-    return (
-      message.includes('rate limit') ||
-      message.includes('timeout') ||
-      message.includes('network') ||
-      message.includes('econnreset') ||
-      message.includes('429') ||
-      message.includes('503') ||
-      message.includes('502')
-    );
-  }
-  return false;
-}
+// isRetryableError is now imported from ../services/errors.js as checkRetryableError
 
 // =============================================================================
 // System Prompt
@@ -217,7 +198,7 @@ export class SupervisorAgent {
     // Initialize OpenAI client with Copilot API
     const copilotConfig = getCopilotAPIConfig();
     this.openai = new OpenAI({
-      apiKey: copilotConfig.githubToken || 'copilot-proxy',
+      apiKey: copilotConfig.githubToken || COPILOT_PROXY_KEY,
       baseURL: copilotConfig.enabled ? `${copilotConfig.baseUrl}/v1` : undefined,
     });
 
@@ -319,7 +300,7 @@ export class SupervisorAgent {
           this.consecutiveErrorCount = 0;
         } catch (error) {
           this.consecutiveErrorCount++;
-          const errorMsg = error instanceof Error ? error.message : String(error);
+          const errorMsg = getErrorMessage(error);
           logger.error('Supervisor step failed', {
             runId: this.state.run_id,
             error: errorMsg,
@@ -427,7 +408,7 @@ export class SupervisorAgent {
           this.consecutiveErrorCount = 0;
         } catch (error) {
           this.consecutiveErrorCount++;
-          const errorMsg = error instanceof Error ? error.message : String(error);
+          const errorMsg = getErrorMessage(error);
           logger.error('Supervisor step failed', {
             runId: this.state.run_id,
             error: errorMsg,
@@ -593,7 +574,7 @@ export class SupervisorAgent {
     } catch (error) {
       logger.error('Failed to summarize messages', {
         runId: this.state.run_id,
-        error: error instanceof Error ? error.message : String(error),
+        error: getErrorMessage(error),
       });
       // Fallback to simple summary
       return `${messages.length}件のメッセージを要約できませんでした。実行されたWorkerタスク数: ${this.state.completed_tasks.length}`;
@@ -628,7 +609,7 @@ export class SupervisorAgent {
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
 
-        if (!isRetryableError(error) || attempt === MAX_API_RETRIES - 1) {
+        if (!checkRetryableError(error) || attempt === MAX_API_RETRIES - 1) {
           throw lastError;
         }
 

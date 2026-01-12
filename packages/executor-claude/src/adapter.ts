@@ -17,6 +17,16 @@ import type {
   ClaudeAgentMessage,
 } from './types.js';
 
+/** Simple debug logger - only logs when DEBUG env is set */
+const debug = {
+  log: (...args: unknown[]) => {
+    if (process.env['DEBUG']) console.log('[ClaudeAdapter]', ...args);
+  },
+  error: (...args: unknown[]) => {
+    console.error('[ClaudeAdapter]', ...args);
+  },
+};
+
 /** Helper to safely get property from unknown object */
 function getProp<T>(obj: unknown, key: string): T | undefined {
   if (obj && typeof obj === 'object' && key in obj) {
@@ -127,7 +137,7 @@ export class ClaudeAdapter {
         persistSession: false,
         // Capture stderr for debugging
         stderr: (data: string) => {
-          console.error('[ClaudeAdapter] STDERR:', data);
+          debug.error('STDERR:', data);
         },
       };
 
@@ -141,22 +151,39 @@ export class ClaudeAdapter {
         sdkOptions['systemPrompt'] = this.config.systemPrompt;
       }
 
-      // Set environment variables
+      // Save original environment variables before modification
+      const originalEnv: Record<string, string | undefined> = {};
       if (options.env) {
-        for (const [key, value] of Object.entries(options.env)) {
-          process.env[key] = value;
+        for (const key of Object.keys(options.env)) {
+          originalEnv[key] = process.env[key];
+          process.env[key] = options.env[key];
         }
       }
 
-      // Execute using the SDK's async generator
-      console.log('[ClaudeAdapter] Starting SDK query...');
-      console.log('[ClaudeAdapter] Options:', JSON.stringify(sdkOptions, null, 2));
+      // NOTE: Do NOT use process.chdir() - it affects global state
+      // The working directory is set via sdkOptions.cwd instead
+
+      // Restore environment variables helper
+      const restoreEnv = () => {
+        for (const [key, value] of Object.entries(originalEnv)) {
+          if (value === undefined) {
+            delete process.env[key];
+          } else {
+            process.env[key] = value;
+          }
+        }
+      };
+
+      try {
+        // Execute using the SDK's async generator
+        debug.log('Starting SDK query...');
+        debug.log('Options:', JSON.stringify(sdkOptions, null, 2));
 
       for await (const message of query({
         prompt,
         options: sdkOptions,
       })) {
-        console.log('[ClaudeAdapter] Message:', JSON.stringify(message, null, 2).slice(0, 500));
+        debug.log('Message:', JSON.stringify(message, null, 2).slice(0, 500));
         // Call message handler if provided
         if (options.onMessage) {
           options.onMessage(message as ClaudeAgentMessage);
@@ -266,13 +293,17 @@ export class ClaudeAdapter {
           model: this.config.model,
         },
       };
+      } finally {
+        // Restore original environment variables
+        restoreEnv();
+      }
     } catch (error) {
       const endTime = new Date();
       const errMsg = error instanceof Error ? error.message : String(error);
       const stack = error instanceof Error ? error.stack : undefined;
 
-      console.error('[ClaudeAdapter] Execution failed:', errMsg);
-      console.error('[ClaudeAdapter] Stack:', stack);
+      debug.error('Execution failed:', errMsg);
+      debug.error('Stack:', stack);
 
       return {
         report_id: createWorkReportId(),
@@ -321,7 +352,7 @@ export class ClaudeAdapter {
       cwd: options.cwd,
       persistSession: false,
       stderr: (data: string) => {
-        console.error('[ClaudeAdapter] STDERR:', data);
+        debug.error('STDERR:', data);
       },
     };
 
@@ -417,6 +448,14 @@ export class ClaudeAdapter {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Dispose adapter and release resources
+   */
+  dispose(): void {
+    // Claude adapter has no persistent resources to clean up
+    // This is here for interface consistency
   }
 }
 

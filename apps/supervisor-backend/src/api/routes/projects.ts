@@ -9,6 +9,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { v4 as uuidv4 } from 'uuid';
 import { deleteProject, getProject, listProjects, saveProject } from '../../services/project-store.js';
+import { logger } from '../../services/logger.js';
 
 // Simplified project schema - just a reference to a repo
 export interface Project {
@@ -74,11 +75,11 @@ projects.post('/', async (c) => {
     };
 
     saveProject(project);
-    console.log(`[Projects] Created project ${project.project_id}: ${project.name}`);
+    logger.info('Created project', { projectId: project.project_id, name: project.name });
 
     return c.json(project, 201);
   } catch (error) {
-    console.error('[Projects] Error creating project:', error);
+    logger.error('Error creating project', { error: error instanceof Error ? error.message : String(error) });
     return c.json({
       error: {
         message: error instanceof Error ? error.message : 'Internal server error',
@@ -143,11 +144,11 @@ projects.put('/:id', async (c) => {
     };
 
     saveProject(updated);
-    console.log(`[Projects] Updated project ${projectId}`);
+    logger.info('Updated project', { projectId });
 
     return c.json(updated);
   } catch (error) {
-    console.error('[Projects] Error updating project:', error);
+    logger.error('Error updating project', { error: error instanceof Error ? error.message : String(error) });
     return c.json({
       error: {
         message: error instanceof Error ? error.message : 'Internal server error',
@@ -173,7 +174,7 @@ projects.delete('/:id', (c) => {
     }, 404);
   }
 
-  console.log(`[Projects] Deleted project ${projectId}`);
+  logger.info('Deleted project', { projectId });
 
   return c.json({ message: `Project ${projectId} deleted` });
 });

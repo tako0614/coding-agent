@@ -1,0 +1,80 @@
+{
+  "name": "@supervisor/desktop",
+  "version": "0.1.0",
+  "description": "Supervisor Agent Desktop Application",
+  "main": "dist/main/index.js",
+  "private": true,
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "dist:win": "electron-builder --win",
+    "dist:mac": "electron-builder --mac",
+    "dist:linux": "electron-builder --linux",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.9",
+    "electron-log": "^5.2.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "electron": "^33.3.1",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^2.3.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7"
+  },
+  "build": {
+    "appId": "com.supervisor.agent",
+    "productName": "Supervisor Agent",
+    "directories": {
+      "output": "release",
+      "buildResources": "resources"
+    },
+    "files": [
+      "dist/**/*",
+      "resources/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../supervisor-backend/dist",
+        "to": "backend",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "../supervisor-backend/public",
+        "to": "backend/public",
+        "filter": ["**/*"]
+      }
+    ],
+    "win": {
+      "target": ["nsis", "portable"],
+      "icon": "resources/icon.ico"
+    },
+    "mac": {
+      "target": ["dmg", "zip"],
+      "icon": "resources/icon.icns",
+      "category": "public.app-category.developer-tools"
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "icon": "resources/icon.png",
+      "category": "Development"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "your-org",
+      "repo": "supervisor-agent"
+    }
+  }
+}

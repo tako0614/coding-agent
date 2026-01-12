@@ -5,6 +5,7 @@
 import { Hono } from 'hono';
 import { copilotAPIManager } from '../../services/copilot-api-manager.js';
 import { getCopilotAPIConfig } from '../../services/settings-store.js';
+import { logger } from '../../services/logger.js';
 
 const copilot = new Hono();
 
@@ -34,7 +35,7 @@ copilot.post('/start', async (c) => {
     const status = await copilotAPIManager.start();
     return c.json(status);
   } catch (error) {
-    console.error('[Copilot] Error starting:', error);
+    logger.error('Copilot error starting', { error: error instanceof Error ? error.message : String(error) });
     return c.json({
       running: false,
       error: error instanceof Error ? error.message : 'Failed to start copilot-api',
@@ -51,7 +52,7 @@ copilot.post('/stop', async (c) => {
     const status = await copilotAPIManager.stop();
     return c.json(status);
   } catch (error) {
-    console.error('[Copilot] Error stopping:', error);
+    logger.error('Copilot error stopping', { error: error instanceof Error ? error.message : String(error) });
     return c.json({
       running: false,
       error: error instanceof Error ? error.message : 'Failed to stop copilot-api',
@@ -69,7 +70,7 @@ copilot.post('/restart', async (c) => {
     const status = await copilotAPIManager.start();
     return c.json(status);
   } catch (error) {
-    console.error('[Copilot] Error restarting:', error);
+    logger.error('Copilot error restarting', { error: error instanceof Error ? error.message : String(error) });
     return c.json({
       running: false,
       error: error instanceof Error ? error.message : 'Failed to restart copilot-api',

@@ -8,6 +8,8 @@ import { createRunId } from '@supervisor/protocol';
 import { ChatCompletionRequestSchema, type ChatCompletionResponse } from '../types.js';
 import { runStore } from '../run-store.js';
 import { runSimplifiedSupervisor } from '../../graph/index.js';
+import { validateRepoPath, PathSecurityError } from '../../services/path-sandbox.js';
+import { logger } from '../../services/logger.js';
 
 const chat = new Hono();
 
@@ -47,13 +49,28 @@ chat.post('/completions', async (c) => {
 
     const userGoal = lastUserMessage.content;
 
-    // Get repo path from request or use current directory
-    const repoPath = request.repo_path ?? process.cwd();
+    // Get and validate repo path from request or use current directory
+    let repoPath: string;
+    if (request.repo_path) {
+      try {
+        repoPath = validateRepoPath(request.repo_path);
+      } catch (err) {
+        const message = err instanceof PathSecurityError ? err.message : 'Invalid repository path';
+        return c.json({
+          error: {
+            message,
+            type: 'invalid_request_error',
+          },
+        }, 400);
+      }
+    } else {
+      repoPath = process.cwd();
+    }
 
     // Generate run ID
     const runId = request.run_id ?? createRunId();
 
-    console.log(`[API] Starting supervisor run ${runId}`);
+    logger.info('Starting supervisor run', { runId, repoPath });
 
     // Handle streaming (not fully implemented for MVP)
     if (request.stream) {
@@ -83,27 +100,51 @@ chat.post('/completions', async (c) => {
         }],
       };
 
-      // Wait for completion and stream result
-      const finalState = await runPromise;
-      runStore.set(runId, finalState);
+      // Wait for completion and stream result with error handling
+      try {
+        const finalState = await runPromise;
+        runStore.set(runId, finalState);
 
-      const finalChunk = {
-        id: `chatcmpl-${uuidv4()}`,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: request.model,
-        choices: [{
-          index: 0,
-          delta: { content: finalState.final_summary ?? `Run completed with status: ${finalState.status}` },
-          finish_reason: 'stop',
-        }],
-      };
+        const finalChunk = {
+          id: `chatcmpl-${uuidv4()}`,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: request.model,
+          choices: [{
+            index: 0,
+            delta: { content: finalState.final_summary ?? `Run completed with status: ${finalState.status}` },
+            finish_reason: 'stop',
+          }],
+        };
 
-      return c.text(
-        `data: ${JSON.stringify(initialChunk)}\n\n` +
-        `data: ${JSON.stringify(finalChunk)}\n\n` +
-        `data: [DONE]\n\n`
-      );
+        return c.text(
+          `data: ${JSON.stringify(initialChunk)}\n\n` +
+          `data: ${JSON.stringify(finalChunk)}\n\n` +
+          `data: [DONE]\n\n`
+        );
+      } catch (streamError) {
+        logger.error('Streaming run failed', {
+          runId,
+          error: streamError instanceof Error ? streamError.message : String(streamError),
+        });
+        const errorChunk = {
+          id: `chatcmpl-${uuidv4()}`,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: request.model,
+          choices: [{
+            index: 0,
+            delta: { content: `Error: ${streamError instanceof Error ? streamError.message : 'Run failed'}` },
+            finish_reason: 'stop',
+          }],
+        };
+
+        return c.text(
+          `data: ${JSON.stringify(initialChunk)}\n\n` +
+          `data: ${JSON.stringify(errorChunk)}\n\n` +
+          `data: [DONE]\n\n`
+        );
+      }
     }
 
     // Non-streaming: run synchronously
@@ -146,7 +187,9 @@ chat.post('/completions', async (c) => {
 
     return c.json(response);
   } catch (error) {
-    console.error('[API] Error in chat completions:', error);
+    logger.error('Error in chat completions', {
+      error: error instanceof Error ? error.message : String(error),
+    });
     return c.json({
       error: {
         message: error instanceof Error ? error.message : 'Internal server error',

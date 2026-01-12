@@ -13,8 +13,15 @@ import type {
 import { WorkerInstance, createWorkerInstance, type TaskContext } from './worker-instance.js';
 import { EventEmitter } from 'events';
 import { logger } from '../services/logger.js';
+import { getErrorMessage } from '../services/errors.js';
 
 export type ExecutorMode = 'agent' | 'codex_only' | 'claude_only';
+
+/** Default task timeout in ms (10 minutes) */
+const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000;
+
+/** Maximum workers per executor type */
+const MAX_WORKERS_PER_TYPE = 3;
 
 export interface PoolContext {
   userGoal: string;
@@ -33,7 +40,8 @@ export interface WorkerPoolEvents {
 }
 
 export class WorkerPool extends EventEmitter {
-  private workers: Map<WorkerExecutorType, WorkerInstance> = new Map();
+  /** Multiple workers per executor type for true parallelism */
+  private workers: Map<WorkerExecutorType, WorkerInstance[]> = new Map();
   private repoPath: string;
   private runId: string;
   private totalTasksCompleted = 0;
@@ -42,6 +50,21 @@ export class WorkerPool extends EventEmitter {
   private completedTasks: Map<string, string> = new Map(); // taskId -> summary
   private cancelled = false;
   private abortController: AbortController;
+  /** Lock for status updates */
+  private statusUpdateLock = false;
+  /** Queue for tasks waiting for workers */
+  private taskQueue: Map<WorkerExecutorType, Array<{
+    node: DAGNode;
+    resolve: (result: WorkReport | null) => void;
+    reject: (error: Error) => void;
+    timeoutMs?: number;
+  }>> = new Map();
+  /** Pending worker requests waiting for idle workers */
+  private pendingWorkerRequests: Map<WorkerExecutorType, Array<{
+    resolve: (worker: WorkerInstance | null) => void;
+    reject: (error: Error) => void;
+    timeoutId: NodeJS.Timeout;
+  }>> = new Map();
 
   constructor(
     repoPath: string,
@@ -53,6 +76,14 @@ export class WorkerPool extends EventEmitter {
     this.runId = runId;
     this.poolContext = poolContext ?? { userGoal: '' };
     this.abortController = new AbortController();
+
+    // Handle EventEmitter 'error' event to prevent Node.js from throwing
+    this.on('error', (error: Error) => {
+      logger.error('WorkerPool error event', {
+        runId: this.runId,
+        error: error.message,
+      });
+    });
   }
 
   /**
@@ -109,30 +140,187 @@ export class WorkerPool extends EventEmitter {
   }
 
   /**
-   * Get or create a worker for the given executor type
+   * Get an idle worker or create a new one for the given executor type
+   * Returns the first idle worker, or creates a new one if under the limit
+   * Returns null if all workers are busy and at capacity
    */
-  private getOrCreateWorker(executorType: WorkerExecutorType): WorkerInstance {
-    let worker = this.workers.get(executorType);
+  private getOrCreateWorker(executorType: WorkerExecutorType): WorkerInstance | null {
+    let workerPool = this.workers.get(executorType);
 
-    if (!worker) {
-      worker = createWorkerInstance({
+    if (!workerPool) {
+      workerPool = [];
+      this.workers.set(executorType, workerPool);
+    }
+
+    // First, try to find an idle worker
+    for (const worker of workerPool) {
+      if (worker.isIdle()) {
+        return worker;
+      }
+    }
+
+    // If no idle worker and under the limit, create a new one
+    if (workerPool.length < MAX_WORKERS_PER_TYPE) {
+      const newWorker = createWorkerInstance({
         executorType,
         repoPath: this.repoPath,
         runId: this.runId,
       });
-      this.workers.set(executorType, worker);
-      this.emit('worker:created', worker.getWorker());
+      workerPool.push(newWorker);
+      this.emit('worker:created', newWorker.getWorker());
+      logger.debug('Created new worker', {
+        runId: this.runId,
+        executorType,
+        poolSize: workerPool.length,
+      });
+      return newWorker;
     }
 
-    return worker;
+    // All workers are busy and at max capacity
+    logger.debug('All workers busy, task will be queued', {
+      runId: this.runId,
+      executorType,
+      poolSize: workerPool.length,
+    });
+    return null;
+  }
+
+  /**
+   * Wait for a worker to become available (event-based, not polling)
+   */
+  private async waitForIdleWorker(executorType: WorkerExecutorType): Promise<WorkerInstance | null> {
+    const workerPool = this.workers.get(executorType);
+    if (!workerPool || workerPool.length === 0) {
+      return null;
+    }
+
+    // Check if already aborted
+    if (this.cancelled || this.abortController.signal.aborted) {
+      return null;
+    }
+
+    // First, check if there's an idle worker available right now
+    for (const worker of workerPool) {
+      if (worker.isIdle()) {
+        return worker;
+      }
+    }
+
+    // No idle worker, wait for one to become available via event
+    const maxWait = 5 * 60 * 1000; // 5 minutes max
+
+    return new Promise<WorkerInstance | null>((resolve, reject) => {
+      // Track abort handler for cleanup
+      let abortHandler: (() => void) | null = null;
+
+      // Set up timeout
+      const timeoutId = setTimeout(() => {
+        // Remove from pending requests
+        this.removePendingRequest(executorType, wrappedResolve);
+        // Remove abort listener to prevent memory leak
+        if (abortHandler) {
+          this.abortController.signal.removeEventListener('abort', abortHandler);
+        }
+        logger.warn('Timeout waiting for idle worker', {
+          runId: this.runId,
+          executorType,
+          waitedMs: maxWait,
+        });
+        resolve(null);
+      }, maxWait);
+
+      // Set up abort handler
+      abortHandler = () => {
+        clearTimeout(timeoutId);
+        this.removePendingRequest(executorType, wrappedResolve);
+        resolve(null);
+      };
+      this.abortController.signal.addEventListener('abort', abortHandler, { once: true });
+
+      // Wrapped resolve that cleans up resources
+      const wrappedResolve = (worker: WorkerInstance | null) => {
+        clearTimeout(timeoutId);
+        if (abortHandler) {
+          this.abortController.signal.removeEventListener('abort', abortHandler);
+        }
+        resolve(worker);
+      };
+
+      // Add to pending requests queue
+      let pendingQueue = this.pendingWorkerRequests.get(executorType);
+      if (!pendingQueue) {
+        pendingQueue = [];
+        this.pendingWorkerRequests.set(executorType, pendingQueue);
+      }
+      pendingQueue.push({
+        resolve: wrappedResolve,
+        reject,
+        timeoutId,
+      });
+    });
+  }
+
+  /**
+   * Remove a pending request from the queue
+   */
+  private removePendingRequest(
+    executorType: WorkerExecutorType,
+    resolveToRemove: (worker: WorkerInstance | null) => void
+  ): void {
+    const pendingQueue = this.pendingWorkerRequests.get(executorType);
+    if (pendingQueue) {
+      const index = pendingQueue.findIndex(req => req.resolve === resolveToRemove);
+      if (index >= 0) {
+        pendingQueue.splice(index, 1);
+      }
+    }
+  }
+
+  /**
+   * Notify waiting tasks that a worker is now available
+   */
+  private notifyWorkerAvailable(executorType: WorkerExecutorType, worker: WorkerInstance): void {
+    const pendingQueue = this.pendingWorkerRequests.get(executorType);
+    if (pendingQueue && pendingQueue.length > 0) {
+      const pending = pendingQueue.shift();
+      if (pending) {
+        clearTimeout(pending.timeoutId);
+        pending.resolve(worker);
+      }
+    }
+  }
+
+  /**
+   * Atomically update status counters
+   */
+  private updateTaskStats(success: boolean, taskId: string, summary?: string): void {
+    // Use a simple lock pattern to prevent interleaved updates
+    if (this.statusUpdateLock) {
+      // Shouldn't happen in Node.js single-threaded environment, but just in case
+      logger.warn('Status update lock contention', { runId: this.runId, taskId });
+    }
+
+    this.statusUpdateLock = true;
+    try {
+      if (success) {
+        this.totalTasksCompleted++;
+        if (summary) {
+          this.completedTasks.set(taskId, summary);
+        }
+      } else {
+        this.totalTasksFailed++;
+      }
+    } finally {
+      this.statusUpdateLock = false;
+    }
   }
 
   /**
    * Execute a task using a worker (reuses existing workers)
    */
-  async executeTask(node: DAGNode): Promise<WorkReport | null> {
-    // Check for cancellation
-    if (this.cancelled) {
+  async executeTask(node: DAGNode, timeoutMs?: number): Promise<WorkReport | null> {
+    // Check for cancellation or abort
+    if (this.cancelled || this.abortController.signal.aborted) {
       logger.info('Task skipped due to cancellation', { taskId: node.task_id });
       return null;
     }
@@ -143,12 +331,26 @@ export class WorkerPool extends EventEmitter {
 
     try {
       // Get or create worker for this executor type
-      const worker = this.getOrCreateWorker(executorType);
+      let worker = this.getOrCreateWorker(executorType);
+
+      // If no worker available, wait for one
+      if (!worker) {
+        logger.debug('Waiting for idle worker', { taskId: node.task_id, executorType });
+        worker = await this.waitForIdleWorker(executorType);
+        if (!worker) {
+          logger.error('No worker available after waiting', { taskId: node.task_id, executorType });
+          this.updateTaskStats(false, node.task_id);
+          this.emit('task:failed', node.task_id, '', 'No worker available');
+          return null;
+        }
+      }
 
       // Check if executor is available
       const available = await worker.isAvailable();
       if (!available) {
         logger.error('Executor not available', { executorType, runId: this.runId });
+        this.updateTaskStats(false, node.task_id);
+        this.emit('task:failed', node.task_id, '', 'Executor not available');
         return null;
       }
 
@@ -162,24 +364,34 @@ export class WorkerPool extends EventEmitter {
         completedTasks: Object.fromEntries(this.completedTasks),
       };
 
-      const result = await worker.executeTask(node, taskContext);
+      // Execute with timeout and abort signal
+      const effectiveTimeout = timeoutMs ?? node.estimated_duration_ms ?? DEFAULT_TASK_TIMEOUT_MS;
+      const result = await withTimeoutAndAbort(
+        worker.executeTask(node, taskContext),
+        effectiveTimeout,
+        this.abortController.signal,
+        node.task_id
+      );
 
       if (result.success && result.report) {
-        this.totalTasksCompleted++;
-        this.completedTasks.set(node.task_id, result.report.summary || `Completed: ${node.name}`);
+        this.updateTaskStats(true, node.task_id, result.report.summary || `Completed: ${node.name}`);
         this.emit('task:completed', node.task_id, worker.getId(), result.report);
         this.emit('worker:completed', worker.getWorker());
+        // Notify pending tasks that this worker is now available
+        this.notifyWorkerAvailable(executorType, worker);
         return result.report;
       } else {
-        this.totalTasksFailed++;
+        this.updateTaskStats(false, node.task_id);
         const error = result.error ?? 'Unknown error';
         this.emit('task:failed', node.task_id, worker.getId(), error);
         this.emit('worker:error', worker.getWorker(), error);
+        // Even on failure, worker becomes available
+        this.notifyWorkerAvailable(executorType, worker);
         return result.report ?? null;
       }
     } catch (error) {
-      this.totalTasksFailed++;
-      const errorMsg = error instanceof Error ? error.message : String(error);
+      this.updateTaskStats(false, node.task_id);
+      const errorMsg = getErrorMessage(error);
       this.emit('task:failed', node.task_id, '', errorMsg);
       logger.error('Task execution error', { taskId: node.task_id, error: errorMsg });
       return null;
@@ -190,10 +402,20 @@ export class WorkerPool extends EventEmitter {
    * Get pool status
    */
   getStatus() {
-    const workerList = Array.from(this.workers.values()).map(w => w.getWorker());
+    const workerList: Worker[] = [];
+    for (const workers of this.workers.values()) {
+      for (const w of workers) {
+        workerList.push(w.getWorker());
+      }
+    }
+
+    const idleWorkers = workerList.filter(w => w.status === 'idle').length;
+    const busyWorkers = workerList.filter(w => w.status === 'running').length;
 
     return {
       total_workers: workerList.length,
+      idle_workers: idleWorkers,
+      busy_workers: busyWorkers,
       workers: workerList,
       total_tasks_completed: this.totalTasksCompleted,
       total_tasks_failed: this.totalTasksFailed,
@@ -210,12 +432,101 @@ export class WorkerPool extends EventEmitter {
       failed: this.totalTasksFailed,
     });
 
-    // Dispose all workers
-    for (const worker of this.workers.values()) {
-      worker.dispose();
+    // Cancel all operations
+    this.cancelled = true;
+    this.abortController.abort();
+
+    // Clean up pending worker requests
+    for (const [executorType, pendingQueue] of this.pendingWorkerRequests.entries()) {
+      for (const pending of pendingQueue) {
+        clearTimeout(pending.timeoutId);
+        // Resolve with null to unblock waiting callers
+        try {
+          pending.resolve(null);
+        } catch (err) {
+          logger.debug('Error resolving pending request during shutdown', {
+            runId: this.runId,
+            executorType,
+            error: getErrorMessage(err),
+          });
+        }
+      }
+    }
+    this.pendingWorkerRequests.clear();
+
+    // Clear task queue
+    this.taskQueue.clear();
+
+    // Dispose all workers with error handling for each
+    const errors: string[] = [];
+    for (const [executorType, workerArray] of this.workers.entries()) {
+      for (const worker of workerArray) {
+        try {
+          worker.dispose();
+        } catch (error) {
+          const errorMsg = getErrorMessage(error);
+          errors.push(`${executorType}: ${errorMsg}`);
+          logger.error('Failed to dispose worker', {
+            runId: this.runId,
+            executorType,
+            error: errorMsg,
+          });
+        }
+      }
     }
     this.workers.clear();
+
+    // Remove all EventEmitter listeners
+    this.removeAllListeners();
+
+    if (errors.length > 0) {
+      logger.warn('WorkerPool shutdown completed with errors', {
+        runId: this.runId,
+        errors,
+      });
+    }
   }
+}
+
+/**
+ * Helper to race a promise against a timeout and abort signal
+ */
+async function withTimeoutAndAbort<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  signal: AbortSignal,
+  taskId: string
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    // Check if already aborted
+    if (signal.aborted) {
+      reject(new Error('Task aborted'));
+      return;
+    }
+
+    const timeoutId = setTimeout(() => {
+      reject(new Error(`Task ${taskId} timed out after ${Math.round(timeoutMs / 60000)} minutes`));
+    }, timeoutMs);
+
+    const abortHandler = () => {
+      clearTimeout(timeoutId);
+      reject(new Error('Task aborted'));
+    };
+
+    signal.addEventListener('abort', abortHandler, { once: true });
+
+    promise
+      .then((result) => {
+        clearTimeout(timeoutId);
+        signal.removeEventListener('abort', abortHandler);
+        resolve(result);
+      })
+      .catch((error) => {
+        clearTimeout(timeoutId);
+        signal.removeEventListener('abort', abortHandler);
+        reject(error);
+      });
+  });
 }
 
 /**

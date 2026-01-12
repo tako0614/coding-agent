@@ -16,6 +16,16 @@ import type {
   CodexEvent,
 } from './types.js';
 
+/** Simple debug logger - only logs when DEBUG env is set */
+const debug = {
+  log: (...args: unknown[]) => {
+    if (process.env['DEBUG']) console.log('[CodexAdapter]', ...args);
+  },
+  error: (...args: unknown[]) => {
+    console.error('[CodexAdapter]', ...args);
+  },
+};
+
 /** Helper to safely get property from unknown object */
 function getProp<T>(obj: unknown, key: string): T | undefined {
   if (obj && typeof obj === 'object' && key in obj) {
@@ -109,18 +119,29 @@ export class CodexAdapter {
     let hasError = false;
     let errorMessage: string | undefined;
 
-    try {
-      // Set environment variables
-      if (options.env) {
-        for (const [key, value] of Object.entries(options.env)) {
+    // Save original environment variables before modification
+    const originalEnv: Record<string, string | undefined> = {};
+    if (options.env) {
+      for (const key of Object.keys(options.env)) {
+        originalEnv[key] = process.env[key];
+        process.env[key] = options.env[key];
+      }
+    }
+
+    // Restore environment variables helper
+    const restoreEnv = () => {
+      for (const [key, value] of Object.entries(originalEnv)) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
           process.env[key] = value;
         }
       }
+    };
 
-      // Set working directory
-      if (options.cwd) {
-        process.chdir(options.cwd);
-      }
+    try {
+      // NOTE: Do NOT use process.chdir() - it affects global state
+      // The working directory is set via threadOptions.workingDirectory instead
 
       // Build thread options
       const threadOptions: ThreadOptions = {
@@ -216,6 +237,9 @@ export class CodexAdapter {
           model: this.config.model,
         },
       };
+    } finally {
+      // Restore original environment variables
+      restoreEnv();
     }
   }
 
@@ -234,9 +258,8 @@ export class CodexAdapter {
     let errorMessage: string | undefined;
 
     try {
-      if (options.cwd) {
-        process.chdir(options.cwd);
-      }
+      // NOTE: Do NOT use process.chdir() - it affects global state
+      // The working directory is set via threadOptions.workingDirectory instead
 
       // Build thread options
       const threadOptions: ThreadOptions = {
@@ -289,9 +312,8 @@ export class CodexAdapter {
    * Execute simple query without WorkOrder
    */
   async query(prompt: string, options?: { cwd?: string; threadId?: string }): Promise<string> {
-    if (options?.cwd) {
-      process.chdir(options.cwd);
-    }
+    // NOTE: Do NOT use process.chdir() - it affects global state
+    // The working directory is set via threadOptions.workingDirectory instead
 
     // Build thread options
     const threadOptions: ThreadOptions = {
@@ -314,30 +336,22 @@ export class CodexAdapter {
 
   /**
    * Check if Codex SDK is available and authenticated
+   * NOTE: This is a lightweight check that doesn't create threads
    */
   async isAvailable(): Promise<boolean> {
     try {
       // Check if SDK instance exists
       if (!this.codex) {
-        console.log('[CodexAdapter] SDK instance not created');
+        debug.log('SDK instance not created');
         return false;
       }
 
-      // Try to start a thread to verify authentication
-      console.log('[CodexAdapter] Checking availability by starting thread...');
-      const threadOptions: ThreadOptions = {
-        skipGitRepoCheck: true,
-        approvalPolicy: 'never',
-      };
-      const thread = this.codex.startThread(threadOptions);
-      if (thread) {
-        console.log('[CodexAdapter] Thread started successfully, SDK is available');
-        return true;
-      }
-      console.log('[CodexAdapter] Failed to start thread');
-      return false;
+      // Simply check that the SDK class is instantiated
+      // Actual authentication will be verified on first use
+      debug.log('SDK instance exists, assuming available');
+      return true;
     } catch (error) {
-      console.error('[CodexAdapter] Availability check failed:', error);
+      debug.error('Availability check failed:', error);
       return false;
     }
   }
@@ -351,6 +365,14 @@ export class CodexAdapter {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Dispose adapter and release resources
+   */
+  dispose(): void {
+    // Codex adapter has no persistent resources to clean up
+    // This is here for interface consistency
   }
 }
 

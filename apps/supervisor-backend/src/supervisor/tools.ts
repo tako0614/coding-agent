@@ -3,13 +3,42 @@
  * Tools available to the Supervisor Agent for orchestrating work
  */
 
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, lstatSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, lstatSync, realpathSync } from 'node:fs';
 import { join, relative, dirname, resolve, normalize } from 'node:path';
-import { execSync } from 'node:child_process';
+import { exec } from 'node:child_process';
+import { promisify } from 'node:util';
 import { mkdirSync } from 'node:fs';
+
+const execAsync = promisify(exec);
 import type { ToolDefinition, WorkerTask, WorkerTaskResult } from './types.js';
 import { createTaskId } from '@supervisor/protocol';
 import { logger } from '../services/logger.js';
+import { getErrorMessage, ToolExecutionError } from '../services/errors.js';
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/** Maximum file size to read (50KB) */
+const MAX_FILE_READ_SIZE = 50_000;
+
+/** Maximum command output size (10KB) */
+const MAX_COMMAND_OUTPUT_SIZE = 10_000;
+
+/** Maximum number of files to list */
+const MAX_LIST_FILES = 500;
+
+/** Maximum directory depth for recursive listing */
+const MAX_LIST_DEPTH = 10;
+
+/** Maximum output log lines to keep per task */
+const MAX_OUTPUT_LOG_LINES = 1000;
+
+/** Command timeout in milliseconds (5 minutes) */
+const COMMAND_TIMEOUT_MS = 300_000;
+
+/** Command max buffer size (10MB) */
+const COMMAND_MAX_BUFFER = 10 * 1024 * 1024;
 
 /** Binary file extensions to skip reading as text */
 const BINARY_EXTENSIONS = new Set([
@@ -28,16 +57,60 @@ const BINARY_EXTENSIONS = new Set([
 
 /**
  * Validate that a path is within the allowed root directory (prevent path traversal)
+ * Uses realpath to resolve symlinks and prevent symlink-based attacks
  */
 function validatePath(rootPath: string, relativePath: string): { valid: boolean; fullPath: string; error?: string } {
-  const normalizedRoot = resolve(rootPath);
-  const fullPath = resolve(rootPath, relativePath);
-  const normalizedFull = normalize(fullPath);
+  // Check for null bytes and other dangerous characters
+  if (relativePath.includes('\0')) {
+    return {
+      valid: false,
+      fullPath: '',
+      error: 'Path contains null byte',
+    };
+  }
+
+  // Check for other potentially dangerous patterns
+  if (/[\x00-\x1f\x7f]/.test(relativePath)) {
+    return {
+      valid: false,
+      fullPath: '',
+      error: 'Path contains control characters',
+    };
+  }
+
+  // Check for Windows UNC path attacks
+  const isWindows = process.platform === 'win32';
+  if (isWindows && (relativePath.startsWith('\\\\') || relativePath.startsWith('//'))) {
+    return {
+      valid: false,
+      fullPath: '',
+      error: 'UNC paths are not allowed',
+    };
+  }
+
+  // Check for Windows drive letter escapes
+  if (isWindows && /^[a-zA-Z]:/.test(relativePath)) {
+    return {
+      valid: false,
+      fullPath: '',
+      error: 'Absolute paths with drive letters are not allowed',
+    };
+  }
+
+  let normalizedRoot: string;
+  try {
+    // Use realpath to resolve any symlinks in the root path itself
+    normalizedRoot = existsSync(rootPath) ? realpathSync(rootPath) : resolve(rootPath);
+  } catch {
+    normalizedRoot = resolve(rootPath);
+  }
+
+  const fullPath = resolve(normalizedRoot, relativePath);
+  let normalizedFull = normalize(fullPath);
 
   // Check if the resolved path starts with the root (case-insensitive on Windows)
-  const isWindows = process.platform === 'win32';
   const rootCheck = isWindows ? normalizedRoot.toLowerCase() : normalizedRoot;
-  const fullCheck = isWindows ? normalizedFull.toLowerCase() : normalizedFull;
+  let fullCheck = isWindows ? normalizedFull.toLowerCase() : normalizedFull;
 
   if (!fullCheck.startsWith(rootCheck)) {
     return {
@@ -45,6 +118,26 @@ function validatePath(rootPath: string, relativePath: string): { valid: boolean;
       fullPath: '',
       error: `Path traversal detected: ${relativePath} resolves outside repository`,
     };
+  }
+
+  // If the path exists, also check the realpath to prevent symlink attacks
+  if (existsSync(fullPath)) {
+    try {
+      const realFullPath = realpathSync(fullPath);
+      normalizedFull = realFullPath;
+      fullCheck = isWindows ? realFullPath.toLowerCase() : realFullPath;
+
+      if (!fullCheck.startsWith(rootCheck)) {
+        return {
+          valid: false,
+          fullPath: '',
+          error: `Symlink escape detected: ${relativePath} resolves outside repository via symlink`,
+        };
+      }
+    } catch {
+      // realpath failed, likely due to permissions - allow the operation to proceed
+      // and let the actual file operation fail if needed
+    }
   }
 
   return { valid: true, fullPath: normalizedFull };
@@ -102,32 +195,106 @@ function validateArgs<T extends Record<string, unknown>>(
 }
 
 /**
- * Validate command for shell execution
- * Commands are now allowed by default - only basic sanity checks
+ * Dangerous command patterns that should be blocked
  */
-function validateCommand(command: string): { valid: boolean; error?: string } {
-  // Only reject completely empty commands
+const DANGEROUS_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
+  // Destructive file operations on root or system directories
+  { pattern: /\brm\s+(-[rf]+\s+)*[/\\]($|\s)/i, reason: 'Deleting root directory' },
+  { pattern: /\brm\s+(-[rf]+\s+)*\/\*($|\s)/i, reason: 'Deleting all files in root' },
+  { pattern: /\brm\s+(-[rf]+\s+)*~($|\s)/i, reason: 'Deleting home directory' },
+
+  // System file access
+  { pattern: /\/etc\/(passwd|shadow|sudoers)/i, reason: 'Accessing system authentication files' },
+  { pattern: /\/etc\/ssh\/.*key/i, reason: 'Accessing SSH keys' },
+  { pattern: /\.ssh\/(id_|known_hosts|authorized_keys)/i, reason: 'Accessing SSH configuration' },
+
+  // Environment and credential exfiltration
+  { pattern: /\bprintenv\s*\|/i, reason: 'Piping environment variables' },
+  { pattern: /\benv\s*\|/i, reason: 'Piping environment variables' },
+  { pattern: /\$[({]?.*PASSWORD/i, reason: 'Accessing password variables' },
+  { pattern: /\$[({]?.*SECRET/i, reason: 'Accessing secret variables' },
+  { pattern: /\$[({]?.*API_KEY/i, reason: 'Accessing API key variables' },
+  { pattern: /\$[({]?.*TOKEN/i, reason: 'Accessing token variables' },
+
+  // Network exfiltration attempts
+  { pattern: /\bcurl\s+.*-d\s*["']?\$\(/i, reason: 'Exfiltrating command output via curl' },
+  { pattern: /\bwget\s+.*--post-data/i, reason: 'Exfiltrating data via wget' },
+  { pattern: /\bnc\s+-[a-z]*e/i, reason: 'Netcat with execute flag (reverse shell)' },
+
+  // Dangerous shell features
+  { pattern: /\beval\s+.*\$\(/i, reason: 'Dangerous eval with command substitution' },
+  { pattern: /`.*\$\(.*`/i, reason: 'Nested command substitution (potential injection)' },
+
+  // Privilege escalation
+  { pattern: /\bchmod\s+[0-7]*7[0-7]*\s+\/bin/i, reason: 'Modifying system binary permissions' },
+  { pattern: /\bchown\s+.*\/bin/i, reason: 'Changing system binary ownership' },
+
+  // Process killing (only block system-wide kills)
+  { pattern: /\bkill\s+-9\s+-1($|\s)/i, reason: 'Killing all processes' },
+  { pattern: /\bkillall\s+-9\s+/i, reason: 'Killing processes by name' },
+];
+
+/**
+ * Interactive commands that may hang
+ */
+const INTERACTIVE_PATTERNS: RegExp[] = [
+  /\bsudo\s/,    // sudo might prompt for password
+  /\bpasswd\b/,  // password change
+  /\bvi\b/,      // vi editor
+  /\bvim\b/,     // vim editor
+  /\bnano\b/,    // nano editor
+  /\bemacs\b/,   // emacs editor
+  /\bssh\s/,     // SSH connection
+  /\btelnet\s/,  // Telnet connection
+];
+
+/**
+ * Commands that should be logged for security audit
+ */
+const AUDIT_PATTERNS: RegExp[] = [
+  /\bcurl\s/,    // HTTP requests
+  /\bwget\s/,    // HTTP downloads
+  /\bgit\s+push/,// Git push
+  /\bnpm\s+publish/, // npm publish
+  /\bdocker\s/,  // Docker commands
+];
+
+/**
+ * Validate command for shell execution
+ * Blocks dangerous patterns and warns about potentially problematic commands
+ */
+function validateCommand(command: string): { valid: boolean; error?: string; warnings?: string[] } {
+  const warnings: string[] = [];
+
+  // Reject empty commands
   if (!command || command.trim().length === 0) {
     return { valid: false, error: 'Command cannot be empty' };
   }
 
-  // Warn about commands that might hang waiting for input
-  const interactivePatterns = [
-    /\bsudo\s/,    // sudo might prompt for password
-    /\bpasswd\b/,  // password change
-    /\bvi\b/,      // vi editor
-    /\bvim\b/,     // vim editor
-    /\bnano\b/,    // nano editor
-    /\bemacs\b/,   // emacs editor
-  ];
-
-  for (const pattern of interactivePatterns) {
+  // Check for dangerous patterns
+  for (const { pattern, reason } of DANGEROUS_PATTERNS) {
     if (pattern.test(command)) {
+      logger.warn('Dangerous command blocked', { command: command.slice(0, 100), reason });
+      return { valid: false, error: `Security: ${reason}` };
+    }
+  }
+
+  // Check for interactive commands
+  for (const pattern of INTERACTIVE_PATTERNS) {
+    if (pattern.test(command)) {
+      warnings.push(`Command may require interactive input: ${command.match(pattern)?.[0]}`);
       logger.warn('Command may require interactive input', { command: command.slice(0, 50) });
     }
   }
 
-  return { valid: true };
+  // Log commands for security audit
+  for (const pattern of AUDIT_PATTERNS) {
+    if (pattern.test(command)) {
+      logger.info('Audit: Command executed', { command: command.slice(0, 100) });
+    }
+  }
+
+  return { valid: true, warnings: warnings.length > 0 ? warnings : undefined };
 }
 
 // =============================================================================
@@ -172,6 +339,10 @@ export const SUPERVISOR_TOOLS: ToolDefinition[] = [
           new_string: {
             type: 'string',
             description: '置換後の文字列（新規作成時はファイル全体の内容）',
+          },
+          replace_all: {
+            type: 'boolean',
+            description: 'trueの場合は全ての出現箇所を置換、falseまたは省略時は最初の1つのみ置換（デフォルト: false）',
           },
         },
         required: ['path', 'old_string', 'new_string'],
@@ -462,10 +633,52 @@ interface AsyncTask {
 /** Maximum number of completed tasks to keep in memory */
 const MAX_COMPLETED_TASKS = 100;
 
+/** Maximum file size for writes (10MB) */
+const MAX_FILE_WRITE_SIZE = 10 * 1024 * 1024;
+
+/**
+ * Simple async mutex for protecting asyncTasks Map operations
+ */
+class AsyncMutex {
+  private locked = false;
+  private queue: (() => void)[] = [];
+
+  async acquire(): Promise<void> {
+    if (!this.locked) {
+      this.locked = true;
+      return;
+    }
+
+    return new Promise<void>(resolve => {
+      this.queue.push(resolve);
+    });
+  }
+
+  release(): void {
+    const next = this.queue.shift();
+    if (next) {
+      next();
+    } else {
+      this.locked = false;
+    }
+  }
+
+  async withLock<T>(fn: () => T | Promise<T>): Promise<T> {
+    await this.acquire();
+    try {
+      return await fn();
+    } finally {
+      this.release();
+    }
+  }
+}
+
 export class ToolExecutor {
   private asyncTasks: Map<string, AsyncTask> = new Map();
+  private tasksMutex = new AsyncMutex();
   private workerExecutor?: (tasks: WorkerTask[], signal?: AbortSignal) => Promise<WorkerTaskResult[]>;
   private callbacks: ToolExecutorCallbacks = {};
+  private cancelled = false;
 
   constructor(private ctx: ToolExecutorContext) {}
 
@@ -514,12 +727,14 @@ export class ToolExecutor {
             path: { type: 'string', required: true },
             old_string: { type: 'string', required: true },
             new_string: { type: 'string', required: true },
+            replace_all: { type: 'boolean' },
           });
           if (!v.valid) return { success: false, error: v.error };
           return this.editFile(
             v.validated.path as string,
             v.validated.old_string as string,
-            v.validated.new_string as string
+            v.validated.new_string as string,
+            (v.validated.replace_all as boolean) ?? false
           );
         }
 
@@ -588,7 +803,7 @@ export class ToolExecutor {
         case 'run_command': {
           const v = validateArgs(args, { command: { type: 'string', required: true } });
           if (!v.valid) return { success: false, error: v.error };
-          return this.runCommand(v.validated.command as string);
+          return await this.runCommand(v.validated.command as string);
         }
 
         case 'complete': {
@@ -613,7 +828,7 @@ export class ToolExecutor {
           return { success: false, error: `Unknown tool: ${name}` };
       }
     } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
+      const errorMsg = getErrorMessage(error);
       logger.error('Tool execution failed', { tool: name, error: errorMsg });
       return { success: false, error: errorMsg };
     }
@@ -650,9 +865,8 @@ export class ToolExecutor {
 
     try {
       const content = readFileSync(pathCheck.fullPath, 'utf-8');
-      const maxSize = 50000;
-      const truncated = content.length > maxSize
-        ? content.slice(0, maxSize) + '\n\n... (truncated)'
+      const truncated = content.length > MAX_FILE_READ_SIZE
+        ? content.slice(0, MAX_FILE_READ_SIZE) + `\n\n... (truncated, showing ${MAX_FILE_READ_SIZE} of ${content.length} chars)`
         : content;
 
       return { success: true, result: truncated };
@@ -669,11 +883,19 @@ export class ToolExecutor {
     }
   }
 
-  private editFile(path: string, oldString: string, newString: string): ToolResult {
+  private editFile(path: string, oldString: string, newString: string, replaceAll = false): ToolResult {
     // Validate path to prevent traversal
     const pathCheck = validatePath(this.ctx.repoPath, path);
     if (!pathCheck.valid) {
       return { success: false, error: pathCheck.error };
+    }
+
+    // Check file size limit to prevent disk exhaustion
+    if (newString.length > MAX_FILE_WRITE_SIZE) {
+      return {
+        success: false,
+        error: `Content too large: ${newString.length} bytes (max: ${MAX_FILE_WRITE_SIZE} bytes)`,
+      };
     }
 
     try {
@@ -704,15 +926,36 @@ export class ToolExecutor {
         return { success: false, error: `String not found in file: "${oldString.slice(0, 50)}..."` };
       }
 
-      // Count replacements BEFORE replacing
+      // Count total occurrences
       const escapedOldString = oldString.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const replacements = (content.match(new RegExp(escapedOldString, 'g')) || []).length;
+      const totalOccurrences = (content.match(new RegExp(escapedOldString, 'g')) || []).length;
 
-      // Use replaceAll to replace all occurrences
-      const newContent = content.replaceAll(oldString, newString);
+      // Replace based on replaceAll flag
+      let newContent: string;
+      let replacements: number;
+
+      if (replaceAll) {
+        // Replace all occurrences
+        newContent = content.replaceAll(oldString, newString);
+        replacements = totalOccurrences;
+      } else {
+        // Replace only the first occurrence
+        newContent = content.replace(oldString, newString);
+        replacements = 1;
+      }
+
       writeFileSync(pathCheck.fullPath, newContent, 'utf-8');
 
-      return { success: true, result: { action: 'edited', path, replacements } };
+      return {
+        success: true,
+        result: {
+          action: 'edited',
+          path,
+          replacements,
+          total_occurrences: totalOccurrences,
+          replace_all: replaceAll,
+        },
+      };
     } catch (error) {
       return { success: false, error: `Failed to edit file: ${error}` };
     }
@@ -731,15 +974,14 @@ export class ToolExecutor {
 
     try {
       const files: string[] = [];
-      const maxFiles = 500;
 
       const walk = (dir: string, depth: number) => {
-        if (files.length >= maxFiles) return;
-        if (depth > 10) return;
+        if (files.length >= MAX_LIST_FILES) return;
+        if (depth > MAX_LIST_DEPTH) return;
 
         const entries = readdirSync(dir);
         for (const entry of entries) {
-          if (files.length >= maxFiles) break;
+          if (files.length >= MAX_LIST_FILES) break;
 
           if (entry.startsWith('.') || entry === 'node_modules' || entry === 'dist') {
             continue;
@@ -836,7 +1078,7 @@ export class ToolExecutor {
         },
       };
     } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
+      const errorMsg = getErrorMessage(error);
       logger.error('Spawn workers failed', { error: errorMsg, runId: this.ctx.runId });
       return {
         success: false,
@@ -858,16 +1100,29 @@ export class ToolExecutor {
       return { success: false, error: 'Worker executor not configured' };
     }
 
-    const workerTasks: WorkerTask[] = tasks.map(task => ({
-      task_id: createTaskId(),
-      instruction: task.instruction,
-      executor: task.executor,
-      context: task.context,
-      priority: 5,
-      created_at: new Date().toISOString(),
-    }));
+    // Check if run is being cancelled
+    if (this.cancelled) {
+      return { success: false, error: 'Run is being cancelled, cannot spawn new workers' };
+    }
 
     const taskIds: string[] = [];
+
+    // Create tasks with output callbacks
+    const workerTasks: WorkerTask[] = tasks.map(task => {
+      const taskId = createTaskId();
+      return {
+        task_id: taskId,
+        instruction: task.instruction,
+        executor: task.executor,
+        context: task.context,
+        priority: 5,
+        created_at: new Date().toISOString(),
+        // Output callback to capture logs for get_task_output
+        onOutput: (output: string) => {
+          this.addTaskOutput(taskId, output);
+        },
+      };
+    });
 
     for (const task of workerTasks) {
       const abortController = new AbortController();
@@ -878,43 +1133,49 @@ export class ToolExecutor {
       const promise: Promise<WorkerTaskResult> = this.workerExecutor([task], abortController.signal)
         .then(results => {
           const result = results[0];
-          const asyncTask = this.asyncTasks.get(task.task_id);
-          if (asyncTask && asyncTask.status === 'running') {
-            asyncTask.status = 'completed';
-            asyncTask.result = result;
-            asyncTask.completedAt = new Date().toISOString();
-            // Notify worker complete
-            if (result) {
-              this.callbacks.onWorkerComplete?.(result);
+          // Use mutex for thread-safe access
+          return this.tasksMutex.withLock(() => {
+            const asyncTask = this.asyncTasks.get(task.task_id);
+            if (asyncTask && asyncTask.status === 'running') {
+              asyncTask.status = 'completed';
+              asyncTask.result = result;
+              asyncTask.completedAt = new Date().toISOString();
+              // Notify worker complete
+              if (result) {
+                this.callbacks.onWorkerComplete?.(result);
+              }
             }
-          }
-          return result ?? {
-            task_id: task.task_id,
-            instruction: task.instruction,
-            executor: task.executor,
-            success: false,
-            error: 'No result returned',
-            duration_ms: 0,
-            completed_at: new Date().toISOString(),
-          };
+            return result ?? {
+              task_id: task.task_id,
+              instruction: task.instruction,
+              executor: task.executor,
+              success: false,
+              error: 'No result returned',
+              duration_ms: 0,
+              completed_at: new Date().toISOString(),
+            };
+          });
         })
         .catch(error => {
-          const asyncTask = this.asyncTasks.get(task.task_id);
-          if (asyncTask && asyncTask.status === 'running') {
-            asyncTask.status = 'failed';
-            asyncTask.error = error instanceof Error ? error.message : String(error);
-            asyncTask.completedAt = new Date().toISOString();
-          }
-          // Don't re-throw - let the error be captured in asyncTask
-          return {
-            task_id: task.task_id,
-            instruction: task.instruction,
-            executor: task.executor,
-            success: false,
-            error: error instanceof Error ? error.message : String(error),
-            duration_ms: 0,
-            completed_at: new Date().toISOString(),
-          };
+          // Use mutex for thread-safe access
+          return this.tasksMutex.withLock(() => {
+            const asyncTask = this.asyncTasks.get(task.task_id);
+            if (asyncTask && asyncTask.status === 'running') {
+              asyncTask.status = 'failed';
+              asyncTask.error = getErrorMessage(error);
+              asyncTask.completedAt = new Date().toISOString();
+            }
+            // Don't re-throw - let the error be captured in asyncTask
+            return {
+              task_id: task.task_id,
+              instruction: task.instruction,
+              executor: task.executor,
+              success: false,
+              error: getErrorMessage(error),
+              duration_ms: 0,
+              completed_at: new Date().toISOString(),
+            };
+          });
         });
 
       this.asyncTasks.set(task.task_id, {
@@ -1073,9 +1334,9 @@ export class ToolExecutor {
       // Split by lines and add
       const lines = output.split('\n');
       asyncTask.outputLogs.push(...lines);
-      // Keep only last 1000 lines to prevent memory issues
-      if (asyncTask.outputLogs.length > 1000) {
-        asyncTask.outputLogs = asyncTask.outputLogs.slice(-1000);
+      // Keep only last N lines to prevent memory issues
+      if (asyncTask.outputLogs.length > MAX_OUTPUT_LOG_LINES) {
+        asyncTask.outputLogs = asyncTask.outputLogs.slice(-MAX_OUTPUT_LOG_LINES);
       }
     }
   }
@@ -1084,7 +1345,7 @@ export class ToolExecutor {
   // Command Execution
   // ===========================================================================
 
-  private runCommand(command: string): ToolResult {
+  private async runCommand(command: string): Promise<ToolResult> {
     // Validate command
     const cmdCheck = validateCommand(command);
     if (!cmdCheck.valid) {
@@ -1092,29 +1353,29 @@ export class ToolExecutor {
     }
 
     try {
-      const output = execSync(command, {
+      const { stdout, stderr } = await execAsync(command, {
         cwd: this.ctx.repoPath,
-        encoding: 'utf-8',
-        maxBuffer: 10 * 1024 * 1024,
-        timeout: 300000, // 5 minute timeout
+        maxBuffer: COMMAND_MAX_BUFFER,
+        timeout: COMMAND_TIMEOUT_MS,
         shell: process.platform === 'win32' ? 'cmd.exe' : '/bin/sh',
       });
 
       return {
         success: true,
         result: {
-          stdout: output.slice(0, 10000),
+          stdout: stdout.slice(0, MAX_COMMAND_OUTPUT_SIZE),
+          stderr: stderr ? stderr.slice(0, MAX_COMMAND_OUTPUT_SIZE / 2) : undefined,
           exit_code: 0,
         },
       };
     } catch (error) {
-      const execError = error as { status?: number; stdout?: string; stderr?: string; killed?: boolean };
-      if (execError.killed) {
-        return { success: false, error: 'Command timed out after 5 minutes' };
+      const execError = error as { code?: number; stdout?: string; stderr?: string; killed?: boolean; signal?: string };
+      if (execError.killed || execError.signal === 'SIGTERM') {
+        return { success: false, error: `Command timed out after ${Math.round(COMMAND_TIMEOUT_MS / 60000)} minutes` };
       }
       return {
         success: false,
-        error: `Command failed (exit ${execError.status}): ${execError.stderr || execError.stdout}`.slice(0, 5000),
+        error: `Command failed (exit ${execError.code}): ${execError.stderr || execError.stdout}`.slice(0, MAX_COMMAND_OUTPUT_SIZE / 2),
       };
     }
   }
@@ -1124,6 +1385,8 @@ export class ToolExecutor {
   // ===========================================================================
 
   private complete(summary: string): ToolResult {
+    // Clean up all async tasks on run completion
+    this.clearAllTasks();
     return {
       success: true,
       result: {
@@ -1134,6 +1397,8 @@ export class ToolExecutor {
   }
 
   private fail(reason: string): ToolResult {
+    // Clean up all async tasks on run failure
+    this.clearAllTasks();
     return {
       success: true,
       result: {
@@ -1144,6 +1409,9 @@ export class ToolExecutor {
   }
 
   private cancel(reason: string): ToolResult {
+    // Set cancelled flag to prevent new tasks from being spawned
+    this.cancelled = true;
+
     const cancelledTaskIds: string[] = [];
 
     // Cancel all running async tasks (actually abort them)
@@ -1161,6 +1429,9 @@ export class ToolExecutor {
     this.callbacks.onCancel?.();
 
     logger.info('Run cancelled', { reason, cancelledTaskIds, runId: this.ctx.runId });
+
+    // Clear all tasks after cancellation
+    this.asyncTasks.clear();
 
     return {
       success: true,
@@ -1188,5 +1459,18 @@ export class ToolExecutor {
         this.asyncTasks.delete(taskId);
       }
     }
+  }
+
+  /**
+   * Clear all tasks (called on run completion)
+   */
+  clearAllTasks(): void {
+    // Cancel any running tasks first
+    for (const [, asyncTask] of this.asyncTasks) {
+      if (asyncTask.status === 'running') {
+        asyncTask.abortController.abort();
+      }
+    }
+    this.asyncTasks.clear();
   }
 }

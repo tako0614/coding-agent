@@ -11,9 +11,12 @@ import {
   setMaxContextTokens,
   getDAGModel,
   getExecutorMode,
+  MIN_MAX_CONTEXT_TOKENS,
+  MAX_MAX_CONTEXT_TOKENS,
   type AppSettings,
 } from '../../services/settings-store.js';
 import { copilotAPIManager } from '../../services/copilot-api-manager.js';
+import { logger } from '../../services/logger.js';
 
 const settings = new Hono();
 
@@ -29,8 +32,11 @@ const UpdateSettingsSchema = z.object({
   dag_model: z.string().optional(),
   // Executor mode
   executor_mode: z.enum(['agent', 'codex_only', 'claude_only']).optional(),
-  // Max context tokens
-  max_context_tokens: z.number().optional(),
+  // Max context tokens (with validation bounds)
+  max_context_tokens: z.number()
+    .min(MIN_MAX_CONTEXT_TOKENS, `min_context_tokens must be at least ${MIN_MAX_CONTEXT_TOKENS}`)
+    .max(MAX_MAX_CONTEXT_TOKENS, `max_context_tokens must be at most ${MAX_MAX_CONTEXT_TOKENS}`)
+    .optional(),
 });
 
 /**
@@ -89,24 +95,24 @@ settings.put('/', async (c) => {
     // Handle max_context_tokens separately (since it uses its own setter)
     if (parsed.data.max_context_tokens !== undefined) {
       setMaxContextTokens(parsed.data.max_context_tokens);
-      console.log(`[Settings] max_context_tokens set to ${parsed.data.max_context_tokens}`);
+      logger.info('max_context_tokens updated', { value: parsed.data.max_context_tokens });
     }
 
     updateSettings(parsed.data);
-    console.log('[Settings] Settings updated');
+    logger.info('Settings updated');
 
     // Auto-start/stop copilot-api based on github_token change
     if (parsed.data.github_token !== undefined) {
       const hasToken = !!parsed.data.github_token;
       if (hasToken && !hadToken) {
-        console.log('[Settings] GitHub token set, starting copilot-api...');
+        logger.info('GitHub token set, starting copilot-api');
         copilotAPIManager.start().catch((err) => {
-          console.error('[Settings] Failed to start copilot-api:', err);
+          logger.error('Failed to start copilot-api', { error: err instanceof Error ? err.message : String(err) });
         });
       } else if (!hasToken && hadToken) {
-        console.log('[Settings] GitHub token cleared, stopping copilot-api...');
+        logger.info('GitHub token cleared, stopping copilot-api');
         copilotAPIManager.stop().catch((err) => {
-          console.error('[Settings] Failed to stop copilot-api:', err);
+          logger.error('Failed to stop copilot-api', { error: err instanceof Error ? err.message : String(err) });
         });
       }
     }
@@ -137,7 +143,7 @@ settings.put('/', async (c) => {
 
     return c.json(masked);
   } catch (error) {
-    console.error('[Settings] Error updating settings:', error);
+    logger.error('Error updating settings', { error: error instanceof Error ? error.message : String(error) });
     return c.json({
       error: {
         message: error instanceof Error ? error.message : 'Internal server error',
@@ -168,7 +174,7 @@ settings.delete('/:key', (c) => {
   } else {
     updateSettings({ [key]: '' });
   }
-  console.log(`[Settings] Deleted setting: ${key}`);
+  logger.info('Setting deleted', { key });
 
   return c.json({ message: `Setting ${key} deleted` });
 });

@@ -31,11 +31,14 @@ import {
   updateSettings,
   fetchParallelSessions,
   saveParallelSessions,
+  sendSpecMessage,
+  fetchConversation,
   type Project,
   type LogEntry,
   type CopilotModel,
   type ExecutorMode,
   type ParallelSession,
+  type RunMode,
 } from '../lib/api';
 import clsx from 'clsx';
 import { ChatMessage, type ChatMessageData } from '../components/chat';
@@ -47,6 +50,7 @@ interface AgentSession {
   id: string;
   projectId: string | null;
   runId: string | null;
+  mode: RunMode;
   status: AgentStatus;
   input: string;
   messages: ChatMessageData[];
@@ -503,6 +507,233 @@ function AgentPanel({
   );
 }
 
+// --- Spec Agent Panel Component ---
+function SpecAgentPanel({
+  session,
+  projects,
+  onUpdate,
+  onBack,
+}: {
+  session: AgentSession;
+  projects: Project[];
+  onUpdate: (updates: Partial<AgentSession>) => void;
+  onBack?: () => void;
+}) {
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [showProjectDropdown, setShowProjectDropdown] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+
+  const selectedProject = projects.find(p => p.project_id === session.projectId);
+
+  // Auto-scroll when messages change
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [session.messages.length]);
+
+  // Load conversation on mount
+  useEffect(() => {
+    if (!session.runId) return;
+
+    const loadConversation = async () => {
+      try {
+        const conversation = await fetchConversation(session.runId!);
+        if (conversation) {
+          const messages: ChatMessageData[] = conversation.messages.map(m => ({
+            id: `${m.timestamp}-${Math.random()}`,
+            type: m.role === 'user' ? 'user' : 'agent',
+            content: m.content,
+            timestamp: m.timestamp,
+            status: 'success',
+          }));
+          onUpdate({ messages });
+        }
+      } catch (error) {
+        console.error('Failed to load conversation:', error);
+      }
+    };
+    loadConversation();
+  }, [session.runId]);
+
+  const handleSend = async () => {
+    if (!session.input.trim() || !session.runId) return;
+
+    const userMessage: ChatMessageData = {
+      id: `user-${Date.now()}`,
+      type: 'user',
+      content: session.input,
+      timestamp: new Date().toISOString(),
+    };
+
+    onUpdate({
+      messages: [...session.messages, userMessage],
+      input: '',
+    });
+
+    setIsLoading(true);
+
+    try {
+      const response = await sendSpecMessage(session.runId, session.input);
+
+      const assistantMessage: ChatMessageData = {
+        id: `assistant-${Date.now()}`,
+        type: 'agent',
+        content: response.message,
+        timestamp: new Date().toISOString(),
+        status: 'success',
+      };
+
+      onUpdate({
+        messages: [...session.messages, userMessage, assistantMessage],
+        status: response.completed ? 'completed' : session.status,
+      });
+    } catch (error) {
+      const errorMessage: ChatMessageData = {
+        id: `error-${Date.now()}`,
+        type: 'agent',
+        content: error instanceof Error ? error.message : 'エラーが発生しました',
+        timestamp: new Date().toISOString(),
+        status: 'error',
+      };
+
+      onUpdate({
+        messages: [...session.messages, userMessage, errorMessage],
+        status: 'failed',
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-full bg-white">
+      {/* Header */}
+      <div className="flex items-center justify-between p-3 border-b border-slate-200 bg-purple-50">
+        <div className="flex items-center gap-3">
+          {onBack && (
+            <button
+              onClick={onBack}
+              className="p-1.5 text-slate-500 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition-colors"
+            >
+              <ArrowLeft size={20} />
+            </button>
+          )}
+
+          {/* Mode Badge */}
+          <span className="px-2 py-1 text-xs font-medium bg-purple-100 text-purple-700 rounded-full">
+            仕様策定モード
+          </span>
+
+          {/* Project Selector */}
+          <div className="relative">
+            <button
+              onClick={() => setShowProjectDropdown(!showProjectDropdown)}
+              disabled={session.status === 'running'}
+              className="flex items-center gap-2 px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100 rounded-lg transition-colors disabled:opacity-50"
+            >
+              <FolderOpen size={16} />
+              <span className="truncate max-w-[200px]">
+                {selectedProject?.name || 'Select Project'}
+              </span>
+              <ChevronDown size={14} />
+            </button>
+            {showProjectDropdown && (
+              <div className="absolute top-full left-0 mt-1 bg-white border border-slate-200 rounded-lg shadow-lg py-1 min-w-[250px] max-h-[300px] overflow-y-auto z-50">
+                {projects.map((project) => (
+                  <button
+                    key={project.project_id}
+                    onClick={() => {
+                      onUpdate({ projectId: project.project_id });
+                      setShowProjectDropdown(false);
+                    }}
+                    className={clsx(
+                      'w-full text-left px-3 py-2 text-sm hover:bg-slate-50',
+                      project.project_id === session.projectId && 'bg-primary-50 text-primary-600'
+                    )}
+                  >
+                    <div className="font-medium truncate">{project.name}</div>
+                    <div className="text-xs text-slate-400 truncate">{project.repo_path}</div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Status */}
+        <div className="flex items-center gap-2">
+          {isLoading && (
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium bg-yellow-100 text-yellow-700 rounded-full">
+              <Loader2 size={10} className="animate-spin" />
+              思考中
+            </span>
+          )}
+          {session.status === 'completed' && (
+            <span className="px-2 py-0.5 text-xs font-medium bg-green-100 text-green-700 rounded-full">
+              完了
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Messages Area */}
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-3xl mx-auto p-4 space-y-3">
+          {session.messages.length === 0 ? (
+            <div className="text-center text-slate-400 text-sm py-16">
+              {session.runId
+                ? '仕様についてチャットを開始してください'
+                : 'まずプロジェクトを選択してください'}
+            </div>
+          ) : (
+            session.messages.map((msg) => (
+              <ChatMessage key={msg.id} message={msg} />
+            ))
+          )}
+          <div ref={messagesEndRef} />
+        </div>
+      </div>
+
+      {/* Input Area */}
+      <div className="border-t border-slate-200 p-4 bg-white">
+        <div className="max-w-3xl mx-auto">
+          <div className="relative">
+            <textarea
+              value={session.input}
+              onChange={(e) => onUpdate({ input: e.target.value })}
+              onKeyDown={handleKeyDown}
+              placeholder={session.runId ? "仕様について質問や指示を入力..." : "プロジェクトを選択してください"}
+              disabled={!session.runId || isLoading}
+              className="w-full resize-none border border-slate-200 rounded-lg px-4 py-3 pr-14 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 min-h-[80px] disabled:bg-slate-50"
+              rows={3}
+            />
+            <div className="absolute right-2 bottom-2">
+              <button
+                onClick={handleSend}
+                disabled={!session.input.trim() || !session.runId || isLoading}
+                className={clsx(
+                  'p-2 rounded-lg transition-colors',
+                  session.input.trim() && session.runId && !isLoading
+                    ? 'bg-purple-500 text-white hover:bg-purple-600'
+                    : 'bg-slate-100 text-slate-400'
+                )}
+              >
+                {isLoading ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // --- Columns View Component (parallel mode) ---
 function ColumnsView({
   sessions,
@@ -683,6 +914,7 @@ function ColumnsView({
 function TimelineView({
   projects,
   onStartNew,
+  onStartSpec,
   onOpenRun,
   onOpenOrphaned,
   onSwitchToParallel,
@@ -696,7 +928,8 @@ function TimelineView({
 }: {
   projects: Project[];
   onStartNew: (projectId: string, goal: string) => void;
-  onOpenRun: (runId: string, projectId: string | undefined, goal: string) => void;
+  onStartSpec: (projectId: string) => void;
+  onOpenRun: (runId: string, projectId: string | undefined, goal: string, mode: RunMode) => void;
   onOpenOrphaned: (runId: string, firstMessage: string | null) => void;
   onSwitchToParallel: () => void;
   selectedModel: string;
@@ -710,6 +943,7 @@ function TimelineView({
   const queryClient = useQueryClient();
   const [newGoal, setNewGoal] = useState('');
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [selectedMode, setSelectedMode] = useState<RunMode>('implementation');
   const [showProjectDropdown, setShowProjectDropdown] = useState(false);
   const [showModelDropdown, setShowModelDropdown] = useState(false);
   const [showExecutorDropdown, setShowExecutorDropdown] = useState(false);
@@ -731,11 +965,6 @@ function TimelineView({
   });
   const runs = runsData?.runs || [];
 
-  // Debug: log runs data when it changes
-  useEffect(() => {
-    console.log('[TimelineView] runs updated:', runs.length, 'items', runs.map(r => r.run_id));
-  }, [runs]);
-
   // Fetch orphaned sessions
   const { data: orphanedData } = useQuery({
     queryKey: ['orphanedSessions'],
@@ -753,9 +982,18 @@ function TimelineView({
   const selectedProject = projects.find(p => p.project_id === selectedProjectId);
 
   const handleSubmit = () => {
-    if (!newGoal.trim() || !selectedProjectId) return;
-    onStartNew(selectedProjectId, newGoal);
-    setNewGoal('');
+    if (!selectedProjectId) return;
+
+    if (selectedMode === 'spec') {
+      // Spec mode: start spec session (goal is optional)
+      onStartSpec(selectedProjectId);
+      setNewGoal('');
+    } else {
+      // Implementation mode: need goal
+      if (!newGoal.trim()) return;
+      onStartNew(selectedProjectId, newGoal);
+      setNewGoal('');
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -807,7 +1045,34 @@ function TimelineView({
       <div className="p-4 bg-white border-b border-slate-200">
         <div className="max-w-2xl mx-auto space-y-3">
           <div className="flex items-center justify-between">
-            <h1 className="text-lg font-semibold text-slate-800">Agents</h1>
+            <div className="flex items-center gap-4">
+              <h1 className="text-lg font-semibold text-slate-800">Agents</h1>
+              {/* Mode Selector */}
+              <div className="flex items-center bg-slate-100 rounded-lg p-0.5">
+                <button
+                  onClick={() => setSelectedMode('spec')}
+                  className={clsx(
+                    'px-3 py-1 text-xs font-medium rounded-md transition-colors',
+                    selectedMode === 'spec'
+                      ? 'bg-purple-500 text-white'
+                      : 'text-slate-600 hover:text-slate-800'
+                  )}
+                >
+                  仕様策定
+                </button>
+                <button
+                  onClick={() => setSelectedMode('implementation')}
+                  className={clsx(
+                    'px-3 py-1 text-xs font-medium rounded-md transition-colors',
+                    selectedMode === 'implementation'
+                      ? 'bg-primary-500 text-white'
+                      : 'text-slate-600 hover:text-slate-800'
+                  )}
+                >
+                  実装
+                </button>
+              </div>
+            </div>
             <button
               onClick={onSwitchToParallel}
               className="flex items-center gap-1 px-2 py-1 text-xs text-slate-500 hover:bg-slate-100 rounded transition-colors"
@@ -885,107 +1150,138 @@ function TimelineView({
 
           {/* Goal Input */}
           <div className="relative">
-            <textarea
-              value={newGoal}
-              onChange={(e) => setNewGoal(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder={selectedProjectId ? "タスクを入力してエージェントを開始..." : "まずプロジェクトを選択してください"}
-              disabled={!selectedProjectId}
-              className="w-full resize-none border border-slate-200 rounded-lg px-4 py-3 pb-12 pr-14 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 min-h-[100px] disabled:bg-slate-50 disabled:text-slate-400"
-              rows={3}
-            />
-            <div className="absolute left-2 right-2 bottom-2 flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                {/* Executor Mode */}
-                <div className="relative">
-                  <button
-                    onClick={() => setShowExecutorDropdown(!showExecutorDropdown)}
-                    className={clsx(
-                      'flex items-center gap-1.5 px-2 py-1 text-xs rounded-md transition-colors',
-                      executorMode === 'codex_only' && 'bg-green-100 text-green-700',
-                      executorMode === 'claude_only' && 'bg-purple-100 text-purple-700',
-                      executorMode === 'agent' && 'bg-slate-100 text-slate-500 hover:bg-slate-200'
-                    )}
-                  >
-                    <span className="w-2 h-2 rounded-full" style={{
-                      backgroundColor: executorMode === 'codex_only' ? '#22c55e' : executorMode === 'claude_only' ? '#a855f7' : '#94a3b8'
-                    }} />
-                    <span>
-                      {executorMode === 'codex_only' ? 'Codex' : executorMode === 'claude_only' ? 'Claude' : 'Agent'}
-                    </span>
-                    <ChevronDown size={12} />
-                  </button>
-                  {showExecutorDropdown && (
-                    <div className="absolute bottom-full left-0 mb-1 bg-white border border-slate-200 rounded-lg shadow-lg py-1 min-w-[140px] z-50">
-                      {([
-                        { value: 'agent', label: 'Agent', color: '#94a3b8' },
-                        { value: 'codex_only', label: 'Codex', color: '#22c55e' },
-                        { value: 'claude_only', label: 'Claude', color: '#a855f7' },
-                      ] as const).map((opt) => (
-                        <button
-                          key={opt.value}
-                          onClick={() => {
-                            onExecutorModeChange(opt.value);
-                            setShowExecutorDropdown(false);
-                          }}
-                          className={clsx(
-                            'w-full text-left px-3 py-1.5 text-xs hover:bg-slate-50 flex items-center gap-2',
-                            opt.value === executorMode && 'bg-primary-50'
-                          )}
-                        >
-                          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: opt.color }} />
-                          {opt.label}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                {/* Token Threshold */}
-                <div className="relative">
-                  <button
-                    onClick={() => setShowTokensDropdown(!showTokensDropdown)}
-                    className="flex items-center gap-1 px-2 py-1 text-xs text-slate-500 bg-slate-100 hover:bg-slate-200 rounded-md transition-colors"
-                  >
-                    <span>{Math.round(maxContextTokens / 1000)}K tokens</span>
-                    <ChevronDown size={12} />
-                  </button>
-                  {showTokensDropdown && (
-                    <div className="absolute bottom-full left-0 mb-1 bg-white border border-slate-200 rounded-lg shadow-lg py-1 min-w-[100px] z-50">
-                      {tokenOptions.map((opt) => (
-                        <button
-                          key={opt.value}
-                          onClick={() => {
-                            onMaxContextTokensChange(opt.value);
-                            setShowTokensDropdown(false);
-                          }}
-                          className={clsx(
-                            'w-full text-left px-3 py-1.5 text-xs hover:bg-slate-50',
-                            opt.value === maxContextTokens && 'bg-primary-50 text-primary-600'
-                          )}
-                        >
-                          {opt.label} tokens
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
+            {selectedMode === 'spec' ? (
+              <div className="border border-purple-200 rounded-lg px-4 py-4 bg-purple-50">
+                <p className="text-sm text-purple-700 mb-2">
+                  仕様策定モードでは、AIとチャットしながら仕様書を作成できます。
+                </p>
+                <p className="text-xs text-purple-600">
+                  プロジェクトを選択して開始ボタンをクリックしてください。
+                </p>
               </div>
+            ) : (
+              <textarea
+                value={newGoal}
+                onChange={(e) => setNewGoal(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder={selectedProjectId ? "タスクを入力してエージェントを開始..." : "まずプロジェクトを選択してください"}
+                disabled={!selectedProjectId}
+                className="w-full resize-none border border-slate-200 rounded-lg px-4 py-3 pb-12 pr-14 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 min-h-[100px] disabled:bg-slate-50 disabled:text-slate-400"
+                rows={3}
+              />
+            )}
+            {selectedMode === 'implementation' && (
+              <div className="absolute left-2 right-2 bottom-2 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  {/* Executor Mode */}
+                  <div className="relative">
+                    <button
+                      onClick={() => setShowExecutorDropdown(!showExecutorDropdown)}
+                      className={clsx(
+                        'flex items-center gap-1.5 px-2 py-1 text-xs rounded-md transition-colors',
+                        executorMode === 'codex_only' && 'bg-green-100 text-green-700',
+                        executorMode === 'claude_only' && 'bg-purple-100 text-purple-700',
+                        executorMode === 'agent' && 'bg-slate-100 text-slate-500 hover:bg-slate-200'
+                      )}
+                    >
+                      <span className="w-2 h-2 rounded-full" style={{
+                        backgroundColor: executorMode === 'codex_only' ? '#22c55e' : executorMode === 'claude_only' ? '#a855f7' : '#94a3b8'
+                      }} />
+                      <span>
+                        {executorMode === 'codex_only' ? 'Codex' : executorMode === 'claude_only' ? 'Claude' : 'Agent'}
+                      </span>
+                      <ChevronDown size={12} />
+                    </button>
+                    {showExecutorDropdown && (
+                      <div className="absolute bottom-full left-0 mb-1 bg-white border border-slate-200 rounded-lg shadow-lg py-1 min-w-[140px] z-50">
+                        {([
+                          { value: 'agent', label: 'Agent', color: '#94a3b8' },
+                          { value: 'codex_only', label: 'Codex', color: '#22c55e' },
+                          { value: 'claude_only', label: 'Claude', color: '#a855f7' },
+                        ] as const).map((opt) => (
+                          <button
+                            key={opt.value}
+                            onClick={() => {
+                              onExecutorModeChange(opt.value);
+                              setShowExecutorDropdown(false);
+                            }}
+                            className={clsx(
+                              'w-full text-left px-3 py-1.5 text-xs hover:bg-slate-50 flex items-center gap-2',
+                              opt.value === executorMode && 'bg-primary-50'
+                            )}
+                          >
+                            <span className="w-2 h-2 rounded-full" style={{ backgroundColor: opt.color }} />
+                            {opt.label}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
 
-              {/* Send Button */}
-              <button
-                onClick={handleSubmit}
-                disabled={!newGoal.trim() || !selectedProjectId}
-                className={clsx(
-                  'p-2 rounded-lg transition-colors',
-                  newGoal.trim() && selectedProjectId
-                    ? 'bg-primary-500 text-white hover:bg-primary-600'
-                    : 'bg-slate-100 text-slate-400'
-                )}
-              >
-                <Send size={18} />
-              </button>
-            </div>
+                  {/* Token Threshold */}
+                  <div className="relative">
+                    <button
+                      onClick={() => setShowTokensDropdown(!showTokensDropdown)}
+                      className="flex items-center gap-1 px-2 py-1 text-xs text-slate-500 bg-slate-100 hover:bg-slate-200 rounded-md transition-colors"
+                    >
+                      <span>{Math.round(maxContextTokens / 1000)}K tokens</span>
+                      <ChevronDown size={12} />
+                    </button>
+                    {showTokensDropdown && (
+                      <div className="absolute bottom-full left-0 mb-1 bg-white border border-slate-200 rounded-lg shadow-lg py-1 min-w-[100px] z-50">
+                        {tokenOptions.map((opt) => (
+                          <button
+                            key={opt.value}
+                            onClick={() => {
+                              onMaxContextTokensChange(opt.value);
+                              setShowTokensDropdown(false);
+                            }}
+                            className={clsx(
+                              'w-full text-left px-3 py-1.5 text-xs hover:bg-slate-50',
+                              opt.value === maxContextTokens && 'bg-primary-50 text-primary-600'
+                            )}
+                          >
+                            {opt.label} tokens
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Send Button */}
+                <button
+                  onClick={handleSubmit}
+                  disabled={!newGoal.trim() || !selectedProjectId}
+                  className={clsx(
+                    'p-2 rounded-lg transition-colors',
+                    newGoal.trim() && selectedProjectId
+                      ? 'bg-primary-500 text-white hover:bg-primary-600'
+                      : 'bg-slate-100 text-slate-400'
+                  )}
+                >
+                  <Send size={18} />
+                </button>
+              </div>
+            )}
+
+            {selectedMode === 'spec' && (
+              <div className="mt-3 flex justify-end">
+                <button
+                  onClick={handleSubmit}
+                  disabled={!selectedProjectId}
+                  className={clsx(
+                    'px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-2',
+                    selectedProjectId
+                      ? 'bg-purple-500 text-white hover:bg-purple-600'
+                      : 'bg-slate-100 text-slate-400'
+                  )}
+                >
+                  <MessageSquare size={16} />
+                  仕様策定を開始
+                </button>
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -1048,12 +1344,15 @@ function TimelineView({
               </div>
             ) : (
               <div className="bg-white rounded-lg border border-slate-200 divide-y divide-slate-100">
-                {runs.map((run) => {
-                  const project = projects.find(p => p.project_id === run.project_id);
+                {(() => {
+                  // Create a Map for O(1) project lookups (avoid N+1 pattern)
+                  const projectMap = new Map(projects.map(p => [p.project_id, p]));
+                  return runs.map((run) => {
+                  const project = run.project_id ? projectMap.get(run.project_id) : undefined;
                   return (
                     <div
                       key={run.run_id}
-                      onClick={() => onOpenRun(run.run_id, run.project_id, run.user_goal)}
+                      onClick={() => onOpenRun(run.run_id, run.project_id, run.user_goal, run.mode || 'implementation')}
                       className="px-4 py-3 hover:bg-slate-50 cursor-pointer"
                     >
                       <div className="flex items-start justify-between gap-3">
@@ -1062,10 +1361,15 @@ function TimelineView({
                             <span className="font-medium text-slate-700 truncate">
                               {project?.name || 'Unknown Project'}
                             </span>
+                            {run.mode === 'spec' && (
+                              <span className="px-1.5 py-0.5 text-[10px] font-medium bg-purple-100 text-purple-700 rounded-full">
+                                仕様
+                              </span>
+                            )}
                             {getStatusBadge(run.status)}
                           </div>
                           <p className="text-sm text-slate-600 line-clamp-2">
-                            {run.user_goal || '(no goal)'}
+                            {run.user_goal || (run.mode === 'spec' ? '(仕様策定セッション)' : '(no goal)')}
                           </p>
                           <p className="text-xs text-slate-400 mt-1">
                             {new Date(run.created_at).toLocaleString()}
@@ -1074,7 +1378,8 @@ function TimelineView({
                       </div>
                     </div>
                   );
-                })}
+                });
+                })()}
               </div>
             )}
           </div>
@@ -1147,6 +1452,7 @@ export default function AgentsPage() {
         id: s.id,
         projectId: s.projectId,
         runId: s.runId,
+        mode: 'implementation' as RunMode, // Default to implementation mode for saved sessions
         status: s.status,
         input: s.input,
         messages: [],
@@ -1234,10 +1540,10 @@ export default function AgentsPage() {
 
   const queryClient = useQueryClient();
   const createRunMutation = useMutation({
-    mutationFn: (options: { goal: string; repoPath: string; projectId?: string }) => createRun(options),
+    mutationFn: (options: { goal: string; repoPath: string; projectId?: string; mode?: RunMode }) => createRun(options),
   });
 
-  // Start new agent from timeline
+  // Start new agent from timeline (implementation mode)
   const startNewFromTimeline = (projectId: string, goal: string) => {
     const project = projects.find(p => p.project_id === projectId);
     if (!project) return;
@@ -1246,6 +1552,7 @@ export default function AgentsPage() {
       id: `session-${Date.now()}`,
       projectId,
       runId: null,
+      mode: 'implementation',
       status: 'idle',
       input: '',
       messages: [],
@@ -1253,7 +1560,7 @@ export default function AgentsPage() {
     };
 
     createRunMutation.mutate(
-      { goal, repoPath: project.repo_path, projectId },
+      { goal, repoPath: project.repo_path, projectId, mode: 'implementation' },
       {
         onSuccess: (data) => {
           setActiveSession({
@@ -1274,10 +1581,43 @@ export default function AgentsPage() {
     );
   };
 
+  // Start spec mode session from timeline
+  const startSpecFromTimeline = (projectId: string) => {
+    const project = projects.find(p => p.project_id === projectId);
+    if (!project) return;
+
+    const newSession: AgentSession = {
+      id: `session-${Date.now()}`,
+      projectId,
+      runId: null,
+      mode: 'spec',
+      status: 'idle',
+      input: '',
+      messages: [],
+      logs: [],
+    };
+
+    createRunMutation.mutate(
+      { goal: '仕様策定', repoPath: project.repo_path, projectId, mode: 'spec' },
+      {
+        onSuccess: (data) => {
+          setActiveSession({
+            ...newSession,
+            runId: data.run_id,
+            status: 'running',
+          });
+          setViewMode('single');
+          queryClient.invalidateQueries({ queryKey: ['runs'] });
+        },
+      }
+    );
+  };
+
   // Open existing run
-  const openRunFromTimeline = async (runId: string, projectId: string | undefined, goal: string) => {
+  const openRunFromTimeline = async (runId: string, projectId: string | undefined, goal: string, mode: RunMode = 'implementation') => {
     try {
       const run = await fetchRun(runId);
+      const runMode = run.mode || mode;
       const status: AgentStatus = run.status === 'running' || run.status === 'pending'
         ? 'running'
         : run.status === 'completed'
@@ -1288,38 +1628,63 @@ export default function AgentsPage() {
         ? 'interrupted'
         : 'idle';
 
-      const { logs } = await fetchLogs(runId);
+      if (runMode === 'spec') {
+        // Spec mode: load conversation
+        const conversation = await fetchConversation(runId);
+        const messages: ChatMessageData[] = conversation?.messages.map(m => ({
+          id: `${m.timestamp}-${Math.random()}`,
+          type: m.role === 'user' ? 'user' : 'agent',
+          content: m.content,
+          timestamp: m.timestamp,
+          status: 'success',
+        })) || [];
 
-      const messages: ChatMessageData[] = [
-        {
-          id: `user-${Date.now()}`,
-          type: 'user',
-          content: goal,
-          timestamp: run.created_at,
-        },
-        ...logs
-          .filter(l => l.level === 'info' || l.level === 'warn' || l.level === 'error')
-          .map(l => ({
-            id: `${l.timestamp}-${Math.random()}`,
-            type: 'agent' as const,
-            content: l.message,
-            timestamp: l.timestamp,
-            status: l.level === 'error' ? 'error' as const : 'success' as const,
-            executor: (l.source === 'claude' || l.source === 'codex')
-              ? l.source as 'claude' | 'codex'
-              : undefined,
-          })),
-      ];
+        setActiveSession({
+          id: `session-${Date.now()}`,
+          projectId: projectId || null,
+          runId,
+          mode: 'spec',
+          status,
+          input: '',
+          messages,
+          logs: [],
+        });
+      } else {
+        // Implementation mode: load logs
+        const { logs } = await fetchLogs(runId);
 
-      setActiveSession({
-        id: `session-${Date.now()}`,
-        projectId: projectId || null,
-        runId,
-        status,
-        input: '',
-        messages,
-        logs,
-      });
+        const messages: ChatMessageData[] = [
+          {
+            id: `user-${Date.now()}`,
+            type: 'user',
+            content: goal,
+            timestamp: run.created_at,
+          },
+          ...logs
+            .filter(l => l.level === 'info' || l.level === 'warn' || l.level === 'error')
+            .map(l => ({
+              id: `${l.timestamp}-${Math.random()}`,
+              type: 'agent' as const,
+              content: l.message,
+              timestamp: l.timestamp,
+              status: l.level === 'error' ? 'error' as const : 'success' as const,
+              executor: (l.source === 'claude' || l.source === 'codex')
+                ? l.source as 'claude' | 'codex'
+                : undefined,
+            })),
+        ];
+
+        setActiveSession({
+          id: `session-${Date.now()}`,
+          projectId: projectId || null,
+          runId,
+          mode: 'implementation',
+          status,
+          input: '',
+          messages,
+          logs,
+        });
+      }
       setViewMode('single');
     } catch (error) {
       console.error('Failed to open run:', error);
@@ -1348,6 +1713,7 @@ export default function AgentsPage() {
         id: `session-${Date.now()}`,
         projectId: null,
         runId: null,
+        mode: 'implementation',
         status: 'interrupted',
         input: '',
         messages,
@@ -1371,6 +1737,7 @@ export default function AgentsPage() {
       id: `session-${Date.now()}`,
       projectId: null,
       runId: null,
+      mode: 'implementation',
       status: 'idle',
       input: '',
       messages: [],
@@ -1430,6 +1797,7 @@ export default function AgentsPage() {
         id: `session-${Date.now()}`,
         projectId: projectId || null,
         runId,
+        mode: run.mode || 'implementation',
         status,
         input: '',
         messages,
@@ -1457,20 +1825,32 @@ export default function AgentsPage() {
   return (
     <div className="h-[calc(100vh-64px)] lg:h-screen flex flex-col">
       {viewMode === 'single' && activeSession ? (
-        <AgentPanel
-          session={activeSession}
-          projects={projects}
-          onUpdate={updateActiveSession}
-          onBack={() => {
-            setActiveSession(null);
-            setViewMode('timeline');
-          }}
-          availableModels={availableModels}
-          selectedModel={selectedModel}
-          onModelChange={handleModelChange}
-          executorMode={executorMode}
-          onExecutorModeChange={handleExecutorModeChange}
-        />
+        activeSession.mode === 'spec' ? (
+          <SpecAgentPanel
+            session={activeSession}
+            projects={projects}
+            onUpdate={updateActiveSession}
+            onBack={() => {
+              setActiveSession(null);
+              setViewMode('timeline');
+            }}
+          />
+        ) : (
+          <AgentPanel
+            session={activeSession}
+            projects={projects}
+            onUpdate={updateActiveSession}
+            onBack={() => {
+              setActiveSession(null);
+              setViewMode('timeline');
+            }}
+            availableModels={availableModels}
+            selectedModel={selectedModel}
+            onModelChange={handleModelChange}
+            executorMode={executorMode}
+            onExecutorModeChange={handleExecutorModeChange}
+          />
+        )
       ) : viewMode === 'columns' ? (
         <ColumnsView
           sessions={parallelSessions}
@@ -1488,6 +1868,7 @@ export default function AgentsPage() {
         <TimelineView
           projects={projects}
           onStartNew={startNewFromTimeline}
+          onStartSpec={startSpecFromTimeline}
           onOpenRun={openRunFromTimeline}
           onOpenOrphaned={openOrphanedFromTimeline}
           onSwitchToParallel={switchToParallel}

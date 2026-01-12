@@ -16,6 +16,8 @@ import { createCodexAdapter, type CodexAdapter, type CodexExecutionOptions, type
 import { createClaudeAdapter, type ClaudeAdapter, type ClaudeExecutionOptions, type ClaudeAgentMessage } from '@supervisor/executor-claude';
 import { log as eventLog } from '../services/event-bus.js';
 import { logger } from '../services/logger.js';
+import { getErrorMessage } from '../services/errors.js';
+import { getClaudeModel, getCodexModel } from '../services/settings-store.js';
 
 /** Unified execution options for both adapters */
 type ExecutionOptions = ClaudeExecutionOptions | CodexExecutionOptions;
@@ -60,11 +62,15 @@ export class WorkerInstance {
       failed_tasks: 0,
     };
 
-    // Create appropriate adapter
+    // Create appropriate adapter with model from settings
     if (config.executorType === 'codex') {
-      this.adapter = createCodexAdapter({ sandbox: true });
+      this.adapter = createCodexAdapter({
+        model: getCodexModel(),
+        sandbox: true,
+      });
     } else {
       this.adapter = createClaudeAdapter({
+        model: getClaudeModel(),
         maxTurns: 50,
         permissionMode: 'acceptEdits',
       });
@@ -142,15 +148,18 @@ export class WorkerInstance {
       }
 
       this.worker.current_task_id = undefined;
-      // Calculate proper rolling average
-      const totalTasks = this.worker.completed_tasks + this.worker.failed_tasks;
-      if (this.worker.avg_task_duration_ms === undefined) {
-        this.worker.avg_task_duration_ms = durationMs;
-      } else {
-        // Rolling average: (old_avg * (n-1) + new_value) / n
-        this.worker.avg_task_duration_ms = Math.round(
-          (this.worker.avg_task_duration_ms * (totalTasks - 1) + durationMs) / totalTasks
-        );
+      // Calculate proper rolling average for successful tasks only
+      // Failed tasks should not count towards performance metrics
+      if (report.status === 'done') {
+        const completedCount = this.worker.completed_tasks;
+        if (this.worker.avg_task_duration_ms === undefined || completedCount === 1) {
+          this.worker.avg_task_duration_ms = durationMs;
+        } else {
+          // Rolling average: (old_avg * (n-1) + new_value) / n
+          this.worker.avg_task_duration_ms = Math.round(
+            (this.worker.avg_task_duration_ms * (completedCount - 1) + durationMs) / completedCount
+          );
+        }
       }
 
       return {
@@ -163,7 +172,7 @@ export class WorkerInstance {
       };
     } catch (error) {
       const durationMs = Date.now() - startTime;
-      const errorMsg = error instanceof Error ? error.message : String(error);
+      const errorMsg = getErrorMessage(error);
 
       this.worker.status = 'idle';
       this.worker.failed_tasks++;
@@ -196,9 +205,15 @@ export class WorkerInstance {
     }
 
     if (context?.repoContext) {
-      const limitedContext = context.repoContext.length > CONTEXT_TRUNCATION_LIMIT
-        ? context.repoContext.slice(0, CONTEXT_TRUNCATION_LIMIT) + '\n\n... (truncated)'
-        : context.repoContext;
+      let limitedContext = context.repoContext;
+      if (limitedContext.length > CONTEXT_TRUNCATION_LIMIT) {
+        // Find the last complete line within the limit
+        const truncatedRaw = limitedContext.slice(0, CONTEXT_TRUNCATION_LIMIT);
+        const lastNewline = truncatedRaw.lastIndexOf('\n');
+        limitedContext = lastNewline > 0
+          ? truncatedRaw.slice(0, lastNewline) + '\n\n... (truncated)'
+          : truncatedRaw + '\n\n... (truncated)';
+      }
       objectiveParts.push(`## Repository Context\n${limitedContext}`);
     }
 
@@ -299,6 +314,19 @@ export class WorkerInstance {
    */
   dispose(): void {
     this.worker.status = 'completed';
+
+    // Dispose the adapter if it has a dispose method
+    if ('dispose' in this.adapter && typeof this.adapter.dispose === 'function') {
+      try {
+        this.adapter.dispose();
+      } catch (error) {
+        logger.error('Failed to dispose adapter', {
+          workerId: this.worker.worker_id,
+          error: getErrorMessage(error),
+        });
+      }
+    }
+
     logger.debug('Worker disposed', {
       workerId: this.worker.worker_id,
       completedTasks: this.worker.completed_tasks,
@@ -307,51 +335,75 @@ export class WorkerInstance {
   }
 
   /**
+   * Type guard for system messages
+   */
+  private isSystemMessage(message: ClaudeAgentMessage): message is ClaudeAgentMessage & { type: 'system'; message?: string; subtype?: string } {
+    return message.type === 'system';
+  }
+
+  /**
+   * Type guard for assistant messages
+   */
+  private isAssistantMessage(message: ClaudeAgentMessage): message is ClaudeAgentMessage & { type: 'assistant'; content?: string } {
+    return message.type === 'assistant';
+  }
+
+  /**
+   * Type guard for result messages
+   */
+  private isResultMessage(message: ClaudeAgentMessage): message is ClaudeAgentMessage & { type: 'result'; result?: string } {
+    return message.type === 'result';
+  }
+
+  /**
    * Forward agent messages to event bus
    */
   private forwardAgentMessage(message: ClaudeAgentMessage, taskId: string): void {
     const source = this.config.executorType === 'claude' ? 'claude' : 'codex';
 
-    // Type-safe message handling based on discriminated union
-    if (message.type === 'system') {
-      const content = 'message' in message ? message.message : undefined;
-      const subtype = 'subtype' in message ? message.subtype : undefined;
-      if (content) {
-        eventLog(this.config.runId, 'info', source, `[${subtype ?? 'system'}] ${content}`, {
-          task_id: taskId,
-          worker_id: this.worker.worker_id,
-        });
+    try {
+      // Type-safe message handling using type guards
+      if (this.isSystemMessage(message)) {
+        const content = message.message;
+        const subtype = message.subtype;
+        if (content) {
+          eventLog(this.config.runId, 'info', source, `[${subtype ?? 'system'}] ${content}`, {
+            task_id: taskId,
+            worker_id: this.worker.worker_id,
+          });
+        }
+      } else if (this.isAssistantMessage(message)) {
+        const content = message.content;
+        if (content) {
+          // Show first 200 chars of assistant response
+          const preview = content.length > LOG_PREVIEW_LENGTH
+            ? content.slice(0, LOG_PREVIEW_LENGTH) + '...'
+            : content;
+          eventLog(this.config.runId, 'info', source, preview, {
+            task_id: taskId,
+            worker_id: this.worker.worker_id,
+            full_content: content,
+          });
+        }
+      } else if (this.isResultMessage(message)) {
+        const result = message.result;
+        if (result) {
+          const preview = result.length > LOG_PREVIEW_LENGTH
+            ? result.slice(0, LOG_PREVIEW_LENGTH) + '...'
+            : result;
+          eventLog(this.config.runId, 'info', source, `Result: ${preview}`, {
+            task_id: taskId,
+            worker_id: this.worker.worker_id,
+          });
+        }
       }
-    }
-
-    // Log assistant text messages
-    if (message.type === 'assistant') {
-      const content = 'content' in message ? message.content : undefined;
-      if (content) {
-        // Show first 200 chars of assistant response
-        const preview = content.length > LOG_PREVIEW_LENGTH
-          ? content.slice(0, LOG_PREVIEW_LENGTH) + '...'
-          : content;
-        eventLog(this.config.runId, 'info', source, preview, {
-          task_id: taskId,
-          worker_id: this.worker.worker_id,
-          full_content: content,
-        });
-      }
-    }
-
-    // Log result messages
-    if (message.type === 'result') {
-      const result = 'result' in message ? message.result : undefined;
-      if (result) {
-        const preview = result.length > LOG_PREVIEW_LENGTH
-          ? result.slice(0, LOG_PREVIEW_LENGTH) + '...'
-          : result;
-        eventLog(this.config.runId, 'info', source, `Result: ${preview}`, {
-          task_id: taskId,
-          worker_id: this.worker.worker_id,
-        });
-      }
+    } catch (error) {
+      // Don't let message forwarding errors crash the worker
+      logger.error('Failed to forward agent message', {
+        taskId,
+        workerId: this.worker.worker_id,
+        error: getErrorMessage(error),
+      });
     }
   }
 }

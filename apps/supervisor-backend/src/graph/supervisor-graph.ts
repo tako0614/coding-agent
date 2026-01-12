@@ -23,6 +23,7 @@ import { WorkerPool, createWorkerPool } from '../workers/index.js';
 import { log as eventLog } from '../services/event-bus.js';
 import { logger } from '../services/logger.js';
 import { getExecutorMode } from '../services/settings-store.js';
+import { getErrorMessage } from '../services/errors.js';
 
 // =============================================================================
 // State Definition
@@ -82,107 +83,137 @@ async function supervisorNode(
   logger.info('Running Supervisor Agent', { runId: state.run_id });
   eventLog(state.run_id, 'info', 'supervisor', '🧠 Starting Supervisor Agent');
 
-  // Create worker executor function that uses the worker pool
+  const executorMode = getExecutorMode();
+
+  // Create a single worker pool for the entire run (reused across all task batches)
+  const pool = createWorkerPool(
+    state.repo_path,
+    state.run_id,
+    {
+      userGoal: state.user_goal,
+      executorMode,
+    }
+  );
+
+  // Initialize pool once
+  await pool.initialize();
+
+  // Create worker executor function that uses the shared worker pool
   const workerExecutor = async (tasks: WorkerTask[], signal?: AbortSignal): Promise<WorkerTaskResult[]> => {
-    const results: WorkerTaskResult[] = [];
-    const executorMode = getExecutorMode();
-
-    // Create worker pool
-    const pool = createWorkerPool(
-      state.repo_path,
-      state.run_id,
-      {
-        userGoal: state.user_goal,
-        executorMode,
-      }
-    );
-
-    try {
-      await pool.initialize();
-
-      // Execute each task
-      for (const task of tasks) {
-        // Check for abort signal
-        if (signal?.aborted) {
-          logger.info('Worker execution aborted by signal', { taskId: task.task_id });
-          results.push({
-            task_id: task.task_id,
-            instruction: task.instruction,
-            executor: task.executor,
-            success: false,
-            error: 'Aborted',
-            duration_ms: 0,
-            completed_at: new Date().toISOString(),
-          });
-          continue;
-        }
-
-        const startTime = Date.now();
-        eventLog(state.run_id, 'info', 'codex', `▶ Starting: ${task.instruction.slice(0, 50)}...`);
-
-        try {
-          // Convert to DAGNode format expected by worker pool
-          const dagNode: DAGNode = {
-            task_id: task.task_id,
-            name: task.instruction.slice(0, 50),
-            description: task.instruction,
-            executor_preference: task.executor as WorkerExecutorType,
-            dependencies: [],
-            priority: task.priority ?? 5,
-            estimated_duration_ms: 300_000, // 5 minutes
-            status: 'pending',
-          };
-
-          const report = await pool.executeTask(dagNode);
-
-          const duration = Date.now() - startTime;
-          if (report) {
-            results.push({
-              task_id: task.task_id,
-              instruction: task.instruction,
-              executor: task.executor,
-              success: report.status === 'done',
-              summary: report.summary,
-              report,
-              duration_ms: duration,
-              completed_at: new Date().toISOString(),
-            });
-            eventLog(state.run_id, 'info', 'codex',
-              `✓ Completed: ${task.instruction.slice(0, 50)}... (${Math.round(duration / 1000)}s)`);
-          } else {
-            results.push({
-              task_id: task.task_id,
-              instruction: task.instruction,
-              executor: task.executor,
-              success: false,
-              error: 'No worker available',
-              duration_ms: duration,
-              completed_at: new Date().toISOString(),
-            });
-            eventLog(state.run_id, 'error', 'codex',
-              `✗ Failed: ${task.instruction.slice(0, 50)}... - No worker available`);
-          }
-        } catch (error) {
-          const duration = Date.now() - startTime;
-          const errorMsg = error instanceof Error ? error.message : String(error);
-          results.push({
-            task_id: task.task_id,
-            instruction: task.instruction,
-            executor: task.executor,
-            success: false,
-            error: errorMsg,
-            duration_ms: duration,
-            completed_at: new Date().toISOString(),
-          });
-          eventLog(state.run_id, 'error', 'codex',
-            `✗ Failed: ${task.instruction.slice(0, 50)}... - ${errorMsg}`);
-        }
-      }
-    } finally {
-      await pool.shutdown();
+    // Connect external abort signal to pool
+    if (signal) {
+      signal.addEventListener('abort', () => {
+        pool.cancel();
+      }, { once: true });
     }
 
-    return results;
+    // Execute a single task and return result
+    const executeTask = async (task: WorkerTask): Promise<WorkerTaskResult> => {
+      // Check for abort signal or pool cancellation
+      if (signal?.aborted || pool.isCancelled()) {
+        logger.info('Worker execution aborted by signal', { taskId: task.task_id });
+        return {
+          task_id: task.task_id,
+          instruction: task.instruction,
+          executor: task.executor,
+          success: false,
+          error: 'Aborted',
+          duration_ms: 0,
+          completed_at: new Date().toISOString(),
+        };
+      }
+
+      const startTime = Date.now();
+      const startMsg = `▶ Starting: ${task.instruction.slice(0, 50)}...`;
+      eventLog(state.run_id, 'info', 'codex', startMsg);
+      task.onOutput?.(startMsg);
+
+      try {
+        // Convert to DAGNode format expected by worker pool
+        const dagNode: DAGNode = {
+          task_id: task.task_id,
+          name: task.instruction.slice(0, 50),
+          description: task.instruction,
+          executor_preference: task.executor as WorkerExecutorType,
+          dependencies: [],
+          priority: task.priority ?? 5,
+          estimated_duration_ms: 300_000, // 5 minutes
+          status: 'pending',
+        };
+
+        const report = await pool.executeTask(dagNode);
+
+        const duration = Date.now() - startTime;
+        if (report) {
+          const completeMsg = `✓ Completed: ${task.instruction.slice(0, 50)}... (${Math.round(duration / 1000)}s)`;
+          eventLog(state.run_id, 'info', 'codex', completeMsg);
+          task.onOutput?.(completeMsg);
+          if (report.summary) {
+            task.onOutput?.(`Summary: ${report.summary}`);
+          }
+          return {
+            task_id: task.task_id,
+            instruction: task.instruction,
+            executor: task.executor,
+            success: report.status === 'done',
+            summary: report.summary,
+            report,
+            duration_ms: duration,
+            completed_at: new Date().toISOString(),
+          };
+        } else {
+          const failMsg = `✗ Failed: ${task.instruction.slice(0, 50)}... - No worker available`;
+          eventLog(state.run_id, 'error', 'codex', failMsg);
+          task.onOutput?.(failMsg);
+          return {
+            task_id: task.task_id,
+            instruction: task.instruction,
+            executor: task.executor,
+            success: false,
+            error: 'No worker available',
+            duration_ms: duration,
+            completed_at: new Date().toISOString(),
+          };
+        }
+      } catch (error) {
+        const duration = Date.now() - startTime;
+        const errorMsg = getErrorMessage(error);
+        const failMsg = `✗ Failed: ${task.instruction.slice(0, 50)}... - ${errorMsg}`;
+        eventLog(state.run_id, 'error', 'codex', failMsg);
+        task.onOutput?.(failMsg);
+        return {
+          task_id: task.task_id,
+          instruction: task.instruction,
+          executor: task.executor,
+          success: false,
+          error: errorMsg,
+          duration_ms: duration,
+          completed_at: new Date().toISOString(),
+        };
+      }
+    };
+
+    // Execute all tasks in parallel using Promise.allSettled
+    const settledResults = await Promise.allSettled(tasks.map(executeTask));
+
+    // Convert settled results to WorkerTaskResult array
+    return settledResults.map((settled, index) => {
+      if (settled.status === 'fulfilled') {
+        return settled.value;
+      } else {
+        // Promise was rejected (shouldn't happen with our try/catch, but handle it)
+        const task = tasks[index]!;
+        return {
+          task_id: task.task_id,
+          instruction: task.instruction,
+          executor: task.executor,
+          success: false,
+          error: settled.reason instanceof Error ? settled.reason.message : String(settled.reason),
+          duration_ms: 0,
+          completed_at: new Date().toISOString(),
+        };
+      }
+    });
   };
 
   // Create and run Supervisor Agent
@@ -208,29 +239,34 @@ async function supervisorNode(
   // Store agent instance for potential restart
   agentStore.set(state.run_id, agent);
 
-  const finalState = await agent.run();
+  try {
+    const finalState = await agent.run();
 
-  // Collect reports from completed tasks
-  const reports: WorkReport[] = finalState.completed_tasks
-    .filter((t) => t.report)
-    .map((t) => t.report!);
+    // Collect reports from completed tasks
+    const reports: WorkReport[] = finalState.completed_tasks
+      .filter((t) => t.report)
+      .map((t) => t.report!);
 
-  if (finalState.phase === 'completed') {
-    eventLog(state.run_id, 'info', 'supervisor', `✅ Completed: ${finalState.final_summary?.slice(0, 100)}...`);
-    return {
-      status: 'completed',
-      reports,
-      final_summary: finalState.final_summary,
-      updated_at: new Date().toISOString(),
-    };
-  } else {
-    eventLog(state.run_id, 'error', 'supervisor', `❌ Failed: ${finalState.error}`);
-    return {
-      status: 'failed',
-      reports,
-      error: finalState.error,
-      updated_at: new Date().toISOString(),
-    };
+    if (finalState.phase === 'completed') {
+      eventLog(state.run_id, 'info', 'supervisor', `✅ Completed: ${finalState.final_summary?.slice(0, 100)}...`);
+      return {
+        status: 'completed',
+        reports,
+        final_summary: finalState.final_summary,
+        updated_at: new Date().toISOString(),
+      };
+    } else {
+      eventLog(state.run_id, 'error', 'supervisor', `❌ Failed: ${finalState.error}`);
+      return {
+        status: 'failed',
+        reports,
+        error: finalState.error,
+        updated_at: new Date().toISOString(),
+      };
+    }
+  } finally {
+    // Always shutdown the worker pool when supervisor completes
+    await pool.shutdown();
   }
 }
 

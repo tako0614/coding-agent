@@ -8,8 +8,44 @@ import { z } from 'zod';
 import { createFilesystemTool, loadPolicyFromConfig } from '@supervisor/tool-runtime';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { validateRepoPath, PathSecurityError } from '../../services/path-sandbox.js';
+import { logger } from '../../services/logger.js';
 
 const files = new Hono();
+
+/** Maximum base64 content size (50MB decoded) */
+const MAX_BASE64_DECODED_SIZE = 50 * 1024 * 1024;
+
+/** Regex to validate base64 format */
+const BASE64_REGEX = /^[A-Za-z0-9+/]*={0,2}$/;
+
+/**
+ * Validate and decode base64 content
+ * @returns Decoded buffer or error object
+ */
+function validateAndDecodeBase64(content: string): { valid: true; data: Buffer } | { valid: false; error: string } {
+  // Check format (basic validation)
+  if (!BASE64_REGEX.test(content)) {
+    return { valid: false, error: 'Invalid base64 format' };
+  }
+
+  // Estimate decoded size (base64 is ~4/3 of original size)
+  const estimatedSize = Math.ceil(content.length * 3 / 4);
+  if (estimatedSize > MAX_BASE64_DECODED_SIZE) {
+    return { valid: false, error: `Base64 content too large. Maximum decoded size is ${MAX_BASE64_DECODED_SIZE / 1024 / 1024}MB` };
+  }
+
+  try {
+    const buffer = Buffer.from(content, 'base64');
+    // Verify actual size
+    if (buffer.length > MAX_BASE64_DECODED_SIZE) {
+      return { valid: false, error: `Decoded content too large. Maximum size is ${MAX_BASE64_DECODED_SIZE / 1024 / 1024}MB` };
+    }
+    return { valid: true, data: buffer };
+  } catch (err) {
+    return { valid: false, error: 'Failed to decode base64 content' };
+  }
+}
 
 // Load policy from config
 async function loadPolicy() {
@@ -83,6 +119,25 @@ const StatSchema = z.object({
 });
 
 /**
+ * Validate and get the working directory
+ * If cwd is provided, validates it. Otherwise uses process.cwd()
+ */
+function getValidatedWorkingDir(cwd: string | undefined): { valid: true; dir: string } | { valid: false; error: string } {
+  if (!cwd) {
+    return { valid: true, dir: process.cwd() };
+  }
+  try {
+    const validated = validateRepoPath(cwd);
+    return { valid: true, dir: validated };
+  } catch (err) {
+    if (err instanceof PathSecurityError) {
+      return { valid: false, error: err.message };
+    }
+    return { valid: false, error: 'Invalid working directory' };
+  }
+}
+
+/**
  * POST /api/files/read
  * Read a file
  */
@@ -96,7 +151,11 @@ files.post('/read', async (c) => {
     }
 
     const { path: filePath, cwd, encoding } = parsed.data;
-    const workingDir = cwd || process.cwd();
+    const cwdResult = getValidatedWorkingDir(cwd);
+    if (!cwdResult.valid) {
+      return c.json({ error: { message: cwdResult.error, code: 'INVALID_CWD' } }, 400);
+    }
+    const workingDir = cwdResult.dir;
     const policy = await loadPolicy();
     const fsTool = createFilesystemTool(workingDir, policy.filesystem);
 
@@ -119,8 +178,10 @@ files.post('/read', async (c) => {
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to read file';
-    const code = message.includes('ENOENT') ? 'NOT_FOUND' : 'READ_ERROR';
-    return c.json({ error: { message, code } }, code === 'NOT_FOUND' ? 404 : 500);
+    // Use error.code for reliable error detection instead of string matching
+    const isNotFound = (error as NodeJS.ErrnoException)?.code === 'ENOENT';
+    const code = isNotFound ? 'NOT_FOUND' : 'READ_ERROR';
+    return c.json({ error: { message, code } }, isNotFound ? 404 : 500);
   }
 });
 
@@ -138,11 +199,26 @@ files.post('/write', async (c) => {
     }
 
     const { path: filePath, content, cwd, encoding } = parsed.data;
-    const workingDir = cwd || process.cwd();
+    const cwdResult = getValidatedWorkingDir(cwd);
+    if (!cwdResult.valid) {
+      return c.json({ error: { message: cwdResult.error, code: 'INVALID_CWD' } }, 400);
+    }
+    const workingDir = cwdResult.dir;
     const policy = await loadPolicy();
     const fsTool = createFilesystemTool(workingDir, policy.filesystem);
 
-    const data = encoding === 'base64' ? Buffer.from(content, 'base64') : content;
+    // Validate and decode base64 if needed
+    let data: string | Buffer;
+    if (encoding === 'base64') {
+      const base64Result = validateAndDecodeBase64(content);
+      if (!base64Result.valid) {
+        return c.json({ error: { message: base64Result.error, code: 'INVALID_BASE64' } }, 400);
+      }
+      data = base64Result.data;
+    } else {
+      data = content;
+    }
+
     const result = await fsTool.writeFile(filePath, data);
 
     if (!result.allowed) {
@@ -175,7 +251,11 @@ files.post('/list', async (c) => {
     }
 
     const { path: dirPath, cwd, recursive } = parsed.data;
-    const workingDir = cwd || process.cwd();
+    const cwdResult = getValidatedWorkingDir(cwd);
+    if (!cwdResult.valid) {
+      return c.json({ error: { message: cwdResult.error, code: 'INVALID_CWD' } }, 400);
+    }
+    const workingDir = cwdResult.dir;
     const policy = await loadPolicy();
     const fsTool = createFilesystemTool(workingDir, policy.filesystem);
 
@@ -224,7 +304,11 @@ files.post('/glob', async (c) => {
     }
 
     const { pattern, cwd, ignore } = parsed.data;
-    const workingDir = cwd || process.cwd();
+    const cwdResult = getValidatedWorkingDir(cwd);
+    if (!cwdResult.valid) {
+      return c.json({ error: { message: cwdResult.error, code: 'INVALID_CWD' } }, 400);
+    }
+    const workingDir = cwdResult.dir;
     const policy = await loadPolicy();
     const fsTool = createFilesystemTool(workingDir, policy.filesystem);
 
@@ -252,7 +336,11 @@ files.post('/stat', async (c) => {
     }
 
     const { path: targetPath, cwd } = parsed.data;
-    const workingDir = cwd || process.cwd();
+    const cwdResult = getValidatedWorkingDir(cwd);
+    if (!cwdResult.valid) {
+      return c.json({ error: { message: cwdResult.error, code: 'INVALID_CWD' } }, 400);
+    }
+    const workingDir = cwdResult.dir;
     const policy = await loadPolicy();
     const fsTool = createFilesystemTool(workingDir, policy.filesystem);
 
@@ -280,7 +368,11 @@ files.post('/delete', async (c) => {
     }
 
     const { path: filePath, cwd } = parsed.data;
-    const workingDir = cwd || process.cwd();
+    const cwdResult = getValidatedWorkingDir(cwd);
+    if (!cwdResult.valid) {
+      return c.json({ error: { message: cwdResult.error, code: 'INVALID_CWD' } }, 400);
+    }
+    const workingDir = cwdResult.dir;
     const policy = await loadPolicy();
     const fsTool = createFilesystemTool(workingDir, policy.filesystem);
 
@@ -312,7 +404,11 @@ files.post('/mkdir', async (c) => {
     }
 
     const { path: dirPath, cwd } = parsed.data;
-    const workingDir = cwd || process.cwd();
+    const cwdResult = getValidatedWorkingDir(cwd);
+    if (!cwdResult.valid) {
+      return c.json({ error: { message: cwdResult.error, code: 'INVALID_CWD' } }, 400);
+    }
+    const workingDir = cwdResult.dir;
     const policy = await loadPolicy();
     const fsTool = createFilesystemTool(workingDir, policy.filesystem);
 
@@ -344,7 +440,11 @@ files.post('/copy', async (c) => {
     }
 
     const { source, destination, cwd } = parsed.data;
-    const workingDir = cwd || process.cwd();
+    const cwdResult = getValidatedWorkingDir(cwd);
+    if (!cwdResult.valid) {
+      return c.json({ error: { message: cwdResult.error, code: 'INVALID_CWD' } }, 400);
+    }
+    const workingDir = cwdResult.dir;
     const policy = await loadPolicy();
     const fsTool = createFilesystemTool(workingDir, policy.filesystem);
 
@@ -376,7 +476,11 @@ files.post('/move', async (c) => {
     }
 
     const { source, destination, cwd } = parsed.data;
-    const workingDir = cwd || process.cwd();
+    const cwdResult = getValidatedWorkingDir(cwd);
+    if (!cwdResult.valid) {
+      return c.json({ error: { message: cwdResult.error, code: 'INVALID_CWD' } }, 400);
+    }
+    const workingDir = cwdResult.dir;
     const policy = await loadPolicy();
     const fsTool = createFilesystemTool(workingDir, policy.filesystem);
 

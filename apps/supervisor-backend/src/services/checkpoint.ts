@@ -256,3 +256,209 @@ export function withCheckpoint<TState, TResult extends Partial<TState>>(
     return result;
   };
 }
+
+// =============================================================================
+// Interrupted Run Detection
+// =============================================================================
+
+interface InterruptedRunInfo {
+  run_id: string;
+  node_name: string;
+  state_json: string;
+  created_at: string;
+}
+
+/**
+ * Detect interrupted runs on startup
+ * These are runs with checkpoints but no final_report or error in runs table
+ */
+export function detectInterruptedRuns(): string[] {
+  try {
+    // Find checkpoints for runs that haven't completed
+    const rows = db.prepare(`
+      SELECT DISTINCT c.run_id, c.node_name, c.state_json, c.created_at
+      FROM checkpoints c
+      INNER JOIN runs r ON c.run_id = r.run_id
+      WHERE r.final_report IS NULL
+        AND (r.error IS NULL OR r.error = '')
+      ORDER BY c.created_at DESC
+    `).all() as InterruptedRunInfo[];
+
+    const interruptedIds: string[] = [];
+    const now = new Date().toISOString();
+
+    // Group by run_id and get the latest checkpoint
+    const latestByRun = new Map<string, InterruptedRunInfo>();
+    for (const row of rows) {
+      if (!latestByRun.has(row.run_id)) {
+        latestByRun.set(row.run_id, row);
+      }
+    }
+
+    // Mark runs as interrupted
+    const markStmt = db.prepare(`
+      UPDATE runs SET
+        error = ?,
+        updated_at = ?
+      WHERE run_id = ? AND final_report IS NULL AND (error IS NULL OR error = '')
+    `);
+
+    for (const [runId, info] of latestByRun) {
+      try {
+        const errorMsg = `Run interrupted (server restart). Last checkpoint at phase: ${info.node_name}`;
+        markStmt.run(errorMsg, now, runId);
+        interruptedIds.push(runId);
+
+        logger.warn('Detected interrupted run', {
+          runId,
+          lastPhase: info.node_name,
+          lastCheckpoint: info.created_at,
+        });
+      } catch (err) {
+        logger.error('Failed to mark run as interrupted', {
+          runId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    if (interruptedIds.length > 0) {
+      logger.info('Interrupted runs detected on startup', {
+        count: interruptedIds.length,
+        runIds: interruptedIds,
+      });
+    }
+
+    return interruptedIds;
+  } catch (err) {
+    logger.error('Failed to detect interrupted runs', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+}
+
+// =============================================================================
+// Checkpoint Manager (for periodic checkpointing)
+// =============================================================================
+
+/**
+ * Checkpoint manager for automatic periodic checkpointing
+ */
+export class CheckpointManager {
+  private runId: string;
+  private intervalMs: number;
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private currentState: Record<string, unknown> | null = null;
+  private currentPhase: string = 'unknown';
+
+  constructor(runId: string, intervalMs = 30_000) {
+    this.runId = runId;
+    this.intervalMs = intervalMs;
+  }
+
+  /**
+   * Start automatic checkpointing
+   */
+  start(initialState: Record<string, unknown>, phase: string): void {
+    this.currentState = initialState;
+    this.currentPhase = phase;
+
+    // Save initial checkpoint
+    saveCheckpoint(this.runId, phase, initialState);
+
+    // Start periodic saving
+    this.timer = setInterval(() => {
+      if (this.currentState) {
+        saveCheckpoint(this.runId, this.currentPhase, this.currentState);
+        pruneCheckpoints(this.runId, 5); // Keep only last 5 checkpoints
+      }
+    }, this.intervalMs);
+
+    logger.debug('Checkpoint manager started', {
+      runId: this.runId,
+      intervalMs: this.intervalMs,
+    });
+  }
+
+  /**
+   * Update state (will be saved on next interval)
+   */
+  update(state: Record<string, unknown>, phase?: string): void {
+    this.currentState = state;
+    if (phase) {
+      this.currentPhase = phase;
+    }
+  }
+
+  /**
+   * Force immediate checkpoint save
+   */
+  saveNow(): void {
+    if (this.currentState) {
+      saveCheckpoint(this.runId, this.currentPhase, this.currentState);
+    }
+  }
+
+  /**
+   * Stop checkpointing
+   */
+  stop(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+
+    // Save final checkpoint
+    if (this.currentState) {
+      saveCheckpoint(this.runId, this.currentPhase, this.currentState);
+    }
+
+    logger.debug('Checkpoint manager stopped', { runId: this.runId });
+  }
+
+  /**
+   * Clean up all checkpoints (call after successful completion)
+   */
+  cleanup(): void {
+    this.stop();
+    deleteCheckpoints(this.runId);
+  }
+}
+
+// Store of active checkpoint managers
+const checkpointManagers = new Map<string, CheckpointManager>();
+
+/**
+ * Get or create a checkpoint manager for a run
+ */
+export function getCheckpointManager(runId: string, intervalMs = 30_000): CheckpointManager {
+  let manager = checkpointManagers.get(runId);
+  if (!manager) {
+    manager = new CheckpointManager(runId, intervalMs);
+    checkpointManagers.set(runId, manager);
+  }
+  return manager;
+}
+
+/**
+ * Remove checkpoint manager
+ */
+export function removeCheckpointManager(runId: string): void {
+  const manager = checkpointManagers.get(runId);
+  if (manager) {
+    manager.stop();
+    checkpointManagers.delete(runId);
+  }
+}
+
+/**
+ * Stop all checkpoint managers (call on shutdown)
+ */
+export function stopAllCheckpointManagers(): void {
+  for (const manager of checkpointManagers.values()) {
+    manager.stop();
+  }
+  checkpointManagers.clear();
+  logger.info('All checkpoint managers stopped');
+}

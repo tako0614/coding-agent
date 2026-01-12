@@ -23,9 +23,12 @@ export interface Plan {
   updated_at: string;
 }
 
+export type RunMode = 'spec' | 'implementation';
+
 export interface Run {
   run_id: string;
   project_id?: string;
+  mode: RunMode;
   status: string;
   user_goal: string;
   created_at: string;
@@ -101,12 +104,13 @@ export interface CreateRunOptions {
   goal: string;
   repoPath: string;
   projectId?: string;
+  mode?: RunMode;
 }
 
 export async function createRun(
   goalOrOptions: string | CreateRunOptions,
   repoPath?: string
-): Promise<{ run_id: string }> {
+): Promise<{ run_id: string; mode: RunMode }> {
   const options: CreateRunOptions = typeof goalOrOptions === 'string'
     ? { goal: goalOrOptions, repoPath: repoPath! }
     : goalOrOptions;
@@ -118,6 +122,7 @@ export async function createRun(
       goal: options.goal,
       repo_path: options.repoPath,
       project_id: options.projectId,
+      mode: options.mode || 'implementation',
     }),
   });
   if (!res.ok) throw new Error('Failed to create run');
@@ -332,8 +337,10 @@ export function subscribeToLogs(
   if (runId) url.searchParams.set('run_id', runId);
 
   const eventSource = new EventSource(url.toString());
+  let closed = false;
 
   eventSource.onmessage = (event) => {
+    if (closed) return;
     try {
       const data = JSON.parse(event.data);
       if (data.type !== 'connected') {
@@ -346,10 +353,20 @@ export function subscribeToLogs(
 
   eventSource.onerror = (error) => {
     console.error('SSE error:', error);
+    // Close the EventSource on error to prevent resource leak
+    if (!closed) {
+      closed = true;
+      eventSource.close();
+    }
     onError?.(error);
   };
 
-  return () => eventSource.close();
+  return () => {
+    if (!closed) {
+      closed = true;
+      eventSource.close();
+    }
+  };
 }
 
 // Plan API
@@ -404,6 +421,8 @@ export interface AppSettings {
   use_copilot_api?: boolean;
   // DAG building model (for LangGraph)
   dag_model?: string;
+  // Spec agent model (for specification mode)
+  spec_model?: string;
   // Executor mode: auto, codex_only, claude_only
   executor_mode?: ExecutorMode;
   // Max context tokens for agent summarization
@@ -592,5 +611,56 @@ export async function focusApplication(pid: number): Promise<{ success: boolean 
     method: 'POST',
   });
   if (!res.ok) throw new Error('Failed to focus application');
+  return res.json();
+}
+
+// Spec Mode API types
+export interface ConversationMessage {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  timestamp: string;
+  tool_calls?: Array<{
+    tool: string;
+    input: Record<string, unknown>;
+    output?: string;
+  }>;
+}
+
+export interface Conversation {
+  run_id: string;
+  messages: ConversationMessage[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChatResponse {
+  message: string;
+  tool_calls?: Array<{
+    tool: string;
+    input: Record<string, unknown>;
+    output: string;
+  }>;
+  completed?: boolean;
+  completion_summary?: string;
+}
+
+// Spec Mode API functions
+export async function sendSpecMessage(runId: string, message: string): Promise<ChatResponse> {
+  const res = await fetch(`${API_BASE}/api/runs/${runId}/message`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message }),
+  });
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ error: { message: 'Unknown error' } }));
+    throw new Error(error.error?.message || 'Failed to send message');
+  }
+  return res.json();
+}
+
+export async function fetchConversation(runId: string): Promise<Conversation | null> {
+  const res = await fetch(`${API_BASE}/api/runs/${runId}/conversation`);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error('Failed to fetch conversation');
   return res.json();
 }

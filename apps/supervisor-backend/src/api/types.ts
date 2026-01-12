@@ -69,11 +69,18 @@ export interface ChatCompletionChunk {
   }>;
 }
 
+// Run mode types
+export const RunModeSchema = z.enum(['spec', 'implementation']);
+export type RunMode = z.infer<typeof RunModeSchema>;
+
 // Run management types
 export const CreateRunRequestSchema = z.object({
   goal: z.string(),
   repo_path: z.string(),
   project_id: z.string().optional(),
+  mode: RunModeSchema.optional().default('implementation'),
+  // Link to a spec run for implementation mode (provides context from specification)
+  spec_run_id: z.string().optional(),
   model_policy: z.object({
     supervisor_model: z.string().optional(),
     claude_model: z.string().optional(),
@@ -87,9 +94,17 @@ export const CreateRunRequestSchema = z.object({
 
 export type CreateRunRequest = z.infer<typeof CreateRunRequestSchema>;
 
+// Message request for spec mode
+export const SendMessageRequestSchema = z.object({
+  message: z.string(),
+});
+
+export type SendMessageRequest = z.infer<typeof SendMessageRequestSchema>;
+
 export interface RunResponse {
   run_id: string;
   project_id?: string;
+  mode: RunMode;
   status: string;
   user_goal: string;
   created_at: string;
@@ -99,9 +114,49 @@ export interface RunResponse {
   final_report?: string;
 }
 
+// Conversation response for spec mode
+export interface ConversationResponse {
+  run_id: string;
+  messages: Array<{
+    role: 'user' | 'assistant' | 'system';
+    content: string;
+    timestamp: string;
+    tool_calls?: Array<{
+      tool: string;
+      input: Record<string, unknown>;
+      output?: string;
+    }>;
+  }>;
+  created_at: string;
+  updated_at: string;
+}
+
+// Chat response for spec mode
+export interface ChatMessageResponse {
+  message: string;
+  tool_calls?: Array<{
+    tool: string;
+    input: Record<string, unknown>;
+    output: string;
+  }>;
+  completed?: boolean;
+  completion_summary?: string;
+}
+
+/** Pagination metadata */
+export interface PaginationInfo {
+  page: number;
+  pageSize: number;
+  totalCount: number;
+  totalPages: number;
+  hasNextPage: boolean;
+  hasPreviousPage: boolean;
+}
+
 export interface RunListResponse {
   runs: RunResponse[];
   total: number;
+  pagination?: PaginationInfo;
 }
 
 // DAG Response types

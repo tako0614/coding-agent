@@ -7,11 +7,18 @@ import { z } from 'zod';
 import { createShellExecutor, loadPolicyFromConfig } from '@supervisor/tool-runtime';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { validateRepoPath, PathSecurityError } from '../../services/path-sandbox.js';
+import { logger } from '../../services/logger.js';
 
 const shell = new Hono();
 
+/** Maximum command length to prevent resource exhaustion (32KB) */
+const MAX_COMMAND_LENGTH = 32 * 1024;
+
 const ExecuteSchema = z.object({
-  command: z.string().min(1),
+  command: z.string().min(1).max(MAX_COMMAND_LENGTH, {
+    message: `Command too long. Maximum length is ${MAX_COMMAND_LENGTH} characters`,
+  }),
   cwd: z.string().optional(),
   timeout: z.number().optional(),
 });
@@ -60,7 +67,19 @@ shell.post('/execute', async (c) => {
     }
 
     const { command, cwd, timeout } = parsed.data;
-    const workingDir = cwd || process.cwd();
+
+    // Validate cwd if provided
+    let workingDir: string;
+    if (cwd) {
+      try {
+        workingDir = validateRepoPath(cwd);
+      } catch (err) {
+        const message = err instanceof PathSecurityError ? err.message : 'Invalid working directory';
+        return c.json({ error: { message, code: 'INVALID_CWD' } }, 400);
+      }
+    } else {
+      workingDir = process.cwd();
+    }
 
     const policy = await loadPolicy();
     const executor = createShellExecutor(workingDir, policy.shell);
@@ -87,7 +106,9 @@ shell.post('/execute', async (c) => {
       timedOut: result.timedOut,
     });
   } catch (error) {
-    console.error('[Shell] Execution error:', error);
+    logger.error('Shell execution error', {
+      error: error instanceof Error ? error.message : String(error),
+    });
     return c.json({
       error: {
         message: error instanceof Error ? error.message : 'Failed to execute command',

@@ -5,6 +5,7 @@
 
 import { spawn, type ChildProcess } from 'child_process';
 import { getCopilotAPIConfig, updateSettings } from './settings-store.js';
+import { logger } from './logger.js';
 
 export interface CopilotAPIStatus {
   running: boolean;
@@ -28,21 +29,52 @@ class CopilotAPIManager {
   private maxRestartAttempts = 3;
   private healthCheckInterval: NodeJS.Timeout | null = null;
 
+  // Store listener references for cleanup
+  private stdoutListener: ((data: Buffer) => void) | null = null;
+  private stderrListener: ((data: Buffer) => void) | null = null;
+  private exitListener: ((code: number | null, signal: NodeJS.Signals | null) => void) | null = null;
+  private errorListener: ((err: Error) => void) | null = null;
+
+  /**
+   * Clean up process listeners to prevent memory leaks
+   */
+  private cleanupListeners(): void {
+    if (this.process) {
+      if (this.stdoutListener && this.process.stdout) {
+        this.process.stdout.off('data', this.stdoutListener);
+      }
+      if (this.stderrListener && this.process.stderr) {
+        this.process.stderr.off('data', this.stderrListener);
+      }
+      if (this.exitListener) {
+        this.process.off('exit', this.exitListener);
+      }
+      if (this.errorListener) {
+        this.process.off('error', this.errorListener);
+      }
+    }
+    this.stdoutListener = null;
+    this.stderrListener = null;
+    this.exitListener = null;
+    this.errorListener = null;
+  }
+
   /**
    * Start the copilot-api proxy
    */
   async start(): Promise<CopilotAPIStatus> {
     if (this.process && this.status.running) {
-      console.log('[CopilotAPI] Already running');
+      logger.info('CopilotAPI already running');
       return this.status;
     }
+
+    // Clean up any existing listeners before starting
+    this.cleanupListeners();
 
     const config = getCopilotAPIConfig();
     const port = this.extractPort(config.baseUrl);
 
-    console.log(`[CopilotAPI] Config URL: ${config.baseUrl}`);
-    console.log(`[CopilotAPI] Starting copilot-api on port ${port}...`);
-    console.log(`[CopilotAPI] GitHub token available: ${!!config.githubToken}`);
+    logger.info('Starting copilot-api', { url: config.baseUrl, port, hasToken: !!config.githubToken });
 
     try {
       // Use npx to run copilot-api (shell: true handles Windows .cmd extensions)
@@ -57,7 +89,7 @@ class CopilotAPIManager {
         },
       });
 
-      console.log(`[CopilotAPI] Process spawned with PID: ${this.process.pid}`);
+      logger.debug('CopilotAPI process spawned', { pid: this.process.pid });
 
       this.status = {
         running: true,
@@ -66,41 +98,46 @@ class CopilotAPIManager {
         startedAt: new Date().toISOString(),
       };
 
-      // Handle stdout
-      this.process.stdout?.on('data', (data: Buffer) => {
+      // Define listeners as bound functions for cleanup
+      this.stdoutListener = (data: Buffer) => {
         const output = data.toString().trim();
         if (output) {
-          console.log(`[CopilotAPI] ${output}`);
+          logger.debug('CopilotAPI stdout', { output });
         }
-      });
+      };
 
-      // Handle stderr
-      this.process.stderr?.on('data', (data: Buffer) => {
+      this.stderrListener = (data: Buffer) => {
         const output = data.toString().trim();
         if (output) {
-          console.error(`[CopilotAPI] ${output}`);
+          logger.warn('CopilotAPI stderr', { output });
         }
-      });
+      };
 
-      // Handle process exit
-      this.process.on('exit', (code, signal) => {
-        console.log(`[CopilotAPI] Process exited with code ${code}, signal ${signal}`);
+      this.exitListener = (code, signal) => {
+        logger.info('CopilotAPI process exited', { code, signal });
+        this.cleanupListeners();
         this.status = { running: false };
         this.process = null;
 
         // Auto-restart if enabled and didn't exceed max attempts
         if (getCopilotAPIConfig().enabled && this.restartAttempts < this.maxRestartAttempts) {
           this.restartAttempts++;
-          console.log(`[CopilotAPI] Attempting restart (${this.restartAttempts}/${this.maxRestartAttempts})...`);
+          logger.info('CopilotAPI attempting restart', { attempt: this.restartAttempts, maxAttempts: this.maxRestartAttempts });
           setTimeout(() => this.start(), 2000);
         }
-      });
+      };
 
-      this.process.on('error', (err) => {
-        console.error(`[CopilotAPI] Process error:`, err);
+      this.errorListener = (err) => {
+        logger.error('CopilotAPI process error', { error: err.message });
         this.status = { running: false, error: err.message };
         this.process = null;
-      });
+      };
+
+      // Attach listeners
+      this.process.stdout?.on('data', this.stdoutListener);
+      this.process.stderr?.on('data', this.stderrListener);
+      this.process.on('exit', this.exitListener);
+      this.process.on('error', this.errorListener);
 
       // Wait a bit for the process to start
       await this.waitForReady(config.baseUrl, 10000);
@@ -111,12 +148,12 @@ class CopilotAPIManager {
       // Reset restart attempts on successful start
       this.restartAttempts = 0;
 
-      console.log(`[CopilotAPI] Started successfully on ${config.baseUrl}`);
+      logger.info('CopilotAPI started successfully', { url: config.baseUrl });
       return this.status;
 
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      console.error(`[CopilotAPI] Failed to start:`, errorMessage);
+      logger.error('CopilotAPI failed to start', { error: errorMessage });
       this.status = { running: false, error: errorMessage };
       return this.status;
     }
@@ -132,29 +169,35 @@ class CopilotAPIManager {
     }
 
     if (!this.process) {
-      console.log('[CopilotAPI] Not running');
+      logger.debug('CopilotAPI not running');
       this.status = { running: false };
       return this.status;
     }
 
-    console.log('[CopilotAPI] Stopping...');
+    logger.info('CopilotAPI stopping');
+
+    // Clean up existing listeners to avoid memory leaks and duplicate handlers
+    this.cleanupListeners();
 
     return new Promise((resolve) => {
       const timeout = setTimeout(() => {
         // Force kill if graceful shutdown didn't work
         if (this.process) {
-          console.log('[CopilotAPI] Force killing process...');
+          logger.warn('CopilotAPI force killing process');
           this.process.kill('SIGKILL');
         }
       }, 5000);
 
-      this.process!.on('exit', () => {
+      // Create a one-time exit handler for this stop operation
+      const stopExitHandler = () => {
         clearTimeout(timeout);
         this.status = { running: false };
         this.process = null;
-        console.log('[CopilotAPI] Stopped');
+        logger.info('CopilotAPI stopped');
         resolve(this.status);
-      });
+      };
+
+      this.process!.once('exit', stopExitHandler);
 
       // Try graceful shutdown first
       this.process!.kill('SIGTERM');
@@ -174,7 +217,7 @@ class CopilotAPIManager {
   async fetchModels(): Promise<CopilotModel[]> {
     const config = getCopilotAPIConfig();
     if (!this.status.running) {
-      console.log('[CopilotAPI] Not running, cannot fetch models');
+      logger.debug('CopilotAPI not running, cannot fetch models');
       return [];
     }
 
@@ -188,16 +231,16 @@ class CopilotAPIManager {
       });
 
       if (!response.ok) {
-        console.warn(`[CopilotAPI] Failed to fetch models: ${response.status}`);
+        logger.warn('CopilotAPI failed to fetch models', { status: response.status });
         return [];
       }
 
       const data = await response.json() as { data?: CopilotModel[] };
       const models = data.data ?? [];
-      console.log(`[CopilotAPI] Fetched ${models.length} models`);
+      logger.debug('CopilotAPI fetched models', { count: models.length });
       return models;
     } catch (error) {
-      console.error('[CopilotAPI] Error fetching models:', error);
+      logger.error('CopilotAPI error fetching models', { error: error instanceof Error ? error.message : String(error) });
       return [];
     }
   }
@@ -244,7 +287,7 @@ class CopilotAPIManager {
         });
         // Any response means server is up
         if (response.status < 500) {
-          console.log('[CopilotAPI] API is responding');
+          logger.debug('CopilotAPI is responding');
           return;
         }
       } catch {
@@ -254,7 +297,7 @@ class CopilotAPIManager {
     }
 
     // Don't throw, just warn - the process might still be starting
-    console.warn('[CopilotAPI] API not responding yet, but process is running');
+    logger.warn('CopilotAPI not responding yet, but process is running');
   }
 
   /**
@@ -270,7 +313,7 @@ class CopilotAPIManager {
 
       // Don't use the same port as the backend
       if (port === BACKEND_PORT) {
-        console.warn(`[CopilotAPI] Port ${BACKEND_PORT} conflicts with backend, using ${DEFAULT_PORT}`);
+        logger.warn('CopilotAPI port conflicts with backend', { conflictPort: BACKEND_PORT, usingPort: DEFAULT_PORT });
         return DEFAULT_PORT;
       }
 
@@ -296,10 +339,10 @@ class CopilotAPIManager {
         const healthy = await this.checkHealth();
         if (!healthy && this.status.running) {
           // Only warn, don't set error - copilot-api might just be slow
-          console.warn('[CopilotAPI] Health check failed, but process is running');
+          logger.warn('CopilotAPI health check failed, but process is running');
         } else if (healthy && this.status.error) {
           // Clear error if recovered
-          console.log('[CopilotAPI] Health check passed, clearing error');
+          logger.info('CopilotAPI health check passed, clearing error');
           delete this.status.error;
         }
       }, 30000); // Check every 30 seconds
@@ -312,7 +355,7 @@ class CopilotAPIManager {
   async initialize(): Promise<void> {
     const config = getCopilotAPIConfig();
     if (config.enabled) {
-      console.log('[CopilotAPI] Auto-starting (enabled in settings)...');
+      logger.info('CopilotAPI auto-starting (enabled in settings)');
       await this.start();
     }
   }

@@ -9,3 +9,4 @@ export { SUPERVISOR_TOOLS, ToolExecutor } from './tools.js';
 export type { ToolExecutorContext, ToolResult } from './tools.js';
 export { agentStore } from './agent-store.js';
 export * from './types.js';
+export type { SupervisorState } from './types.js';

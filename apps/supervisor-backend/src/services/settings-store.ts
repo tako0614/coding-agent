@@ -17,6 +17,12 @@ export interface AppSettings {
   use_copilot_api?: boolean;
   // DAG building model (for LangGraph)
   dag_model?: string;
+  // Spec agent model (for specification mode)
+  spec_model?: string;
+  // Claude executor model
+  claude_model?: string;
+  // Codex executor model
+  codex_model?: string;
   // Executor mode: auto, codex_only, claude_only
   executor_mode?: ExecutorMode;
   // Shell command configuration
@@ -27,6 +33,10 @@ export interface AppSettings {
   task_timeout_ms?: number;
   // Agent context settings
   max_context_tokens?: number;
+  // Agent timeout (overall execution)
+  agent_timeout_ms?: number;
+  // Command timeout
+  command_timeout_ms?: number;
 }
 
 // Known setting keys
@@ -38,16 +48,39 @@ export const SETTING_KEYS = {
   GITHUB_TOKEN: 'github_token',
   USE_COPILOT_API: 'use_copilot_api',
   DAG_MODEL: 'dag_model',
+  SPEC_MODEL: 'spec_model',
+  CLAUDE_MODEL: 'claude_model',
+  CODEX_MODEL: 'codex_model',
   EXECUTOR_MODE: 'executor_mode',
   SHELL_ALLOWLIST: 'shell_allowlist',
   SHELL_DENYLIST: 'shell_denylist',
   MAX_WORKERS: 'max_workers',
   TASK_TIMEOUT_MS: 'task_timeout_ms',
   MAX_CONTEXT_TOKENS: 'max_context_tokens',
+  AGENT_TIMEOUT_MS: 'agent_timeout_ms',
+  COMMAND_TIMEOUT_MS: 'command_timeout_ms',
 } as const;
 
 /** Default max context tokens (150k) */
 export const DEFAULT_MAX_CONTEXT_TOKENS = 150_000;
+
+/** Default agent timeout (30 minutes) */
+export const DEFAULT_AGENT_TIMEOUT_MS = 30 * 60 * 1000;
+
+/** Default command timeout (5 minutes) */
+export const DEFAULT_COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** Default task timeout (10 minutes) */
+export const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000;
+
+/** Fallback API key for Copilot proxy (when no real key is needed) */
+export const COPILOT_PROXY_KEY = 'copilot-proxy';
+
+/** Minimum allowed max context tokens (10k) */
+export const MIN_MAX_CONTEXT_TOKENS = 10_000;
+
+/** Maximum allowed max context tokens (500k) */
+export const MAX_MAX_CONTEXT_TOKENS = 500_000;
 
 // Default shell command allowlist
 export const DEFAULT_SHELL_ALLOWLIST = [
@@ -137,6 +170,15 @@ export function getAllSettings(): AppSettings {
       case SETTING_KEYS.EXECUTOR_MODE:
         settings.executor_mode = row.value as ExecutorMode;
         break;
+      case SETTING_KEYS.SPEC_MODEL:
+        settings.spec_model = row.value;
+        break;
+      case SETTING_KEYS.CLAUDE_MODEL:
+        settings.claude_model = row.value;
+        break;
+      case SETTING_KEYS.CODEX_MODEL:
+        settings.codex_model = row.value;
+        break;
     }
   }
 
@@ -208,6 +250,30 @@ export function updateSettings(settings: Partial<AppSettings>): void {
       deleteStmt.run(SETTING_KEYS.EXECUTOR_MODE);
     }
   }
+
+  if (settings.spec_model !== undefined) {
+    if (settings.spec_model) {
+      upsertStmt.run({ key: SETTING_KEYS.SPEC_MODEL, value: settings.spec_model, updated_at: now });
+    } else {
+      deleteStmt.run(SETTING_KEYS.SPEC_MODEL);
+    }
+  }
+
+  if (settings.claude_model !== undefined) {
+    if (settings.claude_model) {
+      upsertStmt.run({ key: SETTING_KEYS.CLAUDE_MODEL, value: settings.claude_model, updated_at: now });
+    } else {
+      deleteStmt.run(SETTING_KEYS.CLAUDE_MODEL);
+    }
+  }
+
+  if (settings.codex_model !== undefined) {
+    if (settings.codex_model) {
+      upsertStmt.run({ key: SETTING_KEYS.CODEX_MODEL, value: settings.codex_model, updated_at: now });
+    } else {
+      deleteStmt.run(SETTING_KEYS.CODEX_MODEL);
+    }
+  }
 }
 
 /**
@@ -232,6 +298,42 @@ export function getDAGModel(): string {
     return fromSettings;
   }
   return process.env['DAG_MODEL'] || 'gpt-5.2';
+}
+
+/**
+ * Get Spec agent model setting
+ * Defaults to claude-sonnet-4-20250514
+ */
+export function getSpecModel(): string {
+  const fromSettings = getSetting(SETTING_KEYS.SPEC_MODEL);
+  if (fromSettings) {
+    return fromSettings;
+  }
+  return process.env['SPEC_MODEL'] || 'claude-sonnet-4-20250514';
+}
+
+/**
+ * Get Claude executor model setting
+ * Defaults to claude-sonnet-4-20250514
+ */
+export function getClaudeModel(): string {
+  const fromSettings = getSetting(SETTING_KEYS.CLAUDE_MODEL);
+  if (fromSettings) {
+    return fromSettings;
+  }
+  return process.env['CLAUDE_MODEL'] || 'claude-sonnet-4-20250514';
+}
+
+/**
+ * Get Codex executor model setting
+ * Defaults to gpt-4.1
+ */
+export function getCodexModel(): string {
+  const fromSettings = getSetting(SETTING_KEYS.CODEX_MODEL);
+  if (fromSettings) {
+    return fromSettings;
+  }
+  return process.env['CODEX_MODEL'] || 'gpt-4.1';
 }
 
 /**
@@ -269,7 +371,7 @@ export function getOpenAIConfig(): OpenAIConfig | undefined {
   if (copilotConfig.enabled) {
     // Copilot API doesn't need an API key, but we'll use a dummy one for compatibility
     return {
-      apiKey: copilotConfig.githubToken || 'copilot-proxy',
+      apiKey: copilotConfig.githubToken || COPILOT_PROXY_KEY,
       baseUrl: copilotConfig.baseUrl,
       useCopilot: true,
     };
@@ -440,7 +542,7 @@ export function getMaxContextTokens(): number {
   const fromSettings = getSetting(SETTING_KEYS.MAX_CONTEXT_TOKENS);
   if (fromSettings) {
     const parsed = parseInt(fromSettings, 10);
-    if (!isNaN(parsed) && parsed > 0) {
+    if (!isNaN(parsed) && parsed >= MIN_MAX_CONTEXT_TOKENS && parsed <= MAX_MAX_CONTEXT_TOKENS) {
       return parsed;
     }
   }
@@ -449,7 +551,70 @@ export function getMaxContextTokens(): number {
 
 /**
  * Set max context tokens for agent
+ * @param tokens - Value between MIN_MAX_CONTEXT_TOKENS and MAX_MAX_CONTEXT_TOKENS
+ * @throws Error if value is out of bounds
  */
 export function setMaxContextTokens(tokens: number): void {
+  if (tokens < MIN_MAX_CONTEXT_TOKENS || tokens > MAX_MAX_CONTEXT_TOKENS) {
+    throw new Error(
+      `max_context_tokens must be between ${MIN_MAX_CONTEXT_TOKENS} and ${MAX_MAX_CONTEXT_TOKENS}, got ${tokens}`
+    );
+  }
   setSetting(SETTING_KEYS.MAX_CONTEXT_TOKENS, String(tokens));
+}
+
+/**
+ * Get agent timeout in milliseconds
+ */
+export function getAgentTimeoutMs(): number {
+  const fromSettings = getSetting(SETTING_KEYS.AGENT_TIMEOUT_MS);
+  if (fromSettings) {
+    const parsed = parseInt(fromSettings, 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  const fromEnv = process.env['AGENT_TIMEOUT_MS'];
+  if (fromEnv) {
+    const parsed = parseInt(fromEnv, 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return DEFAULT_AGENT_TIMEOUT_MS;
+}
+
+/**
+ * Set agent timeout in milliseconds
+ */
+export function setAgentTimeoutMs(timeoutMs: number): void {
+  setSetting(SETTING_KEYS.AGENT_TIMEOUT_MS, String(timeoutMs));
+}
+
+/**
+ * Get command timeout in milliseconds
+ */
+export function getCommandTimeoutMs(): number {
+  const fromSettings = getSetting(SETTING_KEYS.COMMAND_TIMEOUT_MS);
+  if (fromSettings) {
+    const parsed = parseInt(fromSettings, 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  const fromEnv = process.env['COMMAND_TIMEOUT_MS'];
+  if (fromEnv) {
+    const parsed = parseInt(fromEnv, 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return DEFAULT_COMMAND_TIMEOUT_MS;
+}
+
+/**
+ * Set command timeout in milliseconds
+ */
+export function setCommandTimeoutMs(timeoutMs: number): void {
+  setSetting(SETTING_KEYS.COMMAND_TIMEOUT_MS, String(timeoutMs));
 }

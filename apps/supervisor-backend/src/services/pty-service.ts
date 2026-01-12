@@ -6,6 +6,7 @@
 import * as pty from 'node-pty';
 import { WebSocket } from 'ws';
 import os from 'os';
+import { logger } from './logger.js';
 
 interface PtySession {
   id: string;
@@ -37,7 +38,7 @@ class PtyService {
     const shell = this.getDefaultShell();
     const cwd = options.cwd || process.cwd();
 
-    console.log(`[PTY] Creating session ${sessionId} with shell: ${shell}, cwd: ${cwd}`);
+    logger.info('Creating PTY session', { sessionId, shell, cwd });
 
     const ptyProcess = pty.spawn(shell, [], {
       name: 'xterm-256color',
@@ -67,7 +68,7 @@ class PtyService {
 
     // Handle PTY exit
     ptyProcess.onExit(({ exitCode, signal }) => {
-      console.log(`[PTY] Session ${sessionId} exited with code ${exitCode}, signal ${signal}`);
+      logger.info('PTY session exited', { sessionId, exitCode, signal });
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'exit', exitCode, signal }));
       }
@@ -78,7 +79,14 @@ class PtyService {
     ws.on('message', (message: Buffer) => {
       try {
         const msg = JSON.parse(message.toString());
-        this.handleMessage(sessionId, msg);
+        try {
+          this.handleMessage(sessionId, msg);
+        } catch (handleError) {
+          logger.error('Error handling PTY message', {
+            sessionId,
+            error: handleError instanceof Error ? handleError.message : String(handleError),
+          });
+        }
       } catch {
         // Treat as raw input if not JSON
         ptyProcess.write(message.toString());
@@ -87,7 +95,7 @@ class PtyService {
 
     // Handle WebSocket close
     ws.on('close', () => {
-      console.log(`[PTY] WebSocket closed for session ${sessionId}`);
+      logger.info('PTY WebSocket closed', { sessionId });
       this.destroySession(sessionId);
     });
 
@@ -121,7 +129,7 @@ class PtyService {
         // Resize PTY
         if (msg.cols && msg.rows) {
           session.pty.resize(msg.cols, msg.rows);
-          console.log(`[PTY] Resized session ${sessionId} to ${msg.cols}x${msg.rows}`);
+          logger.debug('PTY session resized', { sessionId, cols: msg.cols, rows: msg.rows });
         }
         break;
 
@@ -140,7 +148,7 @@ class PtyService {
   destroySession(sessionId: string): void {
     const session = this.sessions.get(sessionId);
     if (session) {
-      console.log(`[PTY] Destroying session ${sessionId}`);
+      logger.debug('Destroying PTY session', { sessionId });
       session.pty.kill();
       this.sessions.delete(sessionId);
     }
@@ -161,7 +169,7 @@ class PtyService {
    * Cleanup all sessions
    */
   cleanup(): void {
-    console.log(`[PTY] Cleaning up ${this.sessions.size} sessions`);
+    logger.info('Cleaning up PTY sessions', { count: this.sessions.size });
     for (const sessionId of this.sessions.keys()) {
       this.destroySession(sessionId);
     }
