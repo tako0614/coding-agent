@@ -25,6 +25,8 @@ export interface AppSettings {
   // Worker pool configuration
   max_workers?: number;
   task_timeout_ms?: number;
+  // Agent context settings
+  max_context_tokens?: number;
 }
 
 // Known setting keys
@@ -41,7 +43,11 @@ export const SETTING_KEYS = {
   SHELL_DENYLIST: 'shell_denylist',
   MAX_WORKERS: 'max_workers',
   TASK_TIMEOUT_MS: 'task_timeout_ms',
+  MAX_CONTEXT_TOKENS: 'max_context_tokens',
 } as const;
+
+/** Default max context tokens (150k) */
+export const DEFAULT_MAX_CONTEXT_TOKENS = 150_000;
 
 // Default shell command allowlist
 export const DEFAULT_SHELL_ALLOWLIST = [
@@ -425,4 +431,25 @@ export function getShellConfig(): ShellConfig {
     maxExecutionTimeMs: getTaskTimeoutMs(),
     maxOutputSizeBytes: 10 * 1024 * 1024, // 10MB
   };
+}
+
+/**
+ * Get max context tokens for agent
+ */
+export function getMaxContextTokens(): number {
+  const fromSettings = getSetting(SETTING_KEYS.MAX_CONTEXT_TOKENS);
+  if (fromSettings) {
+    const parsed = parseInt(fromSettings, 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return DEFAULT_MAX_CONTEXT_TOKENS;
+}
+
+/**
+ * Set max context tokens for agent
+ */
+export function setMaxContextTokens(tokens: number): void {
+  setSetting(SETTING_KEYS.MAX_CONTEXT_TOKENS, String(tokens));
 }

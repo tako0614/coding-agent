@@ -406,6 +406,8 @@ export interface AppSettings {
   dag_model?: string;
   // Executor mode: auto, codex_only, claude_only
   executor_mode?: ExecutorMode;
+  // Max context tokens for agent summarization
+  max_context_tokens?: number;
 }
 
 // Copilot API status

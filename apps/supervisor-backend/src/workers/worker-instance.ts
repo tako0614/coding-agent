@@ -142,7 +142,16 @@ export class WorkerInstance {
       }
 
       this.worker.current_task_id = undefined;
-      this.worker.avg_task_duration_ms = durationMs;
+      // Calculate proper rolling average
+      const totalTasks = this.worker.completed_tasks + this.worker.failed_tasks;
+      if (this.worker.avg_task_duration_ms === undefined) {
+        this.worker.avg_task_duration_ms = durationMs;
+      } else {
+        // Rolling average: (old_avg * (n-1) + new_value) / n
+        this.worker.avg_task_duration_ms = Math.round(
+          (this.worker.avg_task_duration_ms * (totalTasks - 1) + durationMs) / totalTasks
+        );
+      }
 
       return {
         success: report.status === 'done',

@@ -4,19 +4,105 @@
  */
 
 import OpenAI from 'openai';
+import { getEncoding, type Tiktoken } from 'js-tiktoken';
 import type {
   SupervisorState,
   SupervisorMessage,
-  SupervisorConfig,
   WorkerTask,
   WorkerTaskResult,
-  ToolCall,
 } from './types.js';
-import { DEFAULT_SUPERVISOR_CONFIG } from './types.js';
 import { SUPERVISOR_TOOLS, ToolExecutor } from './tools.js';
-import { createRunId, createTaskId } from '@supervisor/protocol';
+import { createRunId } from '@supervisor/protocol';
 import { logger } from '../services/logger.js';
-import { getCopilotAPIConfig, getDAGModel } from '../services/settings-store.js';
+import { getCopilotAPIConfig, getDAGModel, getMaxContextTokens } from '../services/settings-store.js';
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/** Maximum retries for API calls */
+const MAX_API_RETRIES = 3;
+
+/** Base delay for exponential backoff (ms) */
+const BASE_RETRY_DELAY_MS = 1000;
+
+/** Default max tokens for context (leave room for response) */
+const DEFAULT_MAX_CONTEXT_TOKENS = 150000;
+
+/** Max consecutive responses without tool calls before warning */
+const MAX_NO_TOOL_RESPONSES = 5;
+
+/** Max consecutive errors before failing */
+const MAX_CONSECUTIVE_ERRORS = 10;
+
+/** Max summarization attempts per step to prevent loops */
+const MAX_SUMMARIZATION_ATTEMPTS = 2;
+
+/** Default agent timeout in ms (30 minutes) */
+const DEFAULT_AGENT_TIMEOUT_MS = 30 * 60 * 1000;
+
+// =============================================================================
+// Utilities
+// =============================================================================
+
+/** Tiktoken encoder instance (lazy initialized) */
+let tiktokenEncoder: Tiktoken | null = null;
+
+/**
+ * Get or create tiktoken encoder
+ */
+function getTokenEncoder(): Tiktoken {
+  if (!tiktokenEncoder) {
+    // Use cl100k_base encoding (used by GPT-4, GPT-3.5-turbo)
+    tiktokenEncoder = getEncoding('cl100k_base');
+  }
+  return tiktokenEncoder;
+}
+
+/**
+ * Count tokens accurately using tiktoken
+ */
+function countTokens(text: string): number {
+  try {
+    const encoder = getTokenEncoder();
+    return encoder.encode(text).length;
+  } catch (error) {
+    // Fallback to rough estimation if tiktoken fails
+    logger.warn('Tiktoken encoding failed, using fallback estimation', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    // Use conservative estimate: ~2 tokens per character for CJK, ~0.25 for ASCII
+    const cjkChars = (text.match(/[\u3000-\u9fff\uac00-\ud7af]/g) || []).length;
+    const otherChars = text.length - cjkChars;
+    return Math.ceil(cjkChars * 2 + otherChars / 4);
+  }
+}
+
+/**
+ * Sleep for specified milliseconds
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Check if an error is retryable
+ */
+function isRetryableError(error: unknown): boolean {
+  if (error instanceof Error) {
+    const message = error.message.toLowerCase();
+    return (
+      message.includes('rate limit') ||
+      message.includes('timeout') ||
+      message.includes('network') ||
+      message.includes('econnreset') ||
+      message.includes('429') ||
+      message.includes('503') ||
+      message.includes('502')
+    );
+  }
+  return false;
+}
 
 // =============================================================================
 // System Prompt
@@ -102,24 +188,31 @@ export interface SupervisorAgentEvents {
   onThinking?: (content: string) => void;
 }
 
+export interface SupervisorAgentOptions {
+  repoPath: string;
+  userGoal: string;
+  events?: SupervisorAgentEvents;
+  workerExecutor?: (tasks: WorkerTask[], signal?: AbortSignal) => Promise<WorkerTaskResult[]>;
+  /** Overall timeout in ms (default: 30 minutes) */
+  timeoutMs?: number;
+}
+
 export class SupervisorAgent {
-  private config: SupervisorConfig;
   private openai: OpenAI;
   private toolExecutor: ToolExecutor;
   private state: SupervisorState;
   private events: SupervisorAgentEvents;
-  private workerExecutor?: (tasks: WorkerTask[]) => Promise<WorkerTaskResult[]>;
+  private workerExecutor?: (tasks: WorkerTask[], signal?: AbortSignal) => Promise<WorkerTaskResult[]>;
+  private noToolResponseCount = 0;
+  private consecutiveErrorCount = 0;
+  private abortController: AbortController;
+  private timeoutMs: number;
 
-  constructor(options: {
-    repoPath: string;
-    userGoal: string;
-    config?: Partial<SupervisorConfig>;
-    events?: SupervisorAgentEvents;
-    workerExecutor?: (tasks: WorkerTask[]) => Promise<WorkerTaskResult[]>;
-  }) {
-    this.config = { ...DEFAULT_SUPERVISOR_CONFIG, ...options.config };
+  constructor(options: SupervisorAgentOptions) {
     this.events = options.events ?? {};
     this.workerExecutor = options.workerExecutor;
+    this.abortController = new AbortController();
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS;
 
     // Initialize OpenAI client with Copilot API
     const copilotConfig = getCopilotAPIConfig();
@@ -136,7 +229,6 @@ export class SupervisorAgent {
       user_goal: options.userGoal,
       repo_path: options.repoPath,
       messages: [],
-      pending_tasks: [],
       active_tasks: new Map(),
       completed_tasks: [],
       created_at: new Date().toISOString(),
@@ -151,13 +243,30 @@ export class SupervisorAgent {
 
     // Set up worker executor for async tasks
     if (this.workerExecutor) {
-      this.toolExecutor.setWorkerExecutor(this.workerExecutor as (tasks: WorkerTask[]) => Promise<unknown[]>);
+      this.toolExecutor.setWorkerExecutor(this.workerExecutor);
     }
 
-    // Set up cancel callback
-    this.toolExecutor.setOnCancel(() => {
-      this.state.phase = 'failed';
-      this.state.error = 'Run cancelled';
+    // Set up callbacks for state tracking
+    this.toolExecutor.setCallbacks({
+      onWorkerStart: (task) => {
+        this.state.active_tasks.set(task.task_id, task);
+        this.state.updated_at = new Date().toISOString();
+        this.events.onWorkerStart?.(task);
+        this.events.onStateChange?.(this.state);
+      },
+      onWorkerComplete: (result) => {
+        this.state.active_tasks.delete(result.task_id);
+        this.state.completed_tasks.push(result);
+        this.state.updated_at = new Date().toISOString();
+        this.events.onWorkerComplete?.(result);
+        this.events.onStateChange?.(this.state);
+      },
+      onCancel: () => {
+        this.state.phase = 'failed';
+        this.state.error = 'Run cancelled';
+        this.state.updated_at = new Date().toISOString();
+        this.events.onStateChange?.(this.state);
+      },
     });
 
     logger.info('Supervisor Agent initialized', {
@@ -173,78 +282,418 @@ export class SupervisorAgent {
   async run(): Promise<SupervisorState> {
     this.updatePhase('planning');
 
-    // Add system and user messages
-    this.addMessage({
-      role: 'system',
-      content: SUPERVISOR_SYSTEM_PROMPT,
-    });
-    this.addMessage({
-      role: 'user',
-      content: `ユーザーの目標: ${this.state.user_goal}\n\nリポジトリパス: ${this.state.repo_path}\n\nこの目標を達成してください。`,
-    });
-
-    // Main agent loop - runs until complete or fail
-    while (
-      this.state.phase !== 'completed' &&
-      this.state.phase !== 'failed'
-    ) {
-      logger.info('Supervisor step', {
+    // Set up overall timeout
+    const timeoutId = setTimeout(() => {
+      logger.warn('Agent timeout reached', {
         runId: this.state.run_id,
-        phase: this.state.phase,
+        timeoutMs: this.timeoutMs,
+      });
+      this.abortController.abort();
+    }, this.timeoutMs);
+
+    try {
+      // Add system and user messages
+      this.addMessage({
+        role: 'system',
+        content: SUPERVISOR_SYSTEM_PROMPT,
+      });
+      this.addMessage({
+        role: 'user',
+        content: `ユーザーの目標: ${this.state.user_goal}\n\nリポジトリパス: ${this.state.repo_path}\n\nこの目標を達成してください。`,
       });
 
-      try {
-        await this.step();
-      } catch (error) {
-        const errorMsg = error instanceof Error ? error.message : String(error);
-        logger.error('Supervisor step failed', {
+      // Main agent loop - runs until complete or fail
+      while (
+        this.state.phase !== 'completed' &&
+        this.state.phase !== 'failed' &&
+        !this.abortController.signal.aborted
+      ) {
+        logger.info('Supervisor step', {
           runId: this.state.run_id,
-          error: errorMsg,
+          phase: this.state.phase,
         });
 
-        // Add error to messages
-        this.addMessage({
-          role: 'user',
-          content: `エラーが発生しました: ${errorMsg}\n\n回復可能であれば続行、不可能であればfailを呼んでください。`,
-        });
+        try {
+          await this.step();
+          // Reset consecutive error count on successful step
+          this.consecutiveErrorCount = 0;
+        } catch (error) {
+          this.consecutiveErrorCount++;
+          const errorMsg = error instanceof Error ? error.message : String(error);
+          logger.error('Supervisor step failed', {
+            runId: this.state.run_id,
+            error: errorMsg,
+            consecutiveErrors: this.consecutiveErrorCount,
+          });
+
+          // Check if we've exceeded max consecutive errors
+          if (this.consecutiveErrorCount >= MAX_CONSECUTIVE_ERRORS) {
+            logger.error('Max consecutive errors reached, failing', {
+              runId: this.state.run_id,
+              count: this.consecutiveErrorCount,
+            });
+            this.state.phase = 'failed';
+            this.state.error = `連続${MAX_CONSECUTIVE_ERRORS}回エラーが発生したため終了: ${errorMsg}`;
+            break;
+          }
+
+          // Add error to messages
+          this.addMessage({
+            role: 'user',
+            content: `エラーが発生しました (${this.consecutiveErrorCount}/${MAX_CONSECUTIVE_ERRORS}): ${errorMsg}\n\n回復可能であれば続行、不可能であればfailを呼んでください。`,
+          });
+        }
       }
+
+      // Handle timeout
+      if (this.abortController.signal.aborted && this.state.phase !== 'completed') {
+        this.state.phase = 'failed';
+        this.state.error = `タイムアウト (${Math.round(this.timeoutMs / 60000)}分) に達しました`;
+      }
+    } finally {
+      clearTimeout(timeoutId);
     }
 
     return this.state;
   }
 
   /**
+   * Cancel the running agent
+   */
+  cancel(reason?: string): void {
+    logger.info('Agent cancelled', { runId: this.state.run_id, reason });
+    this.abortController.abort();
+    this.state.phase = 'failed';
+    this.state.error = reason ?? 'Cancelled by user';
+    this.state.updated_at = new Date().toISOString();
+    this.events.onStateChange?.(this.state);
+  }
+
+  /**
+   * Restart the agent from failed/completed state
+   * Preserves conversation history and continues execution
+   */
+  async restart(): Promise<SupervisorState> {
+    // Only allow restart from terminal states
+    if (!this.canRestart()) {
+      logger.warn('Cannot restart agent that is not in terminal state', {
+        runId: this.state.run_id,
+        phase: this.state.phase,
+      });
+      return this.state;
+    }
+
+    logger.info('Restarting agent', {
+      runId: this.state.run_id,
+      previousPhase: this.state.phase,
+      previousError: this.state.error,
+    });
+
+    // Reset state for restart
+    this.abortController = new AbortController();
+    this.consecutiveErrorCount = 0;
+    this.noToolResponseCount = 0;
+    this.state.phase = 'dispatching';
+    this.state.error = undefined;
+    this.state.updated_at = new Date().toISOString();
+
+    // Add restart message to conversation
+    this.addMessage({
+      role: 'user',
+      content: '[システム: エージェントが再開されました。前回の状態を確認し、未完了のタスクがあれば続行してください。完了していればcomplete()を呼んでください。]',
+    });
+
+    this.events.onStateChange?.(this.state);
+
+    // Set up overall timeout
+    const timeoutId = setTimeout(() => {
+      logger.warn('Agent timeout reached', {
+        runId: this.state.run_id,
+        timeoutMs: this.timeoutMs,
+      });
+      this.abortController.abort();
+    }, this.timeoutMs);
+
+    try {
+      // Resume main agent loop - use isTerminal() to avoid TypeScript narrowing issues
+      while (!this.isTerminal() && !this.abortController.signal.aborted) {
+        logger.info('Supervisor step (restart)', {
+          runId: this.state.run_id,
+          phase: this.state.phase,
+        });
+
+        try {
+          await this.step();
+          this.consecutiveErrorCount = 0;
+        } catch (error) {
+          this.consecutiveErrorCount++;
+          const errorMsg = error instanceof Error ? error.message : String(error);
+          logger.error('Supervisor step failed', {
+            runId: this.state.run_id,
+            error: errorMsg,
+            consecutiveErrors: this.consecutiveErrorCount,
+          });
+
+          if (this.consecutiveErrorCount >= MAX_CONSECUTIVE_ERRORS) {
+            logger.error('Max consecutive errors reached, failing', {
+              runId: this.state.run_id,
+              count: this.consecutiveErrorCount,
+            });
+            this.state.phase = 'failed';
+            this.state.error = `連続${MAX_CONSECUTIVE_ERRORS}回エラーが発生したため終了: ${errorMsg}`;
+            break;
+          }
+
+          this.addMessage({
+            role: 'user',
+            content: `エラーが発生しました (${this.consecutiveErrorCount}/${MAX_CONSECUTIVE_ERRORS}): ${errorMsg}\n\n回復可能であれば続行、不可能であればfailを呼んでください。`,
+          });
+        }
+      }
+
+      if (this.abortController.signal.aborted && !this.isCompleted()) {
+        this.state.phase = 'failed';
+        this.state.error = `タイムアウト (${Math.round(this.timeoutMs / 60000)}分) に達しました`;
+      }
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
+    return this.state;
+  }
+
+  /**
+   * Check if agent is in terminal state (completed or failed)
+   */
+  private isTerminal(): boolean {
+    return this.state.phase === 'completed' || this.state.phase === 'failed';
+  }
+
+  /**
+   * Check if agent completed successfully
+   */
+  private isCompleted(): boolean {
+    return this.state.phase === 'completed';
+  }
+
+  /**
+   * Check if agent can be restarted
+   */
+  canRestart(): boolean {
+    return this.state.phase === 'failed' || this.state.phase === 'completed';
+  }
+
+  /**
+   * Manage context length by summarizing old messages if needed
+   */
+  private async manageContextLength(): Promise<void> {
+    let summarizationAttempts = 0;
+    const maxContextTokens = getMaxContextTokens();
+
+    while (summarizationAttempts < MAX_SUMMARIZATION_ATTEMPTS) {
+      const totalTokens = this.state.messages.reduce(
+        (sum, m) => sum + countTokens(m.content),
+        0
+      );
+
+      if (totalTokens <= maxContextTokens) {
+        return; // Context is within limits
+      }
+
+      summarizationAttempts++;
+      logger.info('Context length exceeded, summarizing old messages', {
+        runId: this.state.run_id,
+        totalTokens,
+        maxTokens: maxContextTokens,
+        attempt: summarizationAttempts,
+      });
+
+      // Keep system message and last N messages (reduce on subsequent attempts)
+      const keepRecentCount = Math.max(5, 20 - (summarizationAttempts - 1) * 5);
+      const systemMessage = this.state.messages.find(m => m.role === 'system');
+      const recentMessages = this.state.messages.slice(-keepRecentCount);
+      const oldMessages = this.state.messages.slice(
+        systemMessage ? 1 : 0,
+        -keepRecentCount
+      );
+
+      if (oldMessages.length === 0) {
+        // Nothing left to summarize, truncate recent messages if still too long
+        logger.warn('No old messages to summarize, context may be too long', {
+          runId: this.state.run_id,
+          totalTokens,
+        });
+        return;
+      }
+
+      // Create summary of old messages
+      const summary = await this.summarizeMessages(oldMessages);
+
+      this.state.messages = [
+        ...(systemMessage ? [systemMessage] : []),
+        {
+          role: 'user' as const,
+          content: `[これまでの会話の要約]\n${summary}\n\n[要約ここまで - 以下は最近の会話です]`,
+        },
+        ...recentMessages.filter(m => m.role !== 'system'),
+      ];
+
+      logger.info('Context summarized', {
+        runId: this.state.run_id,
+        summarizedMessages: oldMessages.length,
+        remainingMessages: this.state.messages.length,
+        attempt: summarizationAttempts,
+      });
+    }
+
+    // If we've reached max attempts and still over limit, log warning
+    const finalTokens = this.state.messages.reduce(
+      (sum, m) => sum + countTokens(m.content),
+      0
+    );
+    if (finalTokens > maxContextTokens) {
+      logger.warn('Context still exceeds limit after max summarization attempts', {
+        runId: this.state.run_id,
+        finalTokens,
+        maxTokens: maxContextTokens,
+      });
+    }
+  }
+
+  /**
+   * Summarize a list of messages using the LLM
+   */
+  private async summarizeMessages(messages: SupervisorMessage[]): Promise<string> {
+    const model = getDAGModel();
+
+    // Build content to summarize
+    const content = messages.map(m => {
+      const role = m.role === 'assistant' ? 'Supervisor' : m.role === 'tool' ? 'Tool Result' : 'User';
+      const text = m.content.slice(0, 500); // Truncate long messages for summary
+      return `[${role}]: ${text}`;
+    }).join('\n\n');
+
+    try {
+      const response = await this.openai.chat.completions.create({
+        model,
+        messages: [
+          {
+            role: 'system',
+            content: 'あなたは会話要約アシスタントです。与えられた会話履歴を簡潔に要約してください。重要な決定事項、実行されたタスク、発生したエラー、現在の状態を含めてください。',
+          },
+          {
+            role: 'user',
+            content: `以下の会話を要約してください:\n\n${content}`,
+          },
+        ],
+        max_tokens: 1000,
+      });
+
+      return response.choices[0]?.message?.content ?? '(要約を生成できませんでした)';
+    } catch (error) {
+      logger.error('Failed to summarize messages', {
+        runId: this.state.run_id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // Fallback to simple summary
+      return `${messages.length}件のメッセージを要約できませんでした。実行されたWorkerタスク数: ${this.state.completed_tasks.length}`;
+    }
+  }
+
+  /**
+   * Call OpenAI API with retry logic
+   */
+  private async callOpenAIWithRetry(
+    messages: OpenAI.ChatCompletionMessageParam[],
+    model: string
+  ): Promise<OpenAI.Chat.Completions.ChatCompletion> {
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt < MAX_API_RETRIES; attempt++) {
+      try {
+        const response = await this.openai.chat.completions.create({
+          model,
+          messages,
+          tools: SUPERVISOR_TOOLS.map((t) => ({
+            type: t.type as 'function',
+            function: {
+              name: t.function.name,
+              description: t.function.description,
+              parameters: t.function.parameters as OpenAI.FunctionParameters,
+            },
+          })),
+          tool_choice: 'auto',
+        });
+        return response;
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+
+        if (!isRetryableError(error) || attempt === MAX_API_RETRIES - 1) {
+          throw lastError;
+        }
+
+        const delay = BASE_RETRY_DELAY_MS * Math.pow(2, attempt);
+        logger.warn('API call failed, retrying', {
+          runId: this.state.run_id,
+          attempt: attempt + 1,
+          maxRetries: MAX_API_RETRIES,
+          delay,
+          error: lastError.message,
+        });
+
+        await sleep(delay);
+      }
+    }
+
+    throw lastError ?? new Error('API call failed');
+  }
+
+  /**
    * Execute one step of the agent loop
    */
   private async step(): Promise<void> {
+    // Manage context length before API call
+    await this.manageContextLength();
+
     // Get model from settings
     const model = getDAGModel();
 
     // Convert messages to proper OpenAI format
-    const messages: OpenAI.ChatCompletionMessageParam[] = this.state.messages.map((m) => {
-      if (m.role === 'system') {
-        return { role: 'system' as const, content: m.content };
-      } else if (m.role === 'user') {
-        return { role: 'user' as const, content: m.content };
-      } else if (m.role === 'tool') {
-        return {
-          role: 'tool' as const,
-          content: m.content,
-          tool_call_id: m.tool_call_id || '',
-        };
-      } else {
-        // assistant
-        return {
-          role: 'assistant' as const,
-          content: m.content,
-          tool_calls: m.tool_calls?.map((tc) => ({
-            id: tc.id,
-            type: 'function' as const,
-            function: tc.function,
-          })),
-        };
-      }
-    });
+    const messages: OpenAI.ChatCompletionMessageParam[] = this.state.messages
+      .filter((m) => {
+        // Filter out tool messages without valid tool_call_id
+        if (m.role === 'tool' && !m.tool_call_id) {
+          logger.warn('Skipping tool message without tool_call_id', {
+            runId: this.state.run_id,
+          });
+          return false;
+        }
+        return true;
+      })
+      .map((m) => {
+        if (m.role === 'system') {
+          return { role: 'system' as const, content: m.content };
+        } else if (m.role === 'user') {
+          return { role: 'user' as const, content: m.content };
+        } else if (m.role === 'tool') {
+          return {
+            role: 'tool' as const,
+            content: m.content,
+            tool_call_id: m.tool_call_id!, // Already filtered above
+          };
+        } else {
+          // assistant
+          return {
+            role: 'assistant' as const,
+            content: m.content,
+            tool_calls: m.tool_calls?.map((tc) => ({
+              id: tc.id,
+              type: 'function' as const,
+              function: tc.function,
+            })),
+          };
+        }
+      });
 
     logger.debug('Calling OpenAI API', {
       runId: this.state.run_id,
@@ -252,23 +701,36 @@ export class SupervisorAgent {
       messageCount: messages.length,
     });
 
-    const response = await this.openai.chat.completions.create({
-      model,
-      messages,
-      tools: SUPERVISOR_TOOLS.map((t) => ({
-        type: t.type as 'function',
-        function: {
-          name: t.function.name,
-          description: t.function.description,
-          parameters: t.function.parameters as OpenAI.FunctionParameters,
-        },
-      })),
-      tool_choice: 'auto',
-    });
+    // Call API with retry
+    const response = await this.callOpenAIWithRetry(messages, model);
 
     const choice = response.choices[0];
     if (!choice?.message) {
       throw new Error('No response from model');
+    }
+
+    // Check finish_reason
+    if (choice.finish_reason === 'length') {
+      logger.warn('Response truncated due to token limit', {
+        runId: this.state.run_id,
+      });
+      // Add message to inform the LLM
+      this.addMessage({
+        role: 'user',
+        content: '[システム: 前回の応答がトークン制限で切れました。簡潔に続けてください。]',
+      });
+      return;
+    }
+
+    if (choice.finish_reason === 'content_filter') {
+      logger.warn('Response blocked by content filter', {
+        runId: this.state.run_id,
+      });
+      this.addMessage({
+        role: 'user',
+        content: '[システム: コンテンツフィルターにより応答がブロックされました。別のアプローチを試してください。]',
+      });
+      return;
     }
 
     const assistantMessage = choice.message;
@@ -295,7 +757,24 @@ export class SupervisorAgent {
 
     // Execute tool calls if any
     if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
+      this.noToolResponseCount = 0;  // Reset counter
       await this.executeToolCalls(assistantMessage.tool_calls);
+    } else {
+      // No tool calls - LLM just responded with text
+      this.noToolResponseCount++;
+
+      if (this.noToolResponseCount >= MAX_NO_TOOL_RESPONSES) {
+        logger.warn('Multiple responses without tool calls', {
+          runId: this.state.run_id,
+          count: this.noToolResponseCount,
+        });
+
+        // Remind the LLM to use tools
+        this.addMessage({
+          role: 'user',
+          content: `[システム: ${this.noToolResponseCount}回連続でツールが呼ばれていません。タスクを進めるにはツールを使用してください。完了した場合はcomplete()を、問題がある場合はfail()を呼んでください。]`,
+        });
+      }
     }
   }
 
@@ -398,12 +877,6 @@ export class SupervisorAgent {
 // Factory Function
 // =============================================================================
 
-export function createSupervisorAgent(options: {
-  repoPath: string;
-  userGoal: string;
-  config?: Partial<SupervisorConfig>;
-  events?: SupervisorAgentEvents;
-  workerExecutor?: (tasks: WorkerTask[]) => Promise<WorkerTaskResult[]>;
-}): SupervisorAgent {
+export function createSupervisorAgent(options: SupervisorAgentOptions): SupervisorAgent {
   return new SupervisorAgent(options);
 }

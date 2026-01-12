@@ -18,6 +18,7 @@ import {
   type WorkerTask,
   type WorkerTaskResult,
 } from '../supervisor/index.js';
+import { agentStore } from '../supervisor/agent-store.js';
 import { WorkerPool, createWorkerPool } from '../workers/index.js';
 import { log as eventLog } from '../services/event-bus.js';
 import { logger } from '../services/logger.js';
@@ -82,7 +83,7 @@ async function supervisorNode(
   eventLog(state.run_id, 'info', 'supervisor', '🧠 Starting Supervisor Agent');
 
   // Create worker executor function that uses the worker pool
-  const workerExecutor = async (tasks: WorkerTask[]): Promise<WorkerTaskResult[]> => {
+  const workerExecutor = async (tasks: WorkerTask[], signal?: AbortSignal): Promise<WorkerTaskResult[]> => {
     const results: WorkerTaskResult[] = [];
     const executorMode = getExecutorMode();
 
@@ -101,6 +102,21 @@ async function supervisorNode(
 
       // Execute each task
       for (const task of tasks) {
+        // Check for abort signal
+        if (signal?.aborted) {
+          logger.info('Worker execution aborted by signal', { taskId: task.task_id });
+          results.push({
+            task_id: task.task_id,
+            instruction: task.instruction,
+            executor: task.executor,
+            success: false,
+            error: 'Aborted',
+            duration_ms: 0,
+            completed_at: new Date().toISOString(),
+          });
+          continue;
+        }
+
         const startTime = Date.now();
         eventLog(state.run_id, 'info', 'codex', `▶ Starting: ${task.instruction.slice(0, 50)}...`);
 
@@ -188,6 +204,9 @@ async function supervisorNode(
     },
     workerExecutor,
   });
+
+  // Store agent instance for potential restart
+  agentStore.set(state.run_id, agent);
 
   const finalState = await agent.run();
 

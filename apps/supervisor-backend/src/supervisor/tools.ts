@@ -3,13 +3,132 @@
  * Tools available to the Supervisor Agent for orchestrating work
  */
 
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'node:fs';
-import { join, relative, dirname } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, lstatSync } from 'node:fs';
+import { join, relative, dirname, resolve, normalize } from 'node:path';
 import { execSync } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
-import type { ToolDefinition, WorkerTask } from './types.js';
+import type { ToolDefinition, WorkerTask, WorkerTaskResult } from './types.js';
 import { createTaskId } from '@supervisor/protocol';
 import { logger } from '../services/logger.js';
+
+/** Binary file extensions to skip reading as text */
+const BINARY_EXTENSIONS = new Set([
+  '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.svg',
+  '.mp3', '.mp4', '.wav', '.avi', '.mov', '.webm',
+  '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+  '.zip', '.tar', '.gz', '.7z', '.rar',
+  '.exe', '.dll', '.so', '.dylib',
+  '.woff', '.woff2', '.ttf', '.eot',
+  '.bin', '.dat', '.db', '.sqlite',
+]);
+
+// =============================================================================
+// Security Utilities
+// =============================================================================
+
+/**
+ * Validate that a path is within the allowed root directory (prevent path traversal)
+ */
+function validatePath(rootPath: string, relativePath: string): { valid: boolean; fullPath: string; error?: string } {
+  const normalizedRoot = resolve(rootPath);
+  const fullPath = resolve(rootPath, relativePath);
+  const normalizedFull = normalize(fullPath);
+
+  // Check if the resolved path starts with the root (case-insensitive on Windows)
+  const isWindows = process.platform === 'win32';
+  const rootCheck = isWindows ? normalizedRoot.toLowerCase() : normalizedRoot;
+  const fullCheck = isWindows ? normalizedFull.toLowerCase() : normalizedFull;
+
+  if (!fullCheck.startsWith(rootCheck)) {
+    return {
+      valid: false,
+      fullPath: '',
+      error: `Path traversal detected: ${relativePath} resolves outside repository`,
+    };
+  }
+
+  return { valid: true, fullPath: normalizedFull };
+}
+
+/**
+ * Check if a file is likely binary based on extension
+ */
+function isBinaryFile(filePath: string): boolean {
+  const ext = filePath.slice(filePath.lastIndexOf('.')).toLowerCase();
+  return BINARY_EXTENSIONS.has(ext);
+}
+
+/**
+ * Check if a path is a symlink
+ */
+function isSymlink(filePath: string): boolean {
+  try {
+    return lstatSync(filePath).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Validate tool arguments
+ */
+function validateArgs<T extends Record<string, unknown>>(
+  args: Record<string, unknown>,
+  schema: { [K in keyof T]: { type: string; required?: boolean } }
+): { valid: boolean; error?: string; validated: Partial<T> } {
+  const validated: Partial<T> = {};
+
+  for (const [key, spec] of Object.entries(schema)) {
+    const value = args[key];
+
+    if (spec.required && (value === undefined || value === null)) {
+      return { valid: false, error: `Missing required argument: ${key}`, validated: {} };
+    }
+
+    if (value !== undefined && value !== null) {
+      const actualType = Array.isArray(value) ? 'array' : typeof value;
+      if (actualType !== spec.type) {
+        return {
+          valid: false,
+          error: `Invalid type for ${key}: expected ${spec.type}, got ${actualType}`,
+          validated: {},
+        };
+      }
+      (validated as Record<string, unknown>)[key] = value;
+    }
+  }
+
+  return { valid: true, validated };
+}
+
+/**
+ * Validate command for shell execution
+ * Commands are now allowed by default - only basic sanity checks
+ */
+function validateCommand(command: string): { valid: boolean; error?: string } {
+  // Only reject completely empty commands
+  if (!command || command.trim().length === 0) {
+    return { valid: false, error: 'Command cannot be empty' };
+  }
+
+  // Warn about commands that might hang waiting for input
+  const interactivePatterns = [
+    /\bsudo\s/,    // sudo might prompt for password
+    /\bpasswd\b/,  // password change
+    /\bvi\b/,      // vi editor
+    /\bvim\b/,     // vim editor
+    /\bnano\b/,    // nano editor
+    /\bemacs\b/,   // emacs editor
+  ];
+
+  for (const pattern of interactivePatterns) {
+    if (pattern.test(command)) {
+      logger.warn('Command may require interactive input', { command: command.slice(0, 50) });
+    }
+  }
+
+  return { valid: true };
+}
 
 // =============================================================================
 // Tool Definitions (OpenAI Function Calling Format)
@@ -209,6 +328,27 @@ export const SUPERVISOR_TOOLS: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'get_task_output',
+      description: '実行中のWorkerタスクの途中経過（出力ログ）を取得。タスクが長時間実行中の場合に進捗を確認するために使用。',
+      parameters: {
+        type: 'object',
+        properties: {
+          task_id: {
+            type: 'string',
+            description: '確認するタスクID',
+          },
+          tail_lines: {
+            type: 'number',
+            description: '取得する最新行数（デフォルト: 50）',
+          },
+        },
+        required: ['task_id'],
+      },
+    },
+  },
 
   // コマンド実行
   {
@@ -298,36 +438,64 @@ export interface ToolResult {
   error?: string;
 }
 
+// Callbacks for state tracking
+export interface ToolExecutorCallbacks {
+  onWorkerStart?: (task: WorkerTask) => void;
+  onWorkerComplete?: (result: WorkerTaskResult) => void;
+  onCancel?: () => void;
+}
+
 // Async task tracking
 interface AsyncTask {
   task: WorkerTask;
-  promise: Promise<unknown>;
+  promise: Promise<WorkerTaskResult>;
+  abortController: AbortController;
   status: 'running' | 'completed' | 'failed' | 'cancelled';
-  result?: unknown;
+  result?: WorkerTaskResult;
   error?: string;
   startedAt: string;
   completedAt?: string;
+  /** Output logs for progress checking */
+  outputLogs: string[];
 }
+
+/** Maximum number of completed tasks to keep in memory */
+const MAX_COMPLETED_TASKS = 100;
 
 export class ToolExecutor {
   private asyncTasks: Map<string, AsyncTask> = new Map();
-  private workerExecutor?: (tasks: WorkerTask[]) => Promise<unknown[]>;
-  private onCancel?: () => void;
+  private workerExecutor?: (tasks: WorkerTask[], signal?: AbortSignal) => Promise<WorkerTaskResult[]>;
+  private callbacks: ToolExecutorCallbacks = {};
 
   constructor(private ctx: ToolExecutorContext) {}
 
   /**
    * Set the worker executor function
    */
-  setWorkerExecutor(executor: (tasks: WorkerTask[]) => Promise<unknown[]>): void {
+  setWorkerExecutor(executor: (tasks: WorkerTask[], signal?: AbortSignal) => Promise<WorkerTaskResult[]>): void {
     this.workerExecutor = executor;
   }
 
   /**
-   * Set cancel callback
+   * Set callbacks for state tracking
    */
-  setOnCancel(callback: () => void): void {
-    this.onCancel = callback;
+  setCallbacks(callbacks: ToolExecutorCallbacks): void {
+    this.callbacks = callbacks;
+  }
+
+  /**
+   * Auto-cleanup old completed tasks to prevent memory leaks
+   */
+  private cleanupOldTasks(): void {
+    const completed = Array.from(this.asyncTasks.entries())
+      .filter(([, task]) => task.status !== 'running')
+      .sort((a, b) => (a[1].completedAt ?? '').localeCompare(b[1].completedAt ?? ''));
+
+    // Keep only the most recent MAX_COMPLETED_TASKS
+    while (completed.length > MAX_COMPLETED_TASKS) {
+      const [taskId] = completed.shift()!;
+      this.asyncTasks.delete(taskId);
+    }
   }
 
   async execute(name: string, args: Record<string, unknown>): Promise<ToolResult> {
@@ -335,56 +503,111 @@ export class ToolExecutor {
 
     try {
       switch (name) {
-        case 'read_file':
-          return this.readFile(args['path'] as string);
+        case 'read_file': {
+          const v = validateArgs(args, { path: { type: 'string', required: true } });
+          if (!v.valid) return { success: false, error: v.error };
+          return this.readFile(v.validated.path as string);
+        }
 
-        case 'edit_file':
+        case 'edit_file': {
+          const v = validateArgs(args, {
+            path: { type: 'string', required: true },
+            old_string: { type: 'string', required: true },
+            new_string: { type: 'string', required: true },
+          });
+          if (!v.valid) return { success: false, error: v.error };
           return this.editFile(
-            args['path'] as string,
-            args['old_string'] as string,
-            args['new_string'] as string
+            v.validated.path as string,
+            v.validated.old_string as string,
+            v.validated.new_string as string
           );
+        }
 
-        case 'list_files':
+        case 'list_files': {
+          const v = validateArgs(args, {
+            path: { type: 'string' },
+            recursive: { type: 'boolean' },
+          });
+          if (!v.valid) return { success: false, error: v.error };
           return this.listFiles(
-            (args['path'] as string) ?? '.',
-            (args['recursive'] as boolean) ?? false
+            (v.validated.path as string) ?? '.',
+            (v.validated.recursive as boolean) ?? false
           );
+        }
 
-        case 'spawn_workers':
-          return await this.spawnWorkers(args['tasks'] as Array<{
+        case 'spawn_workers': {
+          const v = validateArgs(args, { tasks: { type: 'array', required: true } });
+          if (!v.valid) return { success: false, error: v.error };
+          return await this.spawnWorkers(v.validated.tasks as Array<{
             instruction: string;
             executor: 'claude' | 'codex';
             context?: string;
           }>);
+        }
 
-        case 'spawn_workers_async':
-          return this.spawnWorkersAsync(args['tasks'] as Array<{
+        case 'spawn_workers_async': {
+          const v = validateArgs(args, { tasks: { type: 'array', required: true } });
+          if (!v.valid) return { success: false, error: v.error };
+          return this.spawnWorkersAsync(v.validated.tasks as Array<{
             instruction: string;
             executor: 'claude' | 'codex';
             context?: string;
           }>);
+        }
 
-        case 'wait_workers':
-          return await this.waitWorkers(args['task_ids'] as string[] | undefined);
+        case 'wait_workers': {
+          const v = validateArgs(args, { task_ids: { type: 'array' } });
+          if (!v.valid) return { success: false, error: v.error };
+          return await this.waitWorkers(v.validated.task_ids as string[] | undefined);
+        }
 
-        case 'get_worker_status':
-          return this.getWorkerStatus(args['task_ids'] as string[] | undefined);
+        case 'get_worker_status': {
+          const v = validateArgs(args, { task_ids: { type: 'array' } });
+          if (!v.valid) return { success: false, error: v.error };
+          return this.getWorkerStatus(v.validated.task_ids as string[] | undefined);
+        }
 
-        case 'cancel_worker':
-          return this.cancelWorker(args['task_id'] as string);
+        case 'cancel_worker': {
+          const v = validateArgs(args, { task_id: { type: 'string', required: true } });
+          if (!v.valid) return { success: false, error: v.error };
+          return this.cancelWorker(v.validated.task_id as string);
+        }
 
-        case 'run_command':
-          return this.runCommand(args['command'] as string);
+        case 'get_task_output': {
+          const v = validateArgs(args, {
+            task_id: { type: 'string', required: true },
+            tail_lines: { type: 'number' },
+          });
+          if (!v.valid) return { success: false, error: v.error };
+          return this.getTaskOutput(
+            v.validated.task_id as string,
+            (v.validated.tail_lines as number) ?? 50
+          );
+        }
 
-        case 'complete':
-          return this.complete(args['summary'] as string);
+        case 'run_command': {
+          const v = validateArgs(args, { command: { type: 'string', required: true } });
+          if (!v.valid) return { success: false, error: v.error };
+          return this.runCommand(v.validated.command as string);
+        }
 
-        case 'fail':
-          return this.fail(args['reason'] as string);
+        case 'complete': {
+          const v = validateArgs(args, { summary: { type: 'string', required: true } });
+          if (!v.valid) return { success: false, error: v.error };
+          return this.complete(v.validated.summary as string);
+        }
 
-        case 'cancel':
-          return this.cancel(args['reason'] as string);
+        case 'fail': {
+          const v = validateArgs(args, { reason: { type: 'string', required: true } });
+          if (!v.valid) return { success: false, error: v.error };
+          return this.fail(v.validated.reason as string);
+        }
+
+        case 'cancel': {
+          const v = validateArgs(args, { reason: { type: 'string', required: true } });
+          if (!v.valid) return { success: false, error: v.error };
+          return this.cancel(v.validated.reason as string);
+        }
 
         default:
           return { success: false, error: `Unknown tool: ${name}` };
@@ -401,14 +624,32 @@ export class ToolExecutor {
   // ===========================================================================
 
   private readFile(path: string): ToolResult {
-    const fullPath = join(this.ctx.repoPath, path);
+    // Validate path to prevent traversal
+    const pathCheck = validatePath(this.ctx.repoPath, path);
+    if (!pathCheck.valid) {
+      return { success: false, error: pathCheck.error };
+    }
 
-    if (!existsSync(fullPath)) {
+    if (!existsSync(pathCheck.fullPath)) {
       return { success: false, error: `File not found: ${path}` };
     }
 
+    // Check for symlink
+    if (isSymlink(pathCheck.fullPath)) {
+      return { success: false, error: `Cannot read symlink: ${path}` };
+    }
+
+    // Check for binary file
+    if (isBinaryFile(pathCheck.fullPath)) {
+      const stat = statSync(pathCheck.fullPath);
+      return {
+        success: true,
+        result: `[Binary file: ${path}, size: ${stat.size} bytes]`,
+      };
+    }
+
     try {
-      const content = readFileSync(fullPath, 'utf-8');
+      const content = readFileSync(pathCheck.fullPath, 'utf-8');
       const maxSize = 50000;
       const truncated = content.length > maxSize
         ? content.slice(0, maxSize) + '\n\n... (truncated)'
@@ -416,48 +657,75 @@ export class ToolExecutor {
 
       return { success: true, result: truncated };
     } catch (error) {
+      // Might be binary despite extension check
+      const stat = statSync(pathCheck.fullPath);
+      if (stat.size > 0) {
+        return {
+          success: true,
+          result: `[Unreadable file (possibly binary): ${path}, size: ${stat.size} bytes]`,
+        };
+      }
       return { success: false, error: `Failed to read file: ${error}` };
     }
   }
 
   private editFile(path: string, oldString: string, newString: string): ToolResult {
-    const fullPath = join(this.ctx.repoPath, path);
+    // Validate path to prevent traversal
+    const pathCheck = validatePath(this.ctx.repoPath, path);
+    if (!pathCheck.valid) {
+      return { success: false, error: pathCheck.error };
+    }
 
     try {
       // 新規作成の場合
       if (oldString === '') {
-        const dir = dirname(fullPath);
+        const dir = dirname(pathCheck.fullPath);
+        // Also validate directory path
+        const dirCheck = validatePath(this.ctx.repoPath, relative(this.ctx.repoPath, dir));
+        if (!dirCheck.valid) {
+          return { success: false, error: dirCheck.error };
+        }
+
         if (!existsSync(dir)) {
           mkdirSync(dir, { recursive: true });
         }
-        writeFileSync(fullPath, newString, 'utf-8');
+        writeFileSync(pathCheck.fullPath, newString, 'utf-8');
         return { success: true, result: { action: 'created', path } };
       }
 
       // 既存ファイルの編集
-      if (!existsSync(fullPath)) {
+      if (!existsSync(pathCheck.fullPath)) {
         return { success: false, error: `File not found: ${path}` };
       }
 
-      const content = readFileSync(fullPath, 'utf-8');
+      const content = readFileSync(pathCheck.fullPath, 'utf-8');
 
       if (!content.includes(oldString)) {
         return { success: false, error: `String not found in file: "${oldString.slice(0, 50)}..."` };
       }
 
-      const newContent = content.replace(oldString, newString);
-      writeFileSync(fullPath, newContent, 'utf-8');
+      // Count replacements BEFORE replacing
+      const escapedOldString = oldString.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const replacements = (content.match(new RegExp(escapedOldString, 'g')) || []).length;
 
-      return { success: true, result: { action: 'edited', path } };
+      // Use replaceAll to replace all occurrences
+      const newContent = content.replaceAll(oldString, newString);
+      writeFileSync(pathCheck.fullPath, newContent, 'utf-8');
+
+      return { success: true, result: { action: 'edited', path, replacements } };
     } catch (error) {
       return { success: false, error: `Failed to edit file: ${error}` };
     }
   }
 
   private listFiles(path: string, recursive: boolean): ToolResult {
-    const fullPath = join(this.ctx.repoPath, path);
+    // Validate path to prevent traversal
+    const pathCheck = validatePath(this.ctx.repoPath, path);
+    if (!pathCheck.valid) {
+      return { success: false, error: pathCheck.error };
+    }
 
-    if (!existsSync(fullPath)) {
+    if (!existsSync(pathCheck.fullPath)) {
       return { success: false, error: `Directory not found: ${path}` };
     }
 
@@ -479,7 +747,15 @@ export class ToolExecutor {
 
           const entryPath = join(dir, entry);
           const relativePath = relative(this.ctx.repoPath, entryPath);
-          const stat = statSync(entryPath);
+
+          // Use lstatSync to not follow symlinks
+          const stat = lstatSync(entryPath);
+
+          // Skip symlinks for security
+          if (stat.isSymbolicLink()) {
+            files.push(relativePath + ' -> [symlink]');
+            continue;
+          }
 
           if (stat.isDirectory()) {
             files.push(relativePath + '/');
@@ -492,7 +768,7 @@ export class ToolExecutor {
         }
       };
 
-      walk(fullPath, 0);
+      walk(pathCheck.fullPath, 0);
 
       return { success: true, result: files };
     } catch (error) {
@@ -527,17 +803,30 @@ export class ToolExecutor {
       runId: this.ctx.runId,
     });
 
+    // Notify worker start
+    for (const task of workerTasks) {
+      this.callbacks.onWorkerStart?.(task);
+    }
+
     try {
       // Execute all tasks and wait for completion
       const results = await this.workerExecutor(workerTasks);
 
-      const taskResults = workerTasks.map((task, index) => ({
-        task_id: task.task_id,
-        instruction: task.instruction,
-        executor: task.executor,
-        result: results[index],
-        status: 'completed' as const,
-      }));
+      // Notify worker complete and build response
+      const taskResults = workerTasks.map((task, index) => {
+        const result = results[index];
+        if (result) {
+          this.callbacks.onWorkerComplete?.(result);
+        }
+        return {
+          task_id: task.task_id,
+          instruction: task.instruction.slice(0, 100),
+          executor: task.executor,
+          success: result?.success ?? false,
+          summary: result?.summary,
+          error: result?.error,
+        };
+      });
 
       return {
         success: true,
@@ -581,33 +870,67 @@ export class ToolExecutor {
     const taskIds: string[] = [];
 
     for (const task of workerTasks) {
-      const promise = this.workerExecutor([task]).then(results => {
-        const asyncTask = this.asyncTasks.get(task.task_id);
-        if (asyncTask) {
-          asyncTask.status = 'completed';
-          asyncTask.result = results[0];
-          asyncTask.completedAt = new Date().toISOString();
-        }
-        return results[0];
-      }).catch(error => {
-        const asyncTask = this.asyncTasks.get(task.task_id);
-        if (asyncTask) {
-          asyncTask.status = 'failed';
-          asyncTask.error = error instanceof Error ? error.message : String(error);
-          asyncTask.completedAt = new Date().toISOString();
-        }
-        throw error;
-      });
+      const abortController = new AbortController();
+
+      // Notify worker start
+      this.callbacks.onWorkerStart?.(task);
+
+      const promise: Promise<WorkerTaskResult> = this.workerExecutor([task], abortController.signal)
+        .then(results => {
+          const result = results[0];
+          const asyncTask = this.asyncTasks.get(task.task_id);
+          if (asyncTask && asyncTask.status === 'running') {
+            asyncTask.status = 'completed';
+            asyncTask.result = result;
+            asyncTask.completedAt = new Date().toISOString();
+            // Notify worker complete
+            if (result) {
+              this.callbacks.onWorkerComplete?.(result);
+            }
+          }
+          return result ?? {
+            task_id: task.task_id,
+            instruction: task.instruction,
+            executor: task.executor,
+            success: false,
+            error: 'No result returned',
+            duration_ms: 0,
+            completed_at: new Date().toISOString(),
+          };
+        })
+        .catch(error => {
+          const asyncTask = this.asyncTasks.get(task.task_id);
+          if (asyncTask && asyncTask.status === 'running') {
+            asyncTask.status = 'failed';
+            asyncTask.error = error instanceof Error ? error.message : String(error);
+            asyncTask.completedAt = new Date().toISOString();
+          }
+          // Don't re-throw - let the error be captured in asyncTask
+          return {
+            task_id: task.task_id,
+            instruction: task.instruction,
+            executor: task.executor,
+            success: false,
+            error: error instanceof Error ? error.message : String(error),
+            duration_ms: 0,
+            completed_at: new Date().toISOString(),
+          };
+        });
 
       this.asyncTasks.set(task.task_id, {
         task,
         promise,
+        abortController,
         status: 'running',
         startedAt: new Date().toISOString(),
+        outputLogs: [],
       });
 
       taskIds.push(task.task_id);
     }
+
+    // Auto cleanup old tasks
+    this.cleanupOldTasks();
 
     logger.info('Spawning workers (async)', {
       count: workerTasks.length,
@@ -618,7 +941,6 @@ export class ToolExecutor {
     return {
       success: true,
       result: {
-        action: 'spawn_workers_async',
         task_ids: taskIds,
         message: `${taskIds.length}個のタスクを非同期で開始しました`,
       },
@@ -626,7 +948,10 @@ export class ToolExecutor {
   }
 
   private async waitWorkers(taskIds?: string[]): Promise<ToolResult> {
-    const idsToWait = taskIds ?? Array.from(this.asyncTasks.keys());
+    // Filter to only running tasks
+    const allTaskIds = Array.from(this.asyncTasks.keys());
+    const runningTaskIds = allTaskIds.filter(id => this.asyncTasks.get(id)?.status === 'running');
+    const idsToWait = taskIds ?? runningTaskIds;
 
     if (idsToWait.length === 0) {
       return { success: true, result: { tasks: [], message: '待機するタスクがありません' } };
@@ -635,7 +960,8 @@ export class ToolExecutor {
     const results: Array<{
       task_id: string;
       status: string;
-      result?: unknown;
+      success?: boolean;
+      summary?: string;
       error?: string;
     }> = [];
 
@@ -647,18 +973,17 @@ export class ToolExecutor {
       }
 
       if (asyncTask.status === 'running') {
-        try {
-          await asyncTask.promise;
-        } catch {
-          // Error already captured in asyncTask
-        }
+        // Wait for completion
+        await asyncTask.promise;
       }
 
+      // Get the final result
       results.push({
         task_id: id,
         status: asyncTask.status,
-        result: asyncTask.result,
-        error: asyncTask.error,
+        success: asyncTask.result?.success,
+        summary: asyncTask.result?.summary,
+        error: asyncTask.error ?? asyncTask.result?.error,
       });
     }
 
@@ -699,12 +1024,60 @@ export class ToolExecutor {
       return { success: false, error: `Task is not running: ${asyncTask.status}` };
     }
 
+    // Actually abort the task
+    asyncTask.abortController.abort();
     asyncTask.status = 'cancelled';
     asyncTask.completedAt = new Date().toISOString();
+    asyncTask.error = 'Cancelled by user';
 
     logger.info('Worker cancelled', { taskId, runId: this.ctx.runId });
 
     return { success: true, result: { task_id: taskId, status: 'cancelled' } };
+  }
+
+  private getTaskOutput(taskId: string, tailLines: number): ToolResult {
+    const asyncTask = this.asyncTasks.get(taskId);
+
+    if (!asyncTask) {
+      return { success: false, error: `Task not found: ${taskId}` };
+    }
+
+    const logs = asyncTask.outputLogs;
+    const totalLines = logs.length;
+    const startIndex = Math.max(0, totalLines - tailLines);
+    const recentLogs = logs.slice(startIndex);
+
+    return {
+      success: true,
+      result: {
+        task_id: taskId,
+        status: asyncTask.status,
+        instruction: asyncTask.task.instruction.slice(0, 100),
+        started_at: asyncTask.startedAt,
+        elapsed_ms: asyncTask.completedAt
+          ? new Date(asyncTask.completedAt).getTime() - new Date(asyncTask.startedAt).getTime()
+          : Date.now() - new Date(asyncTask.startedAt).getTime(),
+        total_log_lines: totalLines,
+        showing_lines: recentLogs.length,
+        output: recentLogs.join('\n'),
+      },
+    };
+  }
+
+  /**
+   * Add output log to a task (called by worker execution)
+   */
+  addTaskOutput(taskId: string, output: string): void {
+    const asyncTask = this.asyncTasks.get(taskId);
+    if (asyncTask) {
+      // Split by lines and add
+      const lines = output.split('\n');
+      asyncTask.outputLogs.push(...lines);
+      // Keep only last 1000 lines to prevent memory issues
+      if (asyncTask.outputLogs.length > 1000) {
+        asyncTask.outputLogs = asyncTask.outputLogs.slice(-1000);
+      }
+    }
   }
 
   // ===========================================================================
@@ -712,10 +1085,10 @@ export class ToolExecutor {
   // ===========================================================================
 
   private runCommand(command: string): ToolResult {
-    const allowedCommands = ['npm', 'pnpm', 'yarn', 'node', 'git', 'ls', 'cat', 'pwd', 'echo', 'mkdir', 'cp', 'mv', 'rm'];
-    const firstWord = command.split(' ')[0];
-    if (!allowedCommands.some(cmd => firstWord === cmd || firstWord?.endsWith('/' + cmd))) {
-      return { success: false, error: `Command not allowed: ${firstWord}` };
+    // Validate command
+    const cmdCheck = validateCommand(command);
+    if (!cmdCheck.valid) {
+      return { success: false, error: cmdCheck.error };
     }
 
     try {
@@ -723,6 +1096,8 @@ export class ToolExecutor {
         cwd: this.ctx.repoPath,
         encoding: 'utf-8',
         maxBuffer: 10 * 1024 * 1024,
+        timeout: 300000, // 5 minute timeout
+        shell: process.platform === 'win32' ? 'cmd.exe' : '/bin/sh',
       });
 
       return {
@@ -733,7 +1108,10 @@ export class ToolExecutor {
         },
       };
     } catch (error) {
-      const execError = error as { status?: number; stdout?: string; stderr?: string };
+      const execError = error as { status?: number; stdout?: string; stderr?: string; killed?: boolean };
+      if (execError.killed) {
+        return { success: false, error: 'Command timed out after 5 minutes' };
+      }
       return {
         success: false,
         error: `Command failed (exit ${execError.status}): ${execError.stderr || execError.stdout}`.slice(0, 5000),
@@ -766,24 +1144,30 @@ export class ToolExecutor {
   }
 
   private cancel(reason: string): ToolResult {
-    // Cancel all running async tasks
+    const cancelledTaskIds: string[] = [];
+
+    // Cancel all running async tasks (actually abort them)
     for (const [taskId, asyncTask] of this.asyncTasks) {
       if (asyncTask.status === 'running') {
+        asyncTask.abortController.abort();
         asyncTask.status = 'cancelled';
         asyncTask.completedAt = new Date().toISOString();
+        asyncTask.error = `Cancelled: ${reason}`;
+        cancelledTaskIds.push(taskId);
       }
     }
 
     // Call cancel callback
-    this.onCancel?.();
+    this.callbacks.onCancel?.();
 
-    logger.info('Run cancelled', { reason, runId: this.ctx.runId });
+    logger.info('Run cancelled', { reason, cancelledTaskIds, runId: this.ctx.runId });
 
     return {
       success: true,
       result: {
         action: 'cancel',
         reason,
+        cancelled_tasks: cancelledTaskIds,
       },
     };
   }

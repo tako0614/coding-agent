@@ -9,6 +9,7 @@ import { createRunId } from '@supervisor/protocol';
 import { CreateRunRequestSchema, type RunListResponse } from '../types.js';
 import { runStore } from '../run-store.js';
 import { runSimplifiedSupervisor } from '../../graph/index.js';
+import { agentStore } from '../../supervisor/index.js';
 
 const runs = new Hono();
 
@@ -66,18 +67,9 @@ runs.post('/', async (c) => {
       console.log(`[API] Run ${runId} completed with status: ${finalState.status}`);
     }).catch(error => {
       console.error(`[API] Run ${runId} failed:`, error);
-      // Store error state so it shows up in the UI
-      runStore.set(runId, {
-        run_id: runId,
-        status: 'failed',
-        user_goal: request.goal,
-        repo_path: request.repo_path,
-        project_id: request.project_id,
-        error: error instanceof Error ? error.message : String(error),
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-        reports: [],
-      } as any);
+      // Store error state using markFailed to properly cleanup tracking
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      runStore.markFailed(runId, errorMsg);
     });
 
     return c.json({
@@ -229,6 +221,101 @@ runs.get('/:id/workers', (c) => {
       message: `Worker pool not found for run ${runId}`,
     },
   }, 404);
+});
+
+/**
+ * POST /api/runs/:id/restart
+ * Restart a failed or completed run
+ */
+runs.post('/:id/restart', async (c) => {
+  const runId = c.req.param('id');
+  console.log(`[API] POST /api/runs/${runId}/restart received`);
+
+  // Check if run is currently running
+  if (runStore.isRunning(runId)) {
+    return c.json({
+      error: {
+        message: `Run ${runId} is still running, cannot restart`,
+      },
+    }, 409);
+  }
+
+  // Get the agent instance
+  const agent = agentStore.get(runId);
+  if (!agent) {
+    return c.json({
+      error: {
+        message: `Agent instance not found for run ${runId}. Cannot restart - please create a new run.`,
+      },
+    }, 404);
+  }
+
+  // Check if agent can be restarted
+  if (!agent.canRestart()) {
+    return c.json({
+      error: {
+        message: `Run ${runId} cannot be restarted (current state doesn't allow restart)`,
+      },
+    }, 400);
+  }
+
+  // Start restart in background
+  const restartPromise = agent.restart().then(finalState => {
+    // Update run store with new state
+    runStore.set(runId, {
+      run_id: finalState.run_id,
+      status: finalState.phase === 'completed' ? 'completed' : 'failed',
+      user_goal: finalState.user_goal,
+      repo_path: finalState.repo_path,
+      created_at: finalState.created_at,
+      updated_at: finalState.updated_at,
+      final_summary: finalState.final_summary,
+      error: finalState.error,
+      reports: finalState.completed_tasks
+        .filter(t => t.report)
+        .map(t => t.report!),
+    } as any);
+    console.log(`[API] Run ${runId} restart completed with status: ${finalState.phase}`);
+  }).catch(error => {
+    console.error(`[API] Run ${runId} restart failed:`, error);
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    runStore.markFailed(runId, errorMsg);
+  });
+
+  // Track as running
+  runStore.setRunning(runId, restartPromise as any, agent.getState().user_goal);
+
+  return c.json({
+    run_id: runId,
+    status: 'restarting',
+    message: 'Run is being restarted',
+  }, 202);
+});
+
+/**
+ * POST /api/runs/:id/cancel
+ * Cancel a running run
+ */
+runs.post('/:id/cancel', (c) => {
+  const runId = c.req.param('id');
+  console.log(`[API] POST /api/runs/${runId}/cancel received`);
+
+  const agent = agentStore.get(runId);
+  if (!agent) {
+    return c.json({
+      error: {
+        message: `Agent instance not found for run ${runId}`,
+      },
+    }, 404);
+  }
+
+  agent.cancel('Cancelled by user via API');
+
+  return c.json({
+    run_id: runId,
+    status: 'cancelled',
+    message: 'Run has been cancelled',
+  });
 });
 
 export { runs };

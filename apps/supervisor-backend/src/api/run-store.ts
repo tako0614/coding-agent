@@ -101,8 +101,18 @@ class RunStore {
     this.runs.set(runId, state);
     this.runningPromises.delete(runId);
     this.persistToDb(runId, state);
+    // Clean up all associated tracking data
+    this.cleanupRunTracking(runId);
+  }
+
+  /**
+   * Clean up all tracking data for a run
+   */
+  private cleanupRunTracking(runId: string): void {
     this.runningGoals.delete(runId);
     this.runningStartTimes.delete(runId);
+    this.runProjectIds.delete(runId);
+    this.runRepoPaths.delete(runId);
   }
 
   /**
@@ -204,8 +214,7 @@ class RunStore {
    */
   delete(runId: string): boolean {
     this.runningPromises.delete(runId);
-    this.runProjectIds.delete(runId);
-    this.runRepoPaths.delete(runId);
+    this.cleanupRunTracking(runId);
     const memDeleted = this.runs.delete(runId);
 
     try {
@@ -215,6 +224,41 @@ class RunStore {
       console.error('[RunStore] Failed to delete run from DB:', err);
       return memDeleted;
     }
+  }
+
+  /**
+   * Mark a run as failed (used when run fails before set() is called)
+   */
+  markFailed(runId: string, error: string): void {
+    const goal = this.runningGoals.get(runId);
+    const repoPath = this.runRepoPaths.get(runId);
+    const projectId = this.runProjectIds.get(runId);
+    const startTime = this.runningStartTimes.get(runId);
+    const now = new Date().toISOString();
+
+    // Remove from running
+    this.runningPromises.delete(runId);
+
+    // Persist failed state
+    try {
+      insertRunStmt.run({
+        run_id: runId,
+        project_id: projectId || null,
+        user_goal: goal || '',
+        repo_path: repoPath || '',
+        final_report: null,
+        error: error,
+        dag_json: null,
+        dag_progress_json: null,
+        created_at: startTime || now,
+        updated_at: now,
+      });
+    } catch (err) {
+      console.error('[RunStore] Failed to mark run as failed:', err);
+    }
+
+    // Cleanup tracking
+    this.cleanupRunTracking(runId);
   }
 
   /**
@@ -357,6 +401,10 @@ class RunStore {
   clear(): void {
     this.runs.clear();
     this.runningPromises.clear();
+    this.runningGoals.clear();
+    this.runningStartTimes.clear();
+    this.runProjectIds.clear();
+    this.runRepoPaths.clear();
   }
 }
 

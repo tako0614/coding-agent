@@ -9,9 +9,7 @@ import type {
   DAGNode,
   WorkReport,
   DAG,
-  CostMetrics,
 } from '@supervisor/protocol';
-import { createEmptyCostMetrics } from '@supervisor/protocol';
 import { WorkerInstance, createWorkerInstance, type TaskContext } from './worker-instance.js';
 import { EventEmitter } from 'events';
 import { logger } from '../services/logger.js';
@@ -42,8 +40,8 @@ export class WorkerPool extends EventEmitter {
   private totalTasksFailed = 0;
   private poolContext: PoolContext;
   private completedTasks: Map<string, string> = new Map(); // taskId -> summary
-  private costMetrics: CostMetrics;
   private cancelled = false;
+  private abortController: AbortController;
 
   constructor(
     repoPath: string,
@@ -54,7 +52,7 @@ export class WorkerPool extends EventEmitter {
     this.repoPath = repoPath;
     this.runId = runId;
     this.poolContext = poolContext ?? { userGoal: '' };
-    this.costMetrics = createEmptyCostMetrics();
+    this.abortController = new AbortController();
   }
 
   /**
@@ -79,7 +77,15 @@ export class WorkerPool extends EventEmitter {
    */
   cancel(): void {
     this.cancelled = true;
+    this.abortController.abort();
     logger.warn('WorkerPool cancelled', { runId: this.runId });
+  }
+
+  /**
+   * Get the abort signal for this pool
+   */
+  getAbortSignal(): AbortSignal {
+    return this.abortController.signal;
   }
 
   /**
@@ -122,30 +128,6 @@ export class WorkerPool extends EventEmitter {
   }
 
   /**
-   * Update cost metrics from a work report
-   */
-  private updateCostMetrics(report: WorkReport, executorType: WorkerExecutorType): void {
-    const metadata = report.metadata as Record<string, unknown> | undefined;
-    const inputTokens = (metadata?.['input_tokens'] as number) ?? 0;
-    const outputTokens = (metadata?.['output_tokens'] as number) ?? 0;
-
-    // Estimate costs (rough estimates)
-    const costPerInputToken = executorType === 'claude' ? 0.000003 : 0.000001;
-    const costPerOutputToken = executorType === 'claude' ? 0.000015 : 0.000002;
-    const cost = inputTokens * costPerInputToken + outputTokens * costPerOutputToken;
-
-    this.costMetrics.api_calls++;
-    this.costMetrics.input_tokens += inputTokens;
-    this.costMetrics.output_tokens += outputTokens;
-    this.costMetrics.estimated_cost_usd += cost;
-
-    this.costMetrics.by_executor[executorType].api_calls++;
-    this.costMetrics.by_executor[executorType].input_tokens += inputTokens;
-    this.costMetrics.by_executor[executorType].output_tokens += outputTokens;
-    this.costMetrics.by_executor[executorType].estimated_cost_usd += cost;
-  }
-
-  /**
    * Execute a task using a worker (reuses existing workers)
    */
   async executeTask(node: DAGNode): Promise<WorkReport | null> {
@@ -185,16 +167,12 @@ export class WorkerPool extends EventEmitter {
       if (result.success && result.report) {
         this.totalTasksCompleted++;
         this.completedTasks.set(node.task_id, result.report.summary || `Completed: ${node.name}`);
-        this.updateCostMetrics(result.report, executorType);
         this.emit('task:completed', node.task_id, worker.getId(), result.report);
         this.emit('worker:completed', worker.getWorker());
         return result.report;
       } else {
         this.totalTasksFailed++;
         const error = result.error ?? 'Unknown error';
-        if (result.report) {
-          this.updateCostMetrics(result.report, executorType);
-        }
         this.emit('task:failed', node.task_id, worker.getId(), error);
         this.emit('worker:error', worker.getWorker(), error);
         return result.report ?? null;
@@ -223,13 +201,6 @@ export class WorkerPool extends EventEmitter {
   }
 
   /**
-   * Get cost metrics
-   */
-  getCostMetrics(): CostMetrics {
-    return { ...this.costMetrics };
-  }
-
-  /**
    * Shutdown the pool and dispose all workers
    */
   async shutdown(): Promise<void> {
@@ -237,7 +208,6 @@ export class WorkerPool extends EventEmitter {
       runId: this.runId,
       completed: this.totalTasksCompleted,
       failed: this.totalTasksFailed,
-      costMetrics: this.costMetrics,
     });
 
     // Dispose all workers

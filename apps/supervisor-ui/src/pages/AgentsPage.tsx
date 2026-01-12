@@ -691,6 +691,8 @@ function TimelineView({
   onModelChange,
   executorMode,
   onExecutorModeChange,
+  maxContextTokens,
+  onMaxContextTokensChange,
 }: {
   projects: Project[];
   onStartNew: (projectId: string, goal: string) => void;
@@ -702,6 +704,8 @@ function TimelineView({
   onModelChange: (model: string) => void;
   executorMode: ExecutorMode;
   onExecutorModeChange: (mode: ExecutorMode) => void;
+  maxContextTokens: number;
+  onMaxContextTokensChange: (tokens: number) => void;
 }) {
   const queryClient = useQueryClient();
   const [newGoal, setNewGoal] = useState('');
@@ -709,6 +713,15 @@ function TimelineView({
   const [showProjectDropdown, setShowProjectDropdown] = useState(false);
   const [showModelDropdown, setShowModelDropdown] = useState(false);
   const [showExecutorDropdown, setShowExecutorDropdown] = useState(false);
+  const [showTokensDropdown, setShowTokensDropdown] = useState(false);
+
+  // Token threshold options
+  const tokenOptions = [
+    { value: 50000, label: '50K' },
+    { value: 100000, label: '100K' },
+    { value: 150000, label: '150K' },
+    { value: 200000, label: '200K' },
+  ];
 
   // Fetch runs from database
   const { data: runsData, isLoading: runsLoading } = useQuery({
@@ -882,49 +895,81 @@ function TimelineView({
               rows={3}
             />
             <div className="absolute left-2 right-2 bottom-2 flex items-center justify-between">
-              {/* Executor Mode */}
-              <div className="relative">
-                <button
-                  onClick={() => setShowExecutorDropdown(!showExecutorDropdown)}
-                  className={clsx(
-                    'flex items-center gap-1.5 px-2 py-1 text-xs rounded-md transition-colors',
-                    executorMode === 'codex_only' && 'bg-green-100 text-green-700',
-                    executorMode === 'claude_only' && 'bg-purple-100 text-purple-700',
-                    executorMode === 'agent' && 'bg-slate-100 text-slate-500 hover:bg-slate-200'
+              <div className="flex items-center gap-2">
+                {/* Executor Mode */}
+                <div className="relative">
+                  <button
+                    onClick={() => setShowExecutorDropdown(!showExecutorDropdown)}
+                    className={clsx(
+                      'flex items-center gap-1.5 px-2 py-1 text-xs rounded-md transition-colors',
+                      executorMode === 'codex_only' && 'bg-green-100 text-green-700',
+                      executorMode === 'claude_only' && 'bg-purple-100 text-purple-700',
+                      executorMode === 'agent' && 'bg-slate-100 text-slate-500 hover:bg-slate-200'
+                    )}
+                  >
+                    <span className="w-2 h-2 rounded-full" style={{
+                      backgroundColor: executorMode === 'codex_only' ? '#22c55e' : executorMode === 'claude_only' ? '#a855f7' : '#94a3b8'
+                    }} />
+                    <span>
+                      {executorMode === 'codex_only' ? 'Codex' : executorMode === 'claude_only' ? 'Claude' : 'Agent'}
+                    </span>
+                    <ChevronDown size={12} />
+                  </button>
+                  {showExecutorDropdown && (
+                    <div className="absolute bottom-full left-0 mb-1 bg-white border border-slate-200 rounded-lg shadow-lg py-1 min-w-[140px] z-50">
+                      {([
+                        { value: 'agent', label: 'Agent', color: '#94a3b8' },
+                        { value: 'codex_only', label: 'Codex', color: '#22c55e' },
+                        { value: 'claude_only', label: 'Claude', color: '#a855f7' },
+                      ] as const).map((opt) => (
+                        <button
+                          key={opt.value}
+                          onClick={() => {
+                            onExecutorModeChange(opt.value);
+                            setShowExecutorDropdown(false);
+                          }}
+                          className={clsx(
+                            'w-full text-left px-3 py-1.5 text-xs hover:bg-slate-50 flex items-center gap-2',
+                            opt.value === executorMode && 'bg-primary-50'
+                          )}
+                        >
+                          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: opt.color }} />
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
                   )}
-                >
-                  <span className="w-2 h-2 rounded-full" style={{
-                    backgroundColor: executorMode === 'codex_only' ? '#22c55e' : executorMode === 'claude_only' ? '#a855f7' : '#94a3b8'
-                  }} />
-                  <span>
-                    {executorMode === 'codex_only' ? 'Codex' : executorMode === 'claude_only' ? 'Claude' : 'Agent'}
-                  </span>
-                  <ChevronDown size={12} />
-                </button>
-                {showExecutorDropdown && (
-                  <div className="absolute bottom-full left-0 mb-1 bg-white border border-slate-200 rounded-lg shadow-lg py-1 min-w-[140px] z-50">
-                    {([
-                      { value: 'agent', label: 'Agent', color: '#94a3b8' },
-                      { value: 'codex_only', label: 'Codex', color: '#22c55e' },
-                      { value: 'claude_only', label: 'Claude', color: '#a855f7' },
-                    ] as const).map((opt) => (
-                      <button
-                        key={opt.value}
-                        onClick={() => {
-                          onExecutorModeChange(opt.value);
-                          setShowExecutorDropdown(false);
-                        }}
-                        className={clsx(
-                          'w-full text-left px-3 py-1.5 text-xs hover:bg-slate-50 flex items-center gap-2',
-                          opt.value === executorMode && 'bg-primary-50'
-                        )}
-                      >
-                        <span className="w-2 h-2 rounded-full" style={{ backgroundColor: opt.color }} />
-                        {opt.label}
-                      </button>
-                    ))}
-                  </div>
-                )}
+                </div>
+
+                {/* Token Threshold */}
+                <div className="relative">
+                  <button
+                    onClick={() => setShowTokensDropdown(!showTokensDropdown)}
+                    className="flex items-center gap-1 px-2 py-1 text-xs text-slate-500 bg-slate-100 hover:bg-slate-200 rounded-md transition-colors"
+                  >
+                    <span>{Math.round(maxContextTokens / 1000)}K tokens</span>
+                    <ChevronDown size={12} />
+                  </button>
+                  {showTokensDropdown && (
+                    <div className="absolute bottom-full left-0 mb-1 bg-white border border-slate-200 rounded-lg shadow-lg py-1 min-w-[100px] z-50">
+                      {tokenOptions.map((opt) => (
+                        <button
+                          key={opt.value}
+                          onClick={() => {
+                            onMaxContextTokensChange(opt.value);
+                            setShowTokensDropdown(false);
+                          }}
+                          className={clsx(
+                            'w-full text-left px-3 py-1.5 text-xs hover:bg-slate-50',
+                            opt.value === maxContextTokens && 'bg-primary-50 text-primary-600'
+                          )}
+                        >
+                          {opt.label} tokens
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
 
               {/* Send Button */}
@@ -1066,6 +1111,7 @@ export default function AgentsPage() {
   const [parallelSessionsLoaded, setParallelSessionsLoaded] = useState(false);
   const [selectedModel, setSelectedModel] = useState('gpt-5.2');
   const [executorMode, setExecutorMode] = useState<ExecutorMode>('agent');
+  const [maxContextTokens, setMaxContextTokens] = useState(150000);
 
   // Load projects
   const { data: projectsData } = useQuery({
@@ -1167,6 +1213,10 @@ export default function AgentsPage() {
     if (settings?.executor_mode) setExecutorMode(settings.executor_mode);
   }, [settings?.executor_mode]);
 
+  useEffect(() => {
+    if (settings?.max_context_tokens) setMaxContextTokens(settings.max_context_tokens);
+  }, [settings?.max_context_tokens]);
+
   const handleModelChange = (model: string) => {
     setSelectedModel(model);
     updateSettingsMutation.mutate({ dag_model: model });
@@ -1175,6 +1225,11 @@ export default function AgentsPage() {
   const handleExecutorModeChange = (mode: ExecutorMode) => {
     setExecutorMode(mode);
     updateSettingsMutation.mutate({ executor_mode: mode });
+  };
+
+  const handleMaxContextTokensChange = (tokens: number) => {
+    setMaxContextTokens(tokens);
+    updateSettingsMutation.mutate({ max_context_tokens: tokens });
   };
 
   const queryClient = useQueryClient();
@@ -1441,6 +1496,8 @@ export default function AgentsPage() {
           onModelChange={handleModelChange}
           executorMode={executorMode}
           onExecutorModeChange={handleExecutorModeChange}
+          maxContextTokens={maxContextTokens}
+          onMaxContextTokensChange={handleMaxContextTokensChange}
         />
       )}
     </div>

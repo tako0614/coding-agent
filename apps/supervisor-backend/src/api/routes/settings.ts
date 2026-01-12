@@ -7,6 +7,10 @@ import { z } from 'zod';
 import {
   getAllSettings,
   updateSettings,
+  getMaxContextTokens,
+  setMaxContextTokens,
+  getDAGModel,
+  getExecutorMode,
   type AppSettings,
 } from '../../services/settings-store.js';
 import { copilotAPIManager } from '../../services/copilot-api-manager.js';
@@ -21,6 +25,12 @@ const UpdateSettingsSchema = z.object({
   copilot_api_url: z.string().optional(),
   github_token: z.string().optional(),
   use_copilot_api: z.boolean().optional(),
+  // DAG model (for LangGraph)
+  dag_model: z.string().optional(),
+  // Executor mode
+  executor_mode: z.enum(['agent', 'codex_only', 'claude_only']).optional(),
+  // Max context tokens
+  max_context_tokens: z.number().optional(),
 });
 
 /**
@@ -45,6 +55,10 @@ settings.get('/', (c) => {
     openai_api_key_set: !!allSettings.openai_api_key,
     anthropic_api_key_set: !!allSettings.anthropic_api_key,
     github_token_set: !!allSettings.github_token,
+    // Include additional settings with defaults
+    dag_model: getDAGModel(),
+    executor_mode: getExecutorMode(),
+    max_context_tokens: getMaxContextTokens(),
   };
 
   return c.json(masked);
@@ -71,6 +85,12 @@ settings.put('/', async (c) => {
     // Get previous copilot state
     const prevSettings = getAllSettings();
     const hadToken = !!prevSettings.github_token;
+
+    // Handle max_context_tokens separately (since it uses its own setter)
+    if (parsed.data.max_context_tokens !== undefined) {
+      setMaxContextTokens(parsed.data.max_context_tokens);
+      console.log(`[Settings] max_context_tokens set to ${parsed.data.max_context_tokens}`);
+    }
 
     updateSettings(parsed.data);
     console.log('[Settings] Settings updated');
@@ -109,6 +129,10 @@ settings.put('/', async (c) => {
       openai_api_key_set: !!allSettings.openai_api_key,
       anthropic_api_key_set: !!allSettings.anthropic_api_key,
       github_token_set: !!allSettings.github_token,
+      // Include additional settings with defaults
+      dag_model: getDAGModel(),
+      executor_mode: getExecutorMode(),
+      max_context_tokens: getMaxContextTokens(),
     };
 
     return c.json(masked);
@@ -130,7 +154,7 @@ settings.delete('/:key', (c) => {
   const key = c.req.param('key');
 
   // Only allow deleting known keys
-  const allowedKeys = ['openai_api_key', 'anthropic_api_key', 'default_model', 'copilot_api_url', 'github_token', 'use_copilot_api'];
+  const allowedKeys = ['openai_api_key', 'anthropic_api_key', 'default_model', 'copilot_api_url', 'github_token', 'use_copilot_api', 'dag_model', 'executor_mode', 'max_context_tokens'];
   if (!allowedKeys.includes(key)) {
     return c.json({
       error: {

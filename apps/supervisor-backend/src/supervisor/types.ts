@@ -26,7 +26,6 @@ export interface SupervisorState {
   messages: SupervisorMessage[];
 
   // 現在のWorkerタスク
-  pending_tasks: WorkerTask[];
   active_tasks: Map<string, WorkerTask>;
   completed_tasks: WorkerTaskResult[];
 
@@ -117,8 +116,12 @@ export interface ToolDefinition {
 
 export type SupervisorAction =
   | { type: 'spawn_workers'; tasks: WorkerTask[] }
+  | { type: 'spawn_workers_async'; task_ids: string[] }
+  | { type: 'wait_workers'; task_ids?: string[] }
+  | { type: 'cancel_worker'; task_id: string }
   | { type: 'complete'; summary: string }
   | { type: 'fail'; error: string }
+  | { type: 'cancel'; reason: string }
   | { type: 'continue' };  // もう一度考える
 
 export interface SupervisorDecision {
@@ -126,14 +129,3 @@ export interface SupervisorDecision {
   action: SupervisorAction;
 }
 
-// =============================================================================
-// Configuration
-// =============================================================================
-
-export interface SupervisorConfig {
-  model: string;
-}
-
-export const DEFAULT_SUPERVISOR_CONFIG: SupervisorConfig = {
-  model: 'gpt-4o',
-};
