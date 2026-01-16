@@ -277,24 +277,27 @@ interface InterruptedRunInfo {
 export function detectInterruptedRuns(): string[] {
   try {
     // Find checkpoints for runs that haven't completed
+    // Get only the latest checkpoint per run using subquery - no post-filtering needed
     const rows = db.prepare(`
-      SELECT DISTINCT c.run_id, c.node_name, c.state_json, c.created_at
+      SELECT c.run_id, c.node_name, c.state_json, c.created_at
       FROM checkpoints c
       INNER JOIN runs r ON c.run_id = r.run_id
+      INNER JOIN (
+        SELECT run_id, MAX(created_at) as max_created_at
+        FROM checkpoints
+        GROUP BY run_id
+      ) latest ON c.run_id = latest.run_id AND c.created_at = latest.max_created_at
       WHERE r.final_report IS NULL
         AND (r.error IS NULL OR r.error = '')
-      ORDER BY c.created_at DESC
     `).all() as InterruptedRunInfo[];
 
     const interruptedIds: string[] = [];
     const now = new Date().toISOString();
 
-    // Group by run_id and get the latest checkpoint
+    // No need for post-query filtering - SQL already returns latest checkpoint per run
     const latestByRun = new Map<string, InterruptedRunInfo>();
     for (const row of rows) {
-      if (!latestByRun.has(row.run_id)) {
-        latestByRun.set(row.run_id, row);
-      }
+      latestByRun.set(row.run_id, row);
     }
 
     // Mark runs as interrupted

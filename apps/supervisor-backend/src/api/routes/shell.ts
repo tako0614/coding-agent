@@ -23,29 +23,46 @@ const ExecuteSchema = z.object({
   timeout: z.number().optional(),
 });
 
-// Load policy from config file
+// Default policy fallback
+const DEFAULT_POLICY = {
+  shell: {
+    allowlist: ['npm', 'npx', 'pnpm', 'node', 'git', 'ls', 'cat', 'pwd', 'echo'],
+    denylist: ['rm -rf /', 'sudo'],
+    argumentPatterns: {},
+    maxExecutionTimeMs: 300000,
+    maxOutputSizeBytes: 10485760,
+  },
+  filesystem: {
+    writeRoots: ['./'],
+    forbiddenPaths: [],
+    maxFileSizeBytes: 52428800,
+  },
+};
+
+// Cached policy - loaded once at startup
+let cachedPolicy: ReturnType<typeof loadPolicyFromConfig> | null = null;
+
+// Load policy from config file (cached)
 async function loadPolicy() {
+  if (cachedPolicy) {
+    return cachedPolicy;
+  }
+
   try {
     const configPath = path.resolve(process.cwd(), '../../configs/policy/default.json');
     const content = await fs.readFile(configPath, 'utf-8');
-    return loadPolicyFromConfig(JSON.parse(content));
+    cachedPolicy = loadPolicyFromConfig(JSON.parse(content));
+    return cachedPolicy;
   } catch {
     // Return default policy if config not found
-    return {
-      shell: {
-        allowlist: ['npm', 'npx', 'pnpm', 'node', 'git', 'ls', 'cat', 'pwd', 'echo'],
-        denylist: ['rm -rf /', 'sudo'],
-        argumentPatterns: {},
-        maxExecutionTimeMs: 300000,
-        maxOutputSizeBytes: 10485760,
-      },
-      filesystem: {
-        writeRoots: ['./'],
-        forbiddenPaths: [],
-        maxFileSizeBytes: 52428800,
-      },
-    };
+    cachedPolicy = DEFAULT_POLICY;
+    return cachedPolicy;
   }
+}
+
+/** Reload policy from config file (for hot-reload scenarios) */
+export function reloadPolicy(): void {
+  cachedPolicy = null;
 }
 
 /**

@@ -29,8 +29,9 @@ db.pragma('journal_mode = DELETE');
 // Enable foreign key constraints (SQLite doesn't enforce them by default)
 db.pragma('foreign_keys = ON');
 
-// Set busy timeout to handle concurrent writes gracefully
-db.pragma('busy_timeout = 5000');
+// Set busy timeout to handle concurrent writes gracefully (default: 5000ms)
+const DB_BUSY_TIMEOUT_MS = parseInt(process.env['DB_BUSY_TIMEOUT_MS'] ?? '5000', 10);
+db.pragma(`busy_timeout = ${DB_BUSY_TIMEOUT_MS}`);
 
 // Ensure full synchronous mode for data integrity
 db.pragma('synchronous = FULL');

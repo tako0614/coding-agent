@@ -63,11 +63,14 @@ export interface ChatResponse {
   completionSummary?: string;
 }
 
-/** Maximum user message length (100KB) */
-const MAX_MESSAGE_LENGTH = 100 * 1024;
+/** Maximum user message length (default: 100KB) */
+const MAX_MESSAGE_LENGTH = parseInt(process.env['SPEC_AGENT_MAX_MESSAGE_LENGTH'] ?? String(100 * 1024), 10);
 
-/** Maximum tool use iterations to prevent infinite loops */
-const MAX_TOOL_ITERATIONS = 50;
+/** Maximum tool use iterations to prevent infinite loops (default: 50) */
+const MAX_TOOL_ITERATIONS = parseInt(process.env['SPEC_AGENT_MAX_TOOL_ITERATIONS'] ?? '50', 10);
+
+/** Maximum tokens for API response (default: 4096) */
+const SPEC_AGENT_MAX_TOKENS = parseInt(process.env['SPEC_AGENT_MAX_TOKENS'] ?? '4096', 10);
 
 export class SpecAgent {
   private config: SpecAgentConfig;
@@ -148,7 +151,7 @@ export class SpecAgent {
       const response = await resilientAnthropicMessage(() =>
         this.client.messages.create({
           model: this.model,
-          max_tokens: 4096,
+          max_tokens: SPEC_AGENT_MAX_TOKENS,
           system: SPEC_SYSTEM_PROMPT,
           tools: SPEC_TOOLS.map(tool => ({
             name: tool.name,

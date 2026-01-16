@@ -33,11 +33,13 @@ const debug = {
  */
 class EnvMutex {
   private locked = false;
-  private queue: Array<{
+  /** Queue using Map for O(1) deletion on timeout */
+  private queue = new Map<number, {
     resolve: () => void;
     reject: (err: Error) => void;
     timeoutId: NodeJS.Timeout;
-  }> = [];
+  }>();
+  private nextId = 0;
   private static readonly TIMEOUT_MS = 300000; // 5 minutes
 
   async acquire(): Promise<void> {
@@ -47,23 +49,24 @@ class EnvMutex {
     }
 
     return new Promise<void>((resolve, reject) => {
+      const id = this.nextId++;
       const timeoutId = setTimeout(() => {
-        const index = this.queue.findIndex(item => item.resolve === resolve);
-        if (index !== -1) {
-          this.queue.splice(index, 1);
-        }
+        this.queue.delete(id);  // O(1) deletion
         reject(new Error(`EnvMutex acquire timeout after ${EnvMutex.TIMEOUT_MS}ms`));
       }, EnvMutex.TIMEOUT_MS);
 
-      this.queue.push({ resolve, reject, timeoutId });
+      this.queue.set(id, { resolve, reject, timeoutId });
     });
   }
 
   release(): void {
-    const next = this.queue.shift();
-    if (next) {
-      clearTimeout(next.timeoutId);
-      next.resolve();
+    // Get the first (oldest) entry from the map
+    const firstEntry = this.queue.entries().next();
+    if (!firstEntry.done) {
+      const [id, item] = firstEntry.value;
+      this.queue.delete(id);
+      clearTimeout(item.timeoutId);
+      item.resolve();
     } else {
       this.locked = false;
     }

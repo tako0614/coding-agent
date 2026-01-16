@@ -15,18 +15,21 @@ export class DAGScheduler {
   private taskStatus: Map<string, DAGNodeStatus>;
   private dependencyMap: Map<string, Set<string>>;  // task_id -> set of tasks it depends on
   private dependentMap: Map<string, Set<string>>;   // task_id -> set of tasks that depend on it
+  private nodeMap: Map<string, DAGNode>;            // task_id -> node for O(1) lookup
 
   constructor(dag: DAG) {
     this.dag = dag;
     this.taskStatus = new Map();
     this.dependencyMap = new Map();
     this.dependentMap = new Map();
+    this.nodeMap = new Map();
 
-    // Initialize status and dependency maps
+    // Initialize status, dependency maps, and node lookup map
     for (const node of dag.nodes) {
       this.taskStatus.set(node.task_id, node.status);
       this.dependencyMap.set(node.task_id, new Set(node.dependencies));
       this.dependentMap.set(node.task_id, new Set());
+      this.nodeMap.set(node.task_id, node);  // O(1) node lookup
     }
 
     // Build dependent map (reverse of dependency map)
@@ -113,7 +116,7 @@ export class DAGScheduler {
    * Update node properties
    */
   private updateNode(taskId: string, updates: Partial<DAGNode>): void {
-    const node = this.dag.nodes.find((n) => n.task_id === taskId);
+    const node = this.nodeMap.get(taskId);  // O(1) lookup
     if (node) {
       Object.assign(node, updates);
     }
@@ -248,10 +251,10 @@ export class DAGScheduler {
   }
 
   /**
-   * Get a specific node
+   * Get a specific node (O(1) lookup)
    */
   getNode(taskId: string): DAGNode | undefined {
-    return this.dag.nodes.find((n) => n.task_id === taskId);
+    return this.nodeMap.get(taskId);
   }
 
   /**
@@ -349,7 +352,7 @@ export class DAGScheduler {
       const currentDist = distances.get(taskId) ?? 0;
 
       for (const depId of dependents) {
-        const node = this.dag.nodes.find((n) => n.task_id === depId);
+        const node = this.nodeMap.get(depId);  // O(1) lookup
         const weight = node?.estimated_duration_ms ?? 1;
         const newDist = currentDist + weight;
 

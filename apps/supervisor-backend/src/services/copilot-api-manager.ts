@@ -7,6 +7,43 @@ import { spawn, type ChildProcess } from 'child_process';
 import { getCopilotAPIConfig, updateSettings } from './settings-store.js';
 import { logger } from './logger.js';
 
+// =============================================================================
+// Configuration Constants (configurable via environment variables)
+// =============================================================================
+
+/** Restart delay in milliseconds after process exit */
+const RESTART_DELAY_MS = parseInt(process.env['COPILOT_API_RESTART_DELAY_MS'] ?? '2000', 10);
+
+/** Force kill timeout in milliseconds */
+const FORCE_KILL_TIMEOUT_MS = parseInt(process.env['COPILOT_API_FORCE_KILL_TIMEOUT_MS'] ?? '5000', 10);
+
+/** Fetch models request timeout in milliseconds */
+const FETCH_MODELS_TIMEOUT_MS = parseInt(process.env['COPILOT_API_FETCH_MODELS_TIMEOUT_MS'] ?? '5000', 10);
+
+/** Health check /usage endpoint timeout in milliseconds */
+const HEALTH_CHECK_USAGE_TIMEOUT_MS = parseInt(process.env['COPILOT_API_HEALTH_USAGE_TIMEOUT_MS'] ?? '3000', 10);
+
+/** Health check /models endpoint timeout in milliseconds */
+const HEALTH_CHECK_MODELS_TIMEOUT_MS = parseInt(process.env['COPILOT_API_HEALTH_MODELS_TIMEOUT_MS'] ?? '2000', 10);
+
+/** Wait for ready request timeout in milliseconds */
+const WAIT_FOR_READY_REQUEST_TIMEOUT_MS = parseInt(process.env['COPILOT_API_WAIT_READY_TIMEOUT_MS'] ?? '1000', 10);
+
+/** Wait for ready check interval in milliseconds */
+const WAIT_FOR_READY_INTERVAL_MS = parseInt(process.env['COPILOT_API_WAIT_READY_INTERVAL_MS'] ?? '500', 10);
+
+/** Health check interval in milliseconds */
+const HEALTH_CHECK_INTERVAL_MS = parseInt(process.env['COPILOT_API_HEALTH_CHECK_INTERVAL_MS'] ?? '30000', 10);
+
+/** Health check initial delay in milliseconds */
+const HEALTH_CHECK_INITIAL_DELAY_MS = parseInt(process.env['COPILOT_API_HEALTH_CHECK_DELAY_MS'] ?? '10000', 10);
+
+/** Backend port (to avoid conflicts) */
+const BACKEND_PORT = parseInt(process.env['BACKEND_PORT'] ?? '3000', 10);
+
+/** Default Copilot API port */
+const DEFAULT_COPILOT_API_PORT = parseInt(process.env['COPILOT_API_DEFAULT_PORT'] ?? '4141', 10);
+
 export interface CopilotAPIStatus {
   running: boolean;
   pid?: number;
@@ -123,7 +160,7 @@ class CopilotAPIManager {
         if (getCopilotAPIConfig().enabled && this.restartAttempts < this.maxRestartAttempts) {
           this.restartAttempts++;
           logger.info('CopilotAPI attempting restart', { attempt: this.restartAttempts, maxAttempts: this.maxRestartAttempts });
-          setTimeout(() => this.start(), 2000);
+          setTimeout(() => this.start(), RESTART_DELAY_MS);
         }
       };
 
@@ -186,7 +223,7 @@ class CopilotAPIManager {
           logger.warn('CopilotAPI force killing process');
           this.process.kill('SIGKILL');
         }
-      }, 5000);
+      }, FORCE_KILL_TIMEOUT_MS);
 
       // Create a one-time exit handler for this stop operation
       const stopExitHandler = () => {
@@ -227,7 +264,7 @@ class CopilotAPIManager {
         headers: {
           'Authorization': `Bearer ${config.githubToken || 'dummy'}`,
         },
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(FETCH_MODELS_TIMEOUT_MS),
       });
 
       if (!response.ok) {
@@ -254,7 +291,7 @@ class CopilotAPIManager {
       // Try /usage endpoint first (doesn't require auth)
       const response = await fetch(`${config.baseUrl}/usage`, {
         method: 'GET',
-        signal: AbortSignal.timeout(3000),
+        signal: AbortSignal.timeout(HEALTH_CHECK_USAGE_TIMEOUT_MS),
       });
       // Any response (even 401/403) means the server is running
       return response.status < 500;
@@ -263,7 +300,7 @@ class CopilotAPIManager {
       try {
         const response = await fetch(`${config.baseUrl}/v1/models`, {
           method: 'GET',
-          signal: AbortSignal.timeout(2000),
+          signal: AbortSignal.timeout(HEALTH_CHECK_MODELS_TIMEOUT_MS),
         });
         return response.status < 500;
       } catch {
@@ -277,13 +314,12 @@ class CopilotAPIManager {
    */
   private async waitForReady(url: string, timeoutMs: number): Promise<void> {
     const startTime = Date.now();
-    const checkInterval = 500;
 
     while (Date.now() - startTime < timeoutMs) {
       try {
         const response = await fetch(`${url}/usage`, {
           method: 'GET',
-          signal: AbortSignal.timeout(1000),
+          signal: AbortSignal.timeout(WAIT_FOR_READY_REQUEST_TIMEOUT_MS),
         });
         // Any response means server is up
         if (response.status < 500) {
@@ -293,7 +329,7 @@ class CopilotAPIManager {
       } catch {
         // API not ready yet
       }
-      await new Promise(resolve => setTimeout(resolve, checkInterval));
+      await new Promise(resolve => setTimeout(resolve, WAIT_FOR_READY_INTERVAL_MS));
     }
 
     // Don't throw, just warn - the process might still be starting
@@ -301,25 +337,22 @@ class CopilotAPIManager {
   }
 
   /**
-   * Extract port from URL (avoid port 3000 which is used by backend)
+   * Extract port from URL (avoid conflicts with backend port)
    */
   private extractPort(url: string): number {
-    const BACKEND_PORT = 3000;
-    const DEFAULT_PORT = 4141;
-
     try {
       const parsed = new URL(url);
-      const port = parseInt(parsed.port, 10) || DEFAULT_PORT;
+      const port = parseInt(parsed.port, 10) || DEFAULT_COPILOT_API_PORT;
 
       // Don't use the same port as the backend
       if (port === BACKEND_PORT) {
-        logger.warn('CopilotAPI port conflicts with backend', { conflictPort: BACKEND_PORT, usingPort: DEFAULT_PORT });
-        return DEFAULT_PORT;
+        logger.warn('CopilotAPI port conflicts with backend', { conflictPort: BACKEND_PORT, usingPort: DEFAULT_COPILOT_API_PORT });
+        return DEFAULT_COPILOT_API_PORT;
       }
 
       return port;
     } catch {
-      return DEFAULT_PORT;
+      return DEFAULT_COPILOT_API_PORT;
     }
   }
 
@@ -345,8 +378,8 @@ class CopilotAPIManager {
           logger.info('CopilotAPI health check passed, clearing error');
           delete this.status.error;
         }
-      }, 30000); // Check every 30 seconds
-    }, 10000); // Wait 10 seconds before first check
+      }, HEALTH_CHECK_INTERVAL_MS);
+    }, HEALTH_CHECK_INITIAL_DELAY_MS);
   }
 
   /**

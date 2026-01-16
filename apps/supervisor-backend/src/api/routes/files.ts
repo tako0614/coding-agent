@@ -47,28 +47,45 @@ function validateAndDecodeBase64(content: string): { valid: true; data: Buffer }
   }
 }
 
-// Load policy from config
+// Default policy fallback
+const DEFAULT_POLICY = {
+  shell: {
+    allowlist: [],
+    denylist: [],
+    argumentPatterns: {},
+    maxExecutionTimeMs: 300000,
+    maxOutputSizeBytes: 10485760,
+  },
+  filesystem: {
+    writeRoots: ['./'],
+    forbiddenPaths: [],
+    maxFileSizeBytes: 52428800,
+  },
+};
+
+// Cached policy - loaded once at startup
+let cachedPolicy: ReturnType<typeof loadPolicyFromConfig> | null = null;
+
+// Load policy from config (cached)
 async function loadPolicy() {
+  if (cachedPolicy) {
+    return cachedPolicy;
+  }
+
   try {
     const configPath = path.resolve(process.cwd(), '../../configs/policy/default.json');
     const content = await fs.readFile(configPath, 'utf-8');
-    return loadPolicyFromConfig(JSON.parse(content));
+    cachedPolicy = loadPolicyFromConfig(JSON.parse(content));
+    return cachedPolicy;
   } catch {
-    return {
-      shell: {
-        allowlist: [],
-        denylist: [],
-        argumentPatterns: {},
-        maxExecutionTimeMs: 300000,
-        maxOutputSizeBytes: 10485760,
-      },
-      filesystem: {
-        writeRoots: ['./'],
-        forbiddenPaths: [],
-        maxFileSizeBytes: 52428800,
-      },
-    };
+    cachedPolicy = DEFAULT_POLICY;
+    return cachedPolicy;
   }
+}
+
+/** Reload policy from config file (for hot-reload scenarios) */
+export function reloadPolicy(): void {
+  cachedPolicy = null;
 }
 
 // Schemas

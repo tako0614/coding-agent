@@ -22,8 +22,8 @@ import { getErrorMessage, ToolExecutionError } from '../services/errors.js';
 /** Maximum file size to read (50KB) */
 const MAX_FILE_READ_SIZE = parseInt(process.env['TOOLS_MAX_FILE_READ_SIZE'] ?? '50000', 10);
 
-/** Maximum command output size (10KB) */
-const MAX_COMMAND_OUTPUT_SIZE = parseInt(process.env['TOOLS_MAX_COMMAND_OUTPUT_SIZE'] ?? '10000', 10);
+/** Maximum command output size (100KB) */
+const MAX_COMMAND_OUTPUT_SIZE = parseInt(process.env['TOOLS_MAX_COMMAND_OUTPUT_SIZE'] ?? '100000', 10);
 
 /** Maximum number of files to list */
 const MAX_LIST_FILES = parseInt(process.env['TOOLS_MAX_LIST_FILES'] ?? '500', 10);
@@ -671,14 +671,17 @@ const MAX_FILE_WRITE_SIZE = 10 * 1024 * 1024;
 /**
  * Async mutex with timeout support for protecting critical sections
  * Prevents deadlocks through timeout mechanism
+ * Uses Map for O(1) removal on timeout
  */
 class AsyncMutex {
   private locked = false;
-  private queue: Array<{
+  /** Queue using Map for O(1) deletion on timeout */
+  private queue = new Map<number, {
     resolve: () => void;
     reject: (err: Error) => void;
     timeoutId: NodeJS.Timeout;
-  }> = [];
+  }>();
+  private nextId = 0;
   private static readonly DEFAULT_TIMEOUT_MS = 30000; // 30 seconds
 
   async acquire(timeoutMs = AsyncMutex.DEFAULT_TIMEOUT_MS): Promise<void> {
@@ -688,24 +691,25 @@ class AsyncMutex {
     }
 
     return new Promise<void>((resolve, reject) => {
+      const id = this.nextId++;
       const timeoutId = setTimeout(() => {
-        // Remove from queue on timeout
-        const index = this.queue.findIndex(item => item.resolve === resolve);
-        if (index !== -1) {
-          this.queue.splice(index, 1);
-        }
+        // Remove from queue on timeout (O(1) operation)
+        this.queue.delete(id);
         reject(new Error(`Mutex acquire timeout after ${timeoutMs}ms`));
       }, timeoutMs);
 
-      this.queue.push({ resolve, reject, timeoutId });
+      this.queue.set(id, { resolve, reject, timeoutId });
     });
   }
 
   release(): void {
-    const next = this.queue.shift();
-    if (next) {
-      clearTimeout(next.timeoutId);
-      next.resolve();
+    // Get first (oldest) entry from the Map
+    const firstEntry = this.queue.entries().next();
+    if (!firstEntry.done) {
+      const [id, item] = firstEntry.value;
+      this.queue.delete(id);
+      clearTimeout(item.timeoutId);
+      item.resolve();
     } else {
       this.locked = false;
     }
@@ -731,7 +735,7 @@ class AsyncMutex {
    * Get queue length (for debugging/monitoring)
    */
   getQueueLength(): number {
-    return this.queue.length;
+    return this.queue.size;
   }
 }
 
@@ -761,16 +765,29 @@ export class ToolExecutor {
 
   /**
    * Auto-cleanup old completed tasks to prevent memory leaks
+   * Optimized: single pass to collect, sort once, bulk delete
    */
   private cleanupOldTasks(): void {
-    const completed = Array.from(this.asyncTasks.entries())
-      .filter(([, task]) => task.status !== 'running')
-      .sort((a, b) => (a[1].completedAt ?? '').localeCompare(b[1].completedAt ?? ''));
+    // Collect only non-running tasks (completed/failed)
+    const completedEntries: Array<[string, string]> = [];
+    for (const [taskId, task] of this.asyncTasks) {
+      if (task.status !== 'running') {
+        completedEntries.push([taskId, task.completedAt ?? '']);
+      }
+    }
 
-    // Keep only the most recent MAX_COMPLETED_TASKS
-    while (completed.length > MAX_COMPLETED_TASKS) {
-      const [taskId] = completed.shift()!;
-      this.asyncTasks.delete(taskId);
+    // Only proceed if over limit
+    if (completedEntries.length <= MAX_COMPLETED_TASKS) {
+      return;
+    }
+
+    // Sort by completedAt (ascending - oldest first)
+    completedEntries.sort((a, b) => a[1].localeCompare(b[1]));
+
+    // Calculate how many to remove and delete them
+    const toRemoveCount = completedEntries.length - MAX_COMPLETED_TASKS;
+    for (let i = 0; i < toRemoveCount; i++) {
+      this.asyncTasks.delete(completedEntries[i]![0]);
     }
   }
 
@@ -1285,19 +1302,11 @@ export class ToolExecutor {
       return { success: true, result: { tasks: [], message: '待機するタスクがありません' } };
     }
 
-    const results: Array<{
-      task_id: string;
-      status: string;
-      success?: boolean;
-      summary?: string;
-      error?: string;
-    }> = [];
-
-    for (const id of idsToWait) {
+    // Wait for all running tasks in parallel
+    const waitPromises = idsToWait.map(async (id) => {
       const asyncTask = this.asyncTasks.get(id);
       if (!asyncTask) {
-        results.push({ task_id: id, status: 'not_found' });
-        continue;
+        return { task_id: id, status: 'not_found' as const };
       }
 
       if (asyncTask.status === 'running') {
@@ -1306,14 +1315,17 @@ export class ToolExecutor {
       }
 
       // Get the final result
-      results.push({
+      return {
         task_id: id,
         status: asyncTask.status,
         success: asyncTask.result?.success,
         summary: asyncTask.result?.summary,
         error: asyncTask.error ?? asyncTask.result?.error,
-      });
-    }
+      };
+    });
+
+    // Wait for all tasks in parallel
+    const results = await Promise.all(waitPromises);
 
     return { success: true, result: { tasks: results } };
   }
@@ -1394,16 +1406,21 @@ export class ToolExecutor {
 
   /**
    * Add output log to a task (called by worker execution)
+   * Optimized: uses loop instead of spread, batch-trims only when 20% over limit
    */
   addTaskOutput(taskId: string, output: string): void {
     const asyncTask = this.asyncTasks.get(taskId);
     if (asyncTask) {
-      // Split by lines and add
+      // Split by lines and add (loop instead of spread to avoid O(n) spread cost)
       const lines = output.split('\n');
-      asyncTask.outputLogs.push(...lines);
-      // Keep only last N lines to prevent memory issues
-      if (asyncTask.outputLogs.length > MAX_OUTPUT_LOG_LINES) {
-        asyncTask.outputLogs = asyncTask.outputLogs.slice(-MAX_OUTPUT_LOG_LINES);
+      for (const line of lines) {
+        asyncTask.outputLogs.push(line);
+      }
+      // Batch-trim: only splice when significantly over limit (20%) to reduce O(n) operations
+      const trimThreshold = Math.floor(MAX_OUTPUT_LOG_LINES * 1.2);
+      if (asyncTask.outputLogs.length > trimThreshold) {
+        const excess = asyncTask.outputLogs.length - MAX_OUTPUT_LOG_LINES;
+        asyncTask.outputLogs.splice(0, excess);
       }
     }
   }

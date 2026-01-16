@@ -2,19 +2,22 @@
  * Agent Store
  * Stores SupervisorAgent instances for restart functionality
  * Implements LRU eviction and TTL-based expiration
+ *
+ * Uses Map's insertion order for LRU tracking (O(1) operations)
+ * instead of maintaining a separate array (which was O(n))
  */
 
 import type { SupervisorAgent } from './agent.js';
 import { logger } from '../services/logger.js';
 
 /** Maximum number of agents to keep in memory */
-const MAX_AGENTS = 50;
+const MAX_AGENTS = parseInt(process.env['AGENT_STORE_MAX_AGENTS'] ?? '50', 10);
 
 /** TTL for inactive agents (30 minutes) */
-const AGENT_TTL_MS = 30 * 60 * 1000;
+const AGENT_TTL_MS = parseInt(process.env['AGENT_STORE_TTL_MS'] ?? String(30 * 60 * 1000), 10);
 
 /** Cleanup interval (5 minutes) */
-const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+const CLEANUP_INTERVAL_MS = parseInt(process.env['AGENT_STORE_CLEANUP_INTERVAL_MS'] ?? String(5 * 60 * 1000), 10);
 
 interface AgentEntry {
   agent: SupervisorAgent;
@@ -23,8 +26,11 @@ interface AgentEntry {
 }
 
 class AgentStore {
+  /**
+   * Map preserves insertion order - we use this for LRU tracking
+   * Delete + re-add moves an entry to the end (most recently used)
+   */
   private agents: Map<string, AgentEntry> = new Map();
-  private agentOrder: string[] = []; // Track insertion order for LRU cleanup
   private cleanupTimer: NodeJS.Timeout | null = null;
 
   constructor() {
@@ -62,13 +68,14 @@ class AgentStore {
 
   /**
    * Store an agent instance
+   * Uses Map's insertion order for LRU - delete + re-add moves to end
    */
   set(runId: string, agent: SupervisorAgent): void {
     const now = Date.now();
 
-    // If already exists, update entry
+    // If already exists, delete first to update insertion order (LRU)
     if (this.agents.has(runId)) {
-      this.agentOrder = this.agentOrder.filter(id => id !== runId);
+      this.agents.delete(runId);
     }
 
     this.agents.set(runId, {
@@ -76,7 +83,6 @@ class AgentStore {
       lastAccessedAt: now,
       createdAt: now,
     });
-    this.agentOrder.push(runId);
 
     // Clean up old agents if over limit
     this.cleanupOldAgents();
@@ -102,21 +108,21 @@ class AgentStore {
 
   /**
    * Remove oldest agents when over limit (LRU eviction)
+   * Uses Map's insertion order - first entries are oldest
    */
   private cleanupOldAgents(): void {
-    while (this.agentOrder.length > MAX_AGENTS) {
-      const oldestId = this.agentOrder.shift();
-      if (oldestId) {
-        const entry = this.agents.get(oldestId);
-        if (entry) {
-          logger.debug('Evicting agent from store (LRU)', {
-            runId: oldestId,
-            age: Date.now() - entry.createdAt,
-          });
-          this.disposeAgent(entry.agent);
-        }
-        this.agents.delete(oldestId);
-      }
+    while (this.agents.size > MAX_AGENTS) {
+      // Get the first (oldest) entry from the Map - O(1)
+      const firstEntry = this.agents.entries().next();
+      if (firstEntry.done) break;
+
+      const [oldestId, entry] = firstEntry.value;
+      logger.debug('Evicting agent from store (LRU)', {
+        runId: oldestId,
+        age: Date.now() - entry.createdAt,
+      });
+      this.disposeAgent(entry.agent);
+      this.agents.delete(oldestId);
     }
   }
 
@@ -145,12 +151,12 @@ class AgentStore {
         runIds: expiredIds,
       });
 
+      // Delete all expired agents - no need for agentOrder array anymore
       for (const runId of expiredIds) {
         const entry = this.agents.get(runId);
         if (entry) {
           this.disposeAgent(entry.agent);
         }
-        this.agentOrder = this.agentOrder.filter(id => id !== runId);
         this.agents.delete(runId);
       }
     }
@@ -158,6 +164,7 @@ class AgentStore {
 
   /**
    * Get an agent instance (updates LRU order and last accessed time)
+   * Uses Map's insertion order - delete + re-add moves to end (O(1))
    */
   get(runId: string): SupervisorAgent | undefined {
     const entry = this.agents.get(runId);
@@ -165,9 +172,9 @@ class AgentStore {
       // Update last accessed time
       entry.lastAccessedAt = Date.now();
 
-      // Update LRU order: move to end (most recently used)
-      this.agentOrder = this.agentOrder.filter(id => id !== runId);
-      this.agentOrder.push(runId);
+      // Update LRU order: delete + re-add moves to end (most recently used)
+      this.agents.delete(runId);
+      this.agents.set(runId, entry);
 
       return entry.agent;
     }
@@ -189,7 +196,6 @@ class AgentStore {
     if (entry) {
       this.disposeAgent(entry.agent);
     }
-    this.agentOrder = this.agentOrder.filter(id => id !== runId);
     return this.agents.delete(runId);
   }
 
@@ -215,7 +221,6 @@ class AgentStore {
       this.disposeAgent(entry.agent);
     }
     this.agents.clear();
-    this.agentOrder = [];
     logger.info('Agent store cleared');
   }
 

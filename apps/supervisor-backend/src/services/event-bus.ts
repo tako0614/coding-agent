@@ -133,14 +133,14 @@ function rowToLogEntry(row: LogRow): LogEntry {
   };
 }
 
-/** Buffer cleanup interval (5 minutes) */
-const BUFFER_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+/** Buffer cleanup interval (default: 5 minutes) */
+const BUFFER_CLEANUP_INTERVAL_MS = parseInt(process.env['EVENT_BUS_CLEANUP_INTERVAL_MS'] ?? String(5 * 60 * 1000), 10);
 
-/** Max age for buffer entries (30 minutes) */
-const BUFFER_MAX_AGE_MS = 30 * 60 * 1000;
+/** Max age for buffer entries (default: 30 minutes) */
+const BUFFER_MAX_AGE_MS = parseInt(process.env['EVENT_BUS_BUFFER_MAX_AGE_MS'] ?? String(30 * 60 * 1000), 10);
 
-/** Max total entries across all buffers */
-const MAX_TOTAL_BUFFER_ENTRIES = 50000;
+/** Max total entries across all buffers (default: 50000) */
+const MAX_TOTAL_BUFFER_ENTRIES = parseInt(process.env['EVENT_BUS_MAX_TOTAL_ENTRIES'] ?? '50000', 10);
 
 interface BufferMeta {
   runId: string;
@@ -155,13 +155,19 @@ interface ListenerMeta {
   callback: (...args: unknown[]) => void;
 }
 
-/** Max listener age before automatic cleanup (10 minutes) */
-const LISTENER_MAX_AGE_MS = 10 * 60 * 1000;
+/** Max listener age before automatic cleanup (default: 10 minutes) */
+const LISTENER_MAX_AGE_MS = parseInt(process.env['EVENT_BUS_LISTENER_MAX_AGE_MS'] ?? String(10 * 60 * 1000), 10);
+
+/** Max buffer size per run (default: 1000) */
+const MAX_BUFFER_SIZE = parseInt(process.env['EVENT_BUS_MAX_BUFFER_SIZE'] ?? '1000', 10);
+
+/** Max event listeners (default: 100) */
+const MAX_EVENT_LISTENERS = parseInt(process.env['EVENT_BUS_MAX_LISTENERS'] ?? '100', 10);
 
 class EventBus extends EventEmitter {
   private logBuffer: Map<string, LogEntry[]> = new Map();
   private bufferMeta: Map<string, BufferMeta> = new Map();
-  private readonly MAX_BUFFER_SIZE = 1000;
+  private readonly MAX_BUFFER_SIZE = MAX_BUFFER_SIZE;
   private cleanupTimer: NodeJS.Timeout | null = null;
   private totalBufferEntries = 0;
   /** Track active listeners for leak detection and cleanup */
@@ -170,7 +176,7 @@ class EventBus extends EventEmitter {
 
   constructor() {
     super();
-    this.setMaxListeners(100); // Allow many WebSocket connections
+    this.setMaxListeners(MAX_EVENT_LISTENERS);
     this.startPeriodicCleanup();
   }
 
@@ -231,18 +237,21 @@ class EventBus extends EventEmitter {
     }
 
     // If still over total limit, remove oldest buffers
+    // Optimized: collect entries, sort once, iterate with index instead of shift()
     if (this.totalBufferEntries > MAX_TOTAL_BUFFER_ENTRIES) {
       const sortedMeta = Array.from(this.bufferMeta.entries())
         .sort((a, b) => a[1].lastUpdated - b[1].lastUpdated);
 
-      while (this.totalBufferEntries > MAX_TOTAL_BUFFER_ENTRIES && sortedMeta.length > 0) {
-        const [oldestRunId] = sortedMeta.shift()!;
+      let i = 0;
+      while (this.totalBufferEntries > MAX_TOTAL_BUFFER_ENTRIES && i < sortedMeta.length) {
+        const [oldestRunId] = sortedMeta[i]!;
         const buffer = this.logBuffer.get(oldestRunId);
         if (buffer) {
           this.totalBufferEntries -= buffer.length;
         }
         this.logBuffer.delete(oldestRunId);
         this.bufferMeta.delete(oldestRunId);
+        i++;
       }
     }
 

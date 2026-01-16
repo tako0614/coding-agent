@@ -517,7 +517,9 @@ export class SupervisorAgent {
 
       // Keep system message and last N messages (reduce on subsequent attempts)
       const keepRecentCount = Math.max(5, 20 - (summarizationAttempts - 1) * 5);
-      const systemMessage = this.state.messages.find(m => m.role === 'system');
+      // System message is always at index 0 if it exists - O(1) instead of O(n) find
+      const firstMsg = this.state.messages[0];
+      const systemMessage = firstMsg?.role === 'system' ? firstMsg : undefined;
       const recentMessages = this.state.messages.slice(-keepRecentCount);
       const oldMessages = this.state.messages.slice(
         systemMessage ? 1 : 0,
@@ -786,12 +788,13 @@ export class SupervisorAgent {
   }
 
   /**
-   * Execute tool calls from the assistant
+   * Execute tool calls from the assistant (in parallel for better performance)
    */
   private async executeToolCalls(
     toolCalls: OpenAI.Chat.Completions.ChatCompletionMessageToolCall[]
   ): Promise<void> {
-    for (const toolCall of toolCalls) {
+    // Execute all tool calls in parallel
+    const executeOne = async (toolCall: OpenAI.Chat.Completions.ChatCompletionMessageToolCall) => {
       const name = toolCall.function.name;
       let args: Record<string, unknown>;
 
@@ -808,37 +811,57 @@ export class SupervisorAgent {
       });
 
       const result = await this.toolExecutor.execute(name, args);
+      return { toolCall, result };
+    };
 
-      // Handle special actions (run control)
-      if (result.success && result.result) {
-        const actionResult = result.result as {
-          action?: string;
-          summary?: string;
-          reason?: string;
-        };
+    // Run all tool executions in parallel
+    const settled = await Promise.allSettled(toolCalls.map(executeOne));
 
-        if (actionResult.action === 'complete') {
-          this.state.phase = 'completed';
-          this.state.final_summary = actionResult.summary;
-        } else if (actionResult.action === 'fail') {
-          this.state.phase = 'failed';
-          this.state.error = actionResult.reason;
-        } else if (actionResult.action === 'cancel') {
-          this.state.phase = 'failed';
-          this.state.error = `Cancelled: ${actionResult.reason}`;
+    // Process results in order (to maintain consistent message ordering)
+    for (let i = 0; i < settled.length; i++) {
+      const outcome = settled[i]!;
+      if (outcome.status === 'fulfilled') {
+        const { toolCall, result } = outcome.value;
+
+        // Handle special actions (run control)
+        if (result.success && result.result) {
+          const actionResult = result.result as {
+            action?: string;
+            summary?: string;
+            reason?: string;
+          };
+
+          if (actionResult.action === 'complete') {
+            this.state.phase = 'completed';
+            this.state.final_summary = actionResult.summary;
+          } else if (actionResult.action === 'fail') {
+            this.state.phase = 'failed';
+            this.state.error = actionResult.reason;
+          } else if (actionResult.action === 'cancel') {
+            this.state.phase = 'failed';
+            this.state.error = `Cancelled: ${actionResult.reason}`;
+          }
         }
+
+        // Add tool result to messages
+        const toolResultContent = result.success
+          ? JSON.stringify(result.result, null, 2)
+          : `Error: ${result.error}`;
+
+        this.addMessage({
+          role: 'tool',
+          content: toolResultContent,
+          tool_call_id: toolCall.id,
+        });
+      } else {
+        // Promise was rejected (unexpected error) - use index directly (O(1) instead of indexOf O(n))
+        const toolCall = toolCalls[i]!;
+        this.addMessage({
+          role: 'tool',
+          content: `Error: ${outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)}`,
+          tool_call_id: toolCall.id,
+        });
       }
-
-      // Add tool result to messages
-      const toolResultContent = result.success
-        ? JSON.stringify(result.result, null, 2)
-        : `Error: ${result.error}`;
-
-      this.addMessage({
-        role: 'tool',
-        content: toolResultContent,
-        tool_call_id: toolCall.id,
-      });
     }
   }
 
@@ -854,7 +877,9 @@ export class SupervisorAgent {
         messageCount: this.state.messages.length,
       });
       // Keep system message and drop oldest messages
-      const systemMessage = this.state.messages.find(m => m.role === 'system');
+      // System message is always at index 0 if it exists - O(1) instead of O(n) find
+      const firstMsg = this.state.messages[0];
+      const systemMessage = firstMsg?.role === 'system' ? firstMsg : undefined;
       const recentMessages = this.state.messages.slice(-Math.floor(MAX_MESSAGES_HARD_LIMIT / 2));
       this.state.messages = systemMessage
         ? [systemMessage, ...recentMessages.filter(m => m.role !== 'system')]

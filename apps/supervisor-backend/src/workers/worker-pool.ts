@@ -20,6 +20,9 @@ export type ExecutorMode = 'agent' | 'codex_only' | 'claude_only' | 'claude_dire
 /** Default task timeout in ms (10 minutes) */
 const DEFAULT_TASK_TIMEOUT_MS = parseInt(process.env['WORKER_TASK_TIMEOUT_MS'] ?? String(10 * 60 * 1000), 10);
 
+/** Maximum time to wait for an idle worker in ms (5 minutes) */
+const WORKER_WAIT_TIMEOUT_MS = parseInt(process.env['WORKER_WAIT_TIMEOUT_MS'] ?? String(5 * 60 * 1000), 10);
+
 export interface PoolContext {
   userGoal: string;
   repoContext?: string;
@@ -47,12 +50,14 @@ export class WorkerPool extends EventEmitter {
   private completedTasks: Map<string, string> = new Map(); // taskId -> summary
   private cancelled = false;
   private abortController: AbortController;
-  /** Pending worker requests waiting for idle workers */
-  private pendingWorkerRequests: Map<WorkerExecutorType, Array<{
+  /** Pending worker requests waiting for idle workers - using Map for O(1) removal */
+  private pendingWorkerRequests: Map<WorkerExecutorType, Map<number, {
     resolve: (worker: WorkerInstance | null) => void;
     reject: (error: Error) => void;
     timeoutId: NodeJS.Timeout;
   }>> = new Map();
+  /** Unique ID counter for pending requests */
+  private pendingRequestIdCounter = 0;
 
   constructor(
     repoPath: string,
@@ -185,7 +190,10 @@ export class WorkerPool extends EventEmitter {
     }
 
     // No idle worker, wait for one to become available via event
-    const maxWait = 5 * 60 * 1000; // 5 minutes max
+    const maxWait = WORKER_WAIT_TIMEOUT_MS;
+
+    // Generate unique request ID upfront for O(1) removal
+    const requestId = this.pendingRequestIdCounter++;
 
     return new Promise<WorkerInstance | null>((resolve, reject) => {
       // Track abort handler for cleanup
@@ -193,8 +201,8 @@ export class WorkerPool extends EventEmitter {
 
       // Set up timeout
       const timeoutId = setTimeout(() => {
-        // Remove from pending requests
-        this.removePendingRequest(executorType, wrappedResolve);
+        // Remove from pending requests (O(1) operation)
+        this.removePendingRequest(executorType, requestId);
         // Remove abort listener to prevent memory leak
         if (abortHandler) {
           this.abortController.signal.removeEventListener('abort', abortHandler);
@@ -210,7 +218,7 @@ export class WorkerPool extends EventEmitter {
       // Set up abort handler
       abortHandler = () => {
         clearTimeout(timeoutId);
-        this.removePendingRequest(executorType, wrappedResolve);
+        this.removePendingRequest(executorType, requestId);
         resolve(null);
       };
       this.abortController.signal.addEventListener('abort', abortHandler, { once: true });
@@ -224,13 +232,13 @@ export class WorkerPool extends EventEmitter {
         resolve(worker);
       };
 
-      // Add to pending requests queue
+      // Add to pending requests queue (using Map for O(1) removal)
       let pendingQueue = this.pendingWorkerRequests.get(executorType);
       if (!pendingQueue) {
-        pendingQueue = [];
+        pendingQueue = new Map();
         this.pendingWorkerRequests.set(executorType, pendingQueue);
       }
-      pendingQueue.push({
+      pendingQueue.set(requestId, {
         resolve: wrappedResolve,
         reject,
         timeoutId,
@@ -239,18 +247,15 @@ export class WorkerPool extends EventEmitter {
   }
 
   /**
-   * Remove a pending request from the queue
+   * Remove a pending request from the queue by ID (O(1) operation)
    */
   private removePendingRequest(
     executorType: WorkerExecutorType,
-    resolveToRemove: (worker: WorkerInstance | null) => void
+    requestId: number
   ): void {
     const pendingQueue = this.pendingWorkerRequests.get(executorType);
     if (pendingQueue) {
-      const index = pendingQueue.findIndex(req => req.resolve === resolveToRemove);
-      if (index >= 0) {
-        pendingQueue.splice(index, 1);
-      }
+      pendingQueue.delete(requestId);  // O(1) deletion
     }
   }
 
@@ -259,9 +264,12 @@ export class WorkerPool extends EventEmitter {
    */
   private notifyWorkerAvailable(executorType: WorkerExecutorType, worker: WorkerInstance): void {
     const pendingQueue = this.pendingWorkerRequests.get(executorType);
-    if (pendingQueue && pendingQueue.length > 0) {
-      const pending = pendingQueue.shift();
-      if (pending) {
+    if (pendingQueue && pendingQueue.size > 0) {
+      // Get first (oldest) entry from the Map
+      const firstEntry = pendingQueue.entries().next();
+      if (!firstEntry.done) {
+        const [id, pending] = firstEntry.value;
+        pendingQueue.delete(id);
         clearTimeout(pending.timeoutId);
         pending.resolve(worker);
       }
@@ -371,19 +379,26 @@ export class WorkerPool extends EventEmitter {
    */
   getStatus() {
     const workerList: Worker[] = [];
+    let idleCount = 0;
+    let busyCount = 0;
+
+    // Single pass: collect workers and count statuses
     for (const workers of this.workers.values()) {
       for (const w of workers) {
-        workerList.push(w.getWorker());
+        const worker = w.getWorker();
+        workerList.push(worker);
+        if (worker.status === 'idle') {
+          idleCount++;
+        } else if (worker.status === 'running') {
+          busyCount++;
+        }
       }
     }
 
-    const idleWorkers = workerList.filter(w => w.status === 'idle').length;
-    const busyWorkers = workerList.filter(w => w.status === 'running').length;
-
     return {
       total_workers: workerList.length,
-      idle_workers: idleWorkers,
-      busy_workers: busyWorkers,
+      idle_workers: idleCount,
+      busy_workers: busyCount,
       workers: workerList,
       total_tasks_completed: this.totalTasksCompleted,
       total_tasks_failed: this.totalTasksFailed,
@@ -406,7 +421,7 @@ export class WorkerPool extends EventEmitter {
 
     // Clean up pending worker requests
     for (const [executorType, pendingQueue] of this.pendingWorkerRequests.entries()) {
-      for (const pending of pendingQueue) {
+      for (const [, pending] of pendingQueue) {
         clearTimeout(pending.timeoutId);
         // Resolve with null to unblock waiting callers
         try {

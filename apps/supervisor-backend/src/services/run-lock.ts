@@ -35,14 +35,17 @@ const DEFAULT_POLL_INTERVAL_MS = 100;    // 100ms poll interval
 
 /**
  * Lock Manager for run-level operations
+ * Uses Map for wait queues to enable O(1) removal
  */
 class RunLockManager {
   private locks: Map<string, LockInfo> = new Map();
-  private waitQueues: Map<string, Array<{
+  /** Wait queues use Map<id, waiter> for O(1) removal */
+  private waitQueues: Map<string, Map<number, {
     resolve: () => void;
     reject: (err: Error) => void;
     operation: string;
   }>> = new Map();
+  private waitQueueIdCounter = 0;
 
   /**
    * Acquire a lock for a run
@@ -142,11 +145,14 @@ class RunLockManager {
     return new Promise<boolean>((resolve, reject) => {
       const startTime = Date.now();
 
+      // Add to wait queue first and capture the ID for O(1) removal
+      const waiterId = this.addToWaitQueue(runId, operation, () => resolve(true), (err) => reject(err));
+
       const checkLock = () => {
         const elapsed = Date.now() - startTime;
         if (elapsed > timeoutMs) {
-          // Remove from wait queue
-          this.removeFromWaitQueue(runId, operation);
+          // Remove from wait queue using ID - O(1) operation
+          this.removeFromWaitQueue(runId, waiterId);
           resolve(false);
           return;
         }
@@ -170,50 +176,58 @@ class RunLockManager {
         setTimeout(checkLock, pollIntervalMs);
       };
 
-      // Add to wait queue
-      this.addToWaitQueue(runId, operation, () => resolve(true), (err) => reject(err));
-
       // Start polling
       checkLock();
     });
   }
 
+  /**
+   * Add a waiter to the queue
+   * Returns an ID for O(1) removal
+   */
   private addToWaitQueue(
     runId: string,
     operation: string,
     resolve: () => void,
     reject: (err: Error) => void
-  ): void {
+  ): number {
     let queue = this.waitQueues.get(runId);
     if (!queue) {
-      queue = [];
+      queue = new Map();
       this.waitQueues.set(runId, queue);
     }
-    queue.push({ resolve, reject, operation });
+    const id = this.waitQueueIdCounter++;
+    queue.set(id, { resolve, reject, operation });
+    return id;
   }
 
-  private removeFromWaitQueue(runId: string, operation: string): void {
+  /**
+   * Remove a waiter from the queue by ID - O(1) operation
+   */
+  private removeFromWaitQueue(runId: string, waiterId: number): void {
     const queue = this.waitQueues.get(runId);
     if (queue) {
-      const index = queue.findIndex(w => w.operation === operation);
-      if (index !== -1) {
-        queue.splice(index, 1);
-      }
-      if (queue.length === 0) {
+      queue.delete(waiterId);
+      if (queue.size === 0) {
         this.waitQueues.delete(runId);
       }
     }
   }
 
+  /**
+   * Notify the first (oldest) waiter - uses Map's insertion order
+   */
   private notifyWaiters(runId: string): void {
     const queue = this.waitQueues.get(runId);
-    if (queue && queue.length > 0) {
-      // Notify first waiter (FIFO)
-      const waiter = queue.shift();
-      if (waiter) {
+    if (queue && queue.size > 0) {
+      // Get first (oldest) entry from the Map - O(1)
+      const firstEntry = queue.entries().next();
+      if (!firstEntry.done) {
+        const [id, waiter] = firstEntry.value;
+        queue.delete(id);
         waiter.resolve();
       }
-      if (queue.length === 0) {
+      if (queue.size === 0) {
         this.waitQueues.delete(runId);
       }
     }

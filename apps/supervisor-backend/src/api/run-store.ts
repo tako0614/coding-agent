@@ -144,13 +144,13 @@ const DEFAULT_PAGE_SIZE = 20;
 const MAX_PAGE_SIZE = 100;
 
 /** Maximum number of completed runs to keep in memory */
-const MAX_MEMORY_RUNS = 100;
+const MAX_MEMORY_RUNS = parseInt(process.env['RUN_STORE_MAX_MEMORY_RUNS'] ?? '100', 10);
 
-/** TTL for completed runs in memory (10 minutes) */
-const RUN_MEMORY_TTL_MS = 10 * 60 * 1000;
+/** TTL for completed runs in memory (default: 10 minutes) */
+const RUN_MEMORY_TTL_MS = parseInt(process.env['RUN_STORE_TTL_MS'] ?? String(10 * 60 * 1000), 10);
 
-/** Cleanup interval (2 minutes) */
-const CLEANUP_INTERVAL_MS = 2 * 60 * 1000;
+/** Cleanup interval (default: 2 minutes) */
+const CLEANUP_INTERVAL_MS = parseInt(process.env['RUN_STORE_CLEANUP_INTERVAL_MS'] ?? String(2 * 60 * 1000), 10);
 
 /** Pagination options */
 export interface PaginationOptions {
@@ -204,15 +204,21 @@ function rowToRunResponse(row: RunRow): RunResponse {
  * Persists completed runs to SQLite database
  * Implements TTL-based cleanup for memory management
  */
+/** Consolidated metadata for running executions - replaces 6 separate Maps */
+interface RunningMetadata {
+  promise: Promise<SimplifiedSupervisorStateType>;
+  goal?: string;
+  startTime: string;
+  projectId?: string;
+  repoPath?: string;
+  mode: RunMode;
+}
+
 class RunStore {
   private runs: Map<string, SimplifiedSupervisorStateType> = new Map();
   private runStoredAt: Map<string, number> = new Map(); // Track when runs were stored in memory
-  private runningPromises: Map<string, Promise<SimplifiedSupervisorStateType>> = new Map();
-  private runningGoals: Map<string, string> = new Map();
-  private runningStartTimes: Map<string, string> = new Map();
-  private runProjectIds: Map<string, string> = new Map();
-  private runRepoPaths: Map<string, string> = new Map();
-  private runModes: Map<string, RunMode> = new Map();
+  /** Consolidated running execution metadata - single Map instead of 6 */
+  private runningMetadata: Map<string, RunningMetadata> = new Map();
   private cleanupTimer: NodeJS.Timeout | null = null;
 
   constructor() {
@@ -253,24 +259,24 @@ class RunStore {
    */
   private cleanupOldRuns(): void {
     const now = Date.now();
-    const toRemove: string[] = [];
+    const toRemove = new Set<string>();
 
     // Find expired runs
     for (const [runId, storedAt] of this.runStoredAt) {
       if (now - storedAt > RUN_MEMORY_TTL_MS) {
-        toRemove.push(runId);
+        toRemove.add(runId);
       }
     }
 
     // If still over limit, remove oldest
-    if (this.runs.size - toRemove.length > MAX_MEMORY_RUNS) {
+    if (this.runs.size - toRemove.size > MAX_MEMORY_RUNS) {
       const sorted = Array.from(this.runStoredAt.entries())
-        .filter(([id]) => !toRemove.includes(id))
+        .filter(([id]) => !toRemove.has(id))  // O(1) lookup with Set
         .sort((a, b) => a[1] - b[1]);
 
-      const excess = this.runs.size - toRemove.length - MAX_MEMORY_RUNS;
+      const excess = this.runs.size - toRemove.size - MAX_MEMORY_RUNS;
       for (let i = 0; i < excess && i < sorted.length; i++) {
-        toRemove.push(sorted[i]![0]);
+        toRemove.add(sorted[i]![0]);
       }
     }
 
@@ -280,8 +286,8 @@ class RunStore {
       this.runStoredAt.delete(runId);
     }
 
-    if (toRemove.length > 0) {
-      logger.debug('Cleaned up old runs from memory', { count: toRemove.length });
+    if (toRemove.size > 0) {
+      logger.debug('Cleaned up old runs from memory', { count: toRemove.size });
     }
   }
 
@@ -291,21 +297,16 @@ class RunStore {
   set(runId: string, state: SimplifiedSupervisorStateType): void {
     this.runs.set(runId, state);
     this.runStoredAt.set(runId, Date.now());
-    this.runningPromises.delete(runId);
     this.persistToDb(runId, state);
-    // Clean up all associated tracking data
-    this.cleanupRunTracking(runId);
+    // Clean up running metadata
+    this.runningMetadata.delete(runId);
   }
 
   /**
    * Clean up all tracking data for a run
    */
   private cleanupRunTracking(runId: string): void {
-    this.runningGoals.delete(runId);
-    this.runningStartTimes.delete(runId);
-    this.runProjectIds.delete(runId);
-    this.runRepoPaths.delete(runId);
-    this.runModes.delete(runId);
+    this.runningMetadata.delete(runId);
   }
 
   /**
@@ -346,12 +347,13 @@ class RunStore {
   private persistToDb(runId: string, state: SimplifiedSupervisorStateType): void {
     try {
       logger.debug('Persisting run to DB', { runId });
+      const meta = this.runningMetadata.get(runId);
       getInsertRunStmt().run({
         run_id: state.run_id,
-        project_id: state.project_id || this.runProjectIds.get(runId) || null,
+        project_id: state.project_id || meta?.projectId || null,
         user_goal: state.user_goal,
-        repo_path: state.repo_path || this.runRepoPaths.get(runId) || '',
-        mode: this.runModes.get(runId) || 'implementation',
+        repo_path: state.repo_path || meta?.repoPath || '',
+        mode: meta?.mode || 'implementation',
         final_report: state.final_summary || null,
         error: state.error || null,
         dag_json: null,
@@ -409,7 +411,7 @@ class RunStore {
    * Check if a run exists
    */
   has(runId: string): boolean {
-    if (this.runs.has(runId) || this.runningPromises.has(runId)) {
+    if (this.runs.has(runId) || this.runningMetadata.has(runId)) {
       return true;
     }
     try {
@@ -424,8 +426,7 @@ class RunStore {
    * Delete a run (from memory and DB)
    */
   delete(runId: string): boolean {
-    this.runningPromises.delete(runId);
-    this.cleanupRunTracking(runId);
+    this.runningMetadata.delete(runId);
     this.runStoredAt.delete(runId);
     const memDeleted = this.runs.delete(runId);
 
@@ -444,26 +445,19 @@ class RunStore {
    * Uses transaction for atomic database update
    */
   markFailed(runId: string, error: string): void {
-    const goal = this.runningGoals.get(runId);
-    const repoPath = this.runRepoPaths.get(runId);
-    const projectId = this.runProjectIds.get(runId);
-    const mode = this.runModes.get(runId) || 'implementation';
-    const startTime = this.runningStartTimes.get(runId);
+    const meta = this.runningMetadata.get(runId);
     const now = new Date().toISOString();
-
-    // Remove from running
-    this.runningPromises.delete(runId);
 
     // Persist failed state using transaction
     try {
       getMarkFailedTransaction()({
         run_id: runId,
-        project_id: projectId || null,
-        user_goal: goal || '',
-        repo_path: repoPath || '',
-        mode,
+        project_id: meta?.projectId || null,
+        user_goal: meta?.goal || '',
+        repo_path: meta?.repoPath || '',
+        mode: meta?.mode || 'implementation',
         error: error,
-        created_at: startTime || now,
+        created_at: meta?.startTime || now,
         updated_at: now,
       });
     } catch (err) {
@@ -472,7 +466,7 @@ class RunStore {
     }
 
     // Cleanup tracking
-    this.cleanupRunTracking(runId);
+    this.runningMetadata.delete(runId);
   }
 
   /**
@@ -483,16 +477,16 @@ class RunStore {
     const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, options?.pageSize ?? DEFAULT_PAGE_SIZE));
     const offset = (page - 1) * pageSize;
 
-    const runningIds = new Set(this.runningPromises.keys());
+    const runningIds = new Set(this.runningMetadata.keys());
     const runningCount = runningIds.size;
 
-    const running = Array.from(runningIds).map(runId => ({
+    const running = Array.from(this.runningMetadata.entries()).map(([runId, meta]) => ({
       run_id: runId,
-      project_id: this.runProjectIds.get(runId),
-      mode: this.runModes.get(runId) || 'implementation' as RunMode,
+      project_id: meta.projectId,
+      mode: meta.mode,
       status: 'running' as const,
-      user_goal: this.runningGoals.get(runId) ?? 'Unknown goal',
-      created_at: this.runningStartTimes.get(runId) ?? new Date().toISOString(),
+      user_goal: meta.goal ?? 'Unknown goal',
+      created_at: meta.startTime,
       updated_at: new Date().toISOString(),
     }));
 
@@ -510,9 +504,13 @@ class RunStore {
         const remainingSlots = pageSize - runningSlice.length;
         if (remainingSlots > 0) {
           const rows = getListRunsStmt().all(remainingSlots, 0) as RunRow[];
-          const fromDb = rows
-            .filter(row => !runningIds.has(row.run_id))
-            .map(rowToRunResponse);
+          // Single-pass filter+map instead of chained operations
+          const fromDb: RunResponse[] = [];
+          for (const row of rows) {
+            if (!runningIds.has(row.run_id)) {
+              fromDb.push(rowToRunResponse(row));
+            }
+          }
           runs = [...runningSlice, ...fromDb];
         } else {
           runs = runningSlice;
@@ -521,9 +519,13 @@ class RunStore {
         // Page is entirely from DB
         const dbOffset = offset - runningCount;
         const rows = getListRunsStmt().all(pageSize, dbOffset) as RunRow[];
-        runs = rows
-          .filter(row => !runningIds.has(row.run_id))
-          .map(rowToRunResponse);
+        // Single-pass filter+map instead of chained operations
+        runs = [];
+        for (const row of rows) {
+          if (!runningIds.has(row.run_id)) {
+            runs.push(rowToRunResponse(row));
+          }
+        }
       }
 
       const totalPages = Math.ceil(totalCount / pageSize);
@@ -564,19 +566,23 @@ class RunStore {
     const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, options?.pageSize ?? DEFAULT_PAGE_SIZE));
     const offset = (page - 1) * pageSize;
 
-    const runningIds = new Set(
-      Array.from(this.runningPromises.keys())
-        .filter(runId => this.runProjectIds.get(runId) === projectId)
-    );
-    const runningCount = runningIds.size;
+    // Filter running metadata by projectId in single pass
+    const runningForProject: Array<{ runId: string; meta: RunningMetadata }> = [];
+    for (const [runId, meta] of this.runningMetadata) {
+      if (meta.projectId === projectId) {
+        runningForProject.push({ runId, meta });
+      }
+    }
+    const runningIds = new Set(runningForProject.map(r => r.runId));
+    const runningCount = runningForProject.length;
 
-    const running = Array.from(runningIds).map(runId => ({
+    const running = runningForProject.map(({ runId, meta }) => ({
       run_id: runId,
       project_id: projectId,
-      mode: this.runModes.get(runId) || 'implementation' as RunMode,
+      mode: meta.mode,
       status: 'running' as const,
-      user_goal: this.runningGoals.get(runId) ?? 'Unknown goal',
-      created_at: this.runningStartTimes.get(runId) ?? new Date().toISOString(),
+      user_goal: meta.goal ?? 'Unknown goal',
+      created_at: meta.startTime,
       updated_at: new Date().toISOString(),
     }));
 
@@ -594,9 +600,13 @@ class RunStore {
         const remainingSlots = pageSize - runningSlice.length;
         if (remainingSlots > 0) {
           const rows = getListRunsByProjectStmt().all(projectId, remainingSlots, 0) as RunRow[];
-          const fromDb = rows
-            .filter(row => !runningIds.has(row.run_id))
-            .map(rowToRunResponse);
+          // Single-pass filter+map instead of chained operations
+          const fromDb: RunResponse[] = [];
+          for (const row of rows) {
+            if (!runningIds.has(row.run_id)) {
+              fromDb.push(rowToRunResponse(row));
+            }
+          }
           runs = [...runningSlice, ...fromDb];
         } else {
           runs = runningSlice;
@@ -605,9 +615,13 @@ class RunStore {
         // Page is entirely from DB
         const dbOffset = offset - runningCount;
         const rows = getListRunsByProjectStmt().all(projectId, pageSize, dbOffset) as RunRow[];
-        runs = rows
-          .filter(row => !runningIds.has(row.run_id))
-          .map(rowToRunResponse);
+        // Single-pass filter+map instead of chained operations
+        runs = [];
+        for (const row of rows) {
+          if (!runningIds.has(row.run_id)) {
+            runs.push(rowToRunResponse(row));
+          }
+        }
       }
 
       const totalPages = Math.ceil(totalCount / pageSize);
@@ -645,19 +659,18 @@ class RunStore {
    * Uses transaction for atomic database insertion
    */
   setRunning(runId: string, promise: Promise<SimplifiedSupervisorStateType>, goal?: string, projectId?: string, repoPath?: string, mode?: RunMode): void {
-    this.runningPromises.set(runId, promise);
-    if (goal) {
-      this.runningGoals.set(runId, goal);
-    }
-    if (projectId) {
-      this.runProjectIds.set(runId, projectId);
-    }
-    if (repoPath) {
-      this.runRepoPaths.set(runId, repoPath);
-    }
-    this.runModes.set(runId, mode || 'implementation');
     const now = new Date().toISOString();
-    this.runningStartTimes.set(runId, now);
+    const runMode = mode || 'implementation';
+
+    // Store all metadata in single Map entry
+    this.runningMetadata.set(runId, {
+      promise,
+      goal,
+      startTime: now,
+      projectId,
+      repoPath,
+      mode: runMode,
+    });
 
     try {
       console.log('[DEBUG] setRunning: Inserting run record', { runId, goal: goal?.slice(0, 50), repoPath });
@@ -666,7 +679,7 @@ class RunStore {
         project_id: projectId || null,
         user_goal: goal || '',
         repo_path: repoPath || '',
-        mode: mode || 'implementation',
+        mode: runMode,
         created_at: now,
         updated_at: now,
       });
@@ -682,16 +695,16 @@ class RunStore {
    * Check if a run is currently executing
    */
   isRunning(runId: string): boolean {
-    return this.runningPromises.has(runId);
+    return this.runningMetadata.has(runId);
   }
 
   /**
    * Wait for a run to complete
    */
   async waitFor(runId: string): Promise<SimplifiedSupervisorStateType | undefined> {
-    const promise = this.runningPromises.get(runId);
-    if (promise) {
-      return promise;
+    const meta = this.runningMetadata.get(runId);
+    if (meta?.promise) {
+      return meta.promise;
     }
     return this.get(runId);
   }
@@ -703,7 +716,7 @@ class RunStore {
     return {
       run_id: state.run_id,
       project_id: state.project_id,
-      mode: mode || this.runModes.get(state.run_id) || 'implementation',
+      mode: mode || this.runningMetadata.get(state.run_id)?.mode || 'implementation',
       status: state.status,
       user_goal: state.user_goal,
       created_at: state.created_at,
@@ -718,14 +731,17 @@ class RunStore {
    * Get mode for a run
    */
   getMode(runId: string): RunMode {
-    return this.runModes.get(runId) || 'implementation';
+    return this.runningMetadata.get(runId)?.mode || 'implementation';
   }
 
   /**
    * Set mode for a run (for spec mode runs)
    */
   setMode(runId: string, mode: RunMode): void {
-    this.runModes.set(runId, mode);
+    const meta = this.runningMetadata.get(runId);
+    if (meta) {
+      meta.mode = mode;
+    }
   }
 
   /**
@@ -748,12 +764,7 @@ class RunStore {
   clear(): void {
     this.runs.clear();
     this.runStoredAt.clear();
-    this.runningPromises.clear();
-    this.runningGoals.clear();
-    this.runningStartTimes.clear();
-    this.runProjectIds.clear();
-    this.runRepoPaths.clear();
-    this.runModes.clear();
+    this.runningMetadata.clear();
   }
 }
 

@@ -196,141 +196,82 @@ export function deleteSetting(key: SettingKey): boolean {
   return result.changes > 0;
 }
 
+// Mapping from DB key to AppSettings field name and value transformer
+type SettingTransform = { field: keyof AppSettings; transform?: (v: string) => unknown };
+const KEY_TO_FIELD: Record<string, SettingTransform> = {
+  [SETTING_KEYS.OPENAI_API_KEY]: { field: 'openai_api_key' },
+  [SETTING_KEYS.ANTHROPIC_API_KEY]: { field: 'anthropic_api_key' },
+  [SETTING_KEYS.DEFAULT_MODEL]: { field: 'default_model' },
+  [SETTING_KEYS.COPILOT_API_URL]: { field: 'copilot_api_url' },
+  [SETTING_KEYS.GITHUB_TOKEN]: { field: 'github_token' },
+  [SETTING_KEYS.USE_COPILOT_API]: { field: 'use_copilot_api', transform: (v) => v === 'true' },
+  [SETTING_KEYS.DAG_MODEL]: { field: 'dag_model' },
+  [SETTING_KEYS.EXECUTOR_MODE]: { field: 'executor_mode' },
+  [SETTING_KEYS.SPEC_MODEL]: { field: 'spec_model' },
+  [SETTING_KEYS.CLAUDE_MODEL]: { field: 'claude_model' },
+  [SETTING_KEYS.CODEX_MODEL]: { field: 'codex_model' },
+};
+
 /**
  * Get all settings as an object
+ * Uses O(1) map lookup instead of switch statement
  */
 export function getAllSettings(): AppSettings {
   const rows = getListStmt().all() as Array<{ key: string; value: string }>;
   const settings: AppSettings = {};
 
   for (const row of rows) {
-    switch (row.key) {
-      case SETTING_KEYS.OPENAI_API_KEY:
-        settings.openai_api_key = row.value;
-        break;
-      case SETTING_KEYS.ANTHROPIC_API_KEY:
-        settings.anthropic_api_key = row.value;
-        break;
-      case SETTING_KEYS.DEFAULT_MODEL:
-        settings.default_model = row.value;
-        break;
-      case SETTING_KEYS.COPILOT_API_URL:
-        settings.copilot_api_url = row.value;
-        break;
-      case SETTING_KEYS.GITHUB_TOKEN:
-        settings.github_token = row.value;
-        break;
-      case SETTING_KEYS.USE_COPILOT_API:
-        settings.use_copilot_api = row.value === 'true';
-        break;
-      case SETTING_KEYS.DAG_MODEL:
-        settings.dag_model = row.value;
-        break;
-      case SETTING_KEYS.EXECUTOR_MODE:
-        settings.executor_mode = row.value as ExecutorMode;
-        break;
-      case SETTING_KEYS.SPEC_MODEL:
-        settings.spec_model = row.value;
-        break;
-      case SETTING_KEYS.CLAUDE_MODEL:
-        settings.claude_model = row.value;
-        break;
-      case SETTING_KEYS.CODEX_MODEL:
-        settings.codex_model = row.value;
-        break;
+    const mapping = KEY_TO_FIELD[row.key];
+    if (mapping) {
+      const value = mapping.transform ? mapping.transform(row.value) : row.value;
+      (settings as Record<string, unknown>)[mapping.field] = value;
     }
   }
 
   return settings;
 }
 
+// Mapping from AppSettings field to DB key and value serializer
+type SettingUpdate = { key: string; serialize?: (v: unknown) => string; alwaysUpsert?: boolean };
+const FIELD_TO_KEY: Record<keyof AppSettings, SettingUpdate> = {
+  openai_api_key: { key: SETTING_KEYS.OPENAI_API_KEY },
+  anthropic_api_key: { key: SETTING_KEYS.ANTHROPIC_API_KEY },
+  default_model: { key: SETTING_KEYS.DEFAULT_MODEL },
+  copilot_api_url: { key: SETTING_KEYS.COPILOT_API_URL },
+  github_token: { key: SETTING_KEYS.GITHUB_TOKEN },
+  use_copilot_api: { key: SETTING_KEYS.USE_COPILOT_API, serialize: (v) => String(v), alwaysUpsert: true },
+  dag_model: { key: SETTING_KEYS.DAG_MODEL },
+  executor_mode: { key: SETTING_KEYS.EXECUTOR_MODE },
+  spec_model: { key: SETTING_KEYS.SPEC_MODEL },
+  claude_model: { key: SETTING_KEYS.CLAUDE_MODEL },
+  codex_model: { key: SETTING_KEYS.CODEX_MODEL },
+  // These fields are not stored in settings DB (handled separately or read-only)
+  shell_allowlist: { key: SETTING_KEYS.SHELL_ALLOWLIST },
+  shell_denylist: { key: SETTING_KEYS.SHELL_DENYLIST },
+  max_workers: { key: SETTING_KEYS.MAX_WORKERS },
+  task_timeout_ms: { key: SETTING_KEYS.TASK_TIMEOUT_MS },
+  max_context_tokens: { key: SETTING_KEYS.MAX_CONTEXT_TOKENS },
+  agent_timeout_ms: { key: SETTING_KEYS.AGENT_TIMEOUT_MS },
+  command_timeout_ms: { key: SETTING_KEYS.COMMAND_TIMEOUT_MS },
+};
+
 /**
  * Update multiple settings at once
+ * Uses loop over mapping instead of repeated if blocks
  */
 export function updateSettings(settings: Partial<AppSettings>): void {
   const now = new Date().toISOString();
 
-  if (settings.openai_api_key !== undefined) {
-    if (settings.openai_api_key) {
-      getUpsertStmt().run({ key: SETTING_KEYS.OPENAI_API_KEY, value: settings.openai_api_key, updated_at: now });
-    } else {
-      getDeleteStmt().run(SETTING_KEYS.OPENAI_API_KEY);
-    }
-  }
+  for (const [field, mapping] of Object.entries(FIELD_TO_KEY)) {
+    const value = settings[field as keyof AppSettings];
+    if (value === undefined) continue;
 
-  if (settings.anthropic_api_key !== undefined) {
-    if (settings.anthropic_api_key) {
-      getUpsertStmt().run({ key: SETTING_KEYS.ANTHROPIC_API_KEY, value: settings.anthropic_api_key, updated_at: now });
-    } else {
-      getDeleteStmt().run(SETTING_KEYS.ANTHROPIC_API_KEY);
-    }
-  }
+    const serialized = mapping.serialize ? mapping.serialize(value) : String(value);
 
-  if (settings.default_model !== undefined) {
-    if (settings.default_model) {
-      getUpsertStmt().run({ key: SETTING_KEYS.DEFAULT_MODEL, value: settings.default_model, updated_at: now });
+    if (value || mapping.alwaysUpsert) {
+      getUpsertStmt().run({ key: mapping.key, value: serialized, updated_at: now });
     } else {
-      getDeleteStmt().run(SETTING_KEYS.DEFAULT_MODEL);
-    }
-  }
-
-  if (settings.copilot_api_url !== undefined) {
-    if (settings.copilot_api_url) {
-      getUpsertStmt().run({ key: SETTING_KEYS.COPILOT_API_URL, value: settings.copilot_api_url, updated_at: now });
-    } else {
-      getDeleteStmt().run(SETTING_KEYS.COPILOT_API_URL);
-    }
-  }
-
-  if (settings.github_token !== undefined) {
-    if (settings.github_token) {
-      getUpsertStmt().run({ key: SETTING_KEYS.GITHUB_TOKEN, value: settings.github_token, updated_at: now });
-    } else {
-      getDeleteStmt().run(SETTING_KEYS.GITHUB_TOKEN);
-    }
-  }
-
-  if (settings.use_copilot_api !== undefined) {
-    getUpsertStmt().run({ key: SETTING_KEYS.USE_COPILOT_API, value: String(settings.use_copilot_api), updated_at: now });
-  }
-
-  if (settings.dag_model !== undefined) {
-    if (settings.dag_model) {
-      getUpsertStmt().run({ key: SETTING_KEYS.DAG_MODEL, value: settings.dag_model, updated_at: now });
-    } else {
-      getDeleteStmt().run(SETTING_KEYS.DAG_MODEL);
-    }
-  }
-
-  if (settings.executor_mode !== undefined) {
-    if (settings.executor_mode) {
-      getUpsertStmt().run({ key: SETTING_KEYS.EXECUTOR_MODE, value: settings.executor_mode, updated_at: now });
-    } else {
-      getDeleteStmt().run(SETTING_KEYS.EXECUTOR_MODE);
-    }
-  }
-
-  if (settings.spec_model !== undefined) {
-    if (settings.spec_model) {
-      getUpsertStmt().run({ key: SETTING_KEYS.SPEC_MODEL, value: settings.spec_model, updated_at: now });
-    } else {
-      getDeleteStmt().run(SETTING_KEYS.SPEC_MODEL);
-    }
-  }
-
-  if (settings.claude_model !== undefined) {
-    if (settings.claude_model) {
-      getUpsertStmt().run({ key: SETTING_KEYS.CLAUDE_MODEL, value: settings.claude_model, updated_at: now });
-    } else {
-      getDeleteStmt().run(SETTING_KEYS.CLAUDE_MODEL);
-    }
-  }
-
-  if (settings.codex_model !== undefined) {
-    if (settings.codex_model) {
-      getUpsertStmt().run({ key: SETTING_KEYS.CODEX_MODEL, value: settings.codex_model, updated_at: now });
-    } else {
-      getDeleteStmt().run(SETTING_KEYS.CODEX_MODEL);
+      getDeleteStmt().run(mapping.key);
     }
   }
 }

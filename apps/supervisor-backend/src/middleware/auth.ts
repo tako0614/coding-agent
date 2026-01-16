@@ -66,26 +66,33 @@ interface AuthContext {
 // JWT Utilities
 // =============================================================================
 
+// Character mapping for base64url encoding (single-pass optimization)
+const BASE64_TO_BASE64URL: Record<string, string> = { '+': '-', '/': '_', '=': '' };
+const BASE64URL_TO_BASE64: Record<string, string> = { '-': '+', '_': '/' };
+
 /**
  * Base64URL encode a string
+ * Uses single-pass character mapping instead of chained replace()
  */
 function base64UrlEncode(str: string): string {
   return Buffer.from(str)
     .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=/g, '');
+    .replace(/[+/=]/g, (c) => BASE64_TO_BASE64URL[c] ?? c);
 }
 
 /**
  * Base64URL decode a string
+ * Uses single-pass character mapping instead of chained replace()
  */
 function base64UrlDecode(str: string): string {
-  str = str.replace(/-/g, '+').replace(/_/g, '/');
-  while (str.length % 4) {
-    str += '=';
+  // Single-pass character replacement
+  let result = str.replace(/[-_]/g, (c) => BASE64URL_TO_BASE64[c] ?? c);
+  // Pad to multiple of 4
+  const padLength = (4 - (result.length % 4)) % 4;
+  if (padLength > 0) {
+    result += '='.repeat(padLength);
   }
-  return Buffer.from(str, 'base64').toString('utf-8');
+  return Buffer.from(result, 'base64').toString('utf-8');
 }
 
 /**

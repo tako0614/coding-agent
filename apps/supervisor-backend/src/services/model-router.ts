@@ -32,7 +32,7 @@ export class ModelRouterService {
   private config: Required<ModelRouterConfig>;
   private cachedUsage?: UsageInfo;
   private usageCacheTime: number = 0;
-  private readonly CACHE_TTL_MS = 60000; // 1 minute
+  private readonly CACHE_TTL_MS = parseInt(process.env['MODEL_ROUTER_CACHE_TTL_MS'] ?? '60000', 10); // 1 minute default
 
   constructor(config: ModelRouterConfig = {}) {
     this.config = {

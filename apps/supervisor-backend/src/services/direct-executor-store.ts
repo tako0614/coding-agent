@@ -29,9 +29,9 @@ interface SessionEntry {
   codexAdapter?: CodexAdapter;
 }
 
-const MAX_SESSIONS = 20;
-const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
-const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const MAX_SESSIONS = parseInt(process.env['DIRECT_EXECUTOR_MAX_SESSIONS'] ?? '20', 10);
+const SESSION_TTL_MS = parseInt(process.env['DIRECT_EXECUTOR_TTL_MS'] ?? String(30 * 60 * 1000), 10); // 30 minutes default
+const CLEANUP_INTERVAL_MS = parseInt(process.env['DIRECT_EXECUTOR_CLEANUP_INTERVAL_MS'] ?? String(5 * 60 * 1000), 10); // 5 minutes default
 
 class DirectExecutorStore {
   private sessions: Map<string, SessionEntry> = new Map();

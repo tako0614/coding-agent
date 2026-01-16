@@ -17,9 +17,12 @@ const MIN_ROWS = 5;
 const MAX_ROWS = parseInt(process.env['PTY_MAX_ROWS'] ?? '200', 10);
 
 // Ring buffer for output storage
+// Optimized: tracks total length incrementally, uses index instead of shift()
 class OutputBuffer {
   private buffer: string[] = [];
   private maxSize: number;
+  private totalLength = 0;
+  private startIndex = 0;  // Virtual start index to avoid shift() O(n) operations
 
   constructor(maxSize: number = 50000) {
     this.maxSize = maxSize;
@@ -27,20 +30,33 @@ class OutputBuffer {
 
   append(data: string): void {
     this.buffer.push(data);
-    // Trim if exceeds max size
-    let totalLength = this.buffer.reduce((sum, s) => sum + s.length, 0);
-    while (totalLength > this.maxSize && this.buffer.length > 0) {
-      const removed = this.buffer.shift();
-      totalLength -= removed?.length || 0;
+    this.totalLength += data.length;
+
+    // Trim if exceeds max size - O(k) where k is number of items to remove
+    while (this.totalLength > this.maxSize && this.startIndex < this.buffer.length) {
+      const removed = this.buffer[this.startIndex];
+      if (removed) {
+        this.totalLength -= removed.length;
+        this.buffer[this.startIndex] = '';  // Allow GC, avoid shift()
+      }
+      this.startIndex++;
+    }
+
+    // Periodically compact the array to reclaim memory (when half is empty)
+    if (this.startIndex > this.buffer.length / 2 && this.startIndex > 100) {
+      this.buffer = this.buffer.slice(this.startIndex);
+      this.startIndex = 0;
     }
   }
 
   getAll(): string {
-    return this.buffer.join('');
+    return this.buffer.slice(this.startIndex).join('');
   }
 
   clear(): void {
     this.buffer = [];
+    this.totalLength = 0;
+    this.startIndex = 0;
   }
 }
 
@@ -59,9 +75,15 @@ interface PtySession {
   exitSignal?: number;
 }
 
+// Session timeout for orphaned PTY sessions (default: 30 minutes)
+const PTY_SESSION_TIMEOUT_MS = parseInt(process.env['PTY_SESSION_TIMEOUT_MS'] ?? String(30 * 60 * 1000), 10);
+
+// Exited session retention time (default: 60 seconds)
+const PTY_EXITED_SESSION_RETENTION_MS = parseInt(process.env['PTY_EXITED_SESSION_RETENTION_MS'] ?? '60000', 10);
+
 class PtyService {
   private sessions: Map<string, PtySession> = new Map();
-  private sessionTimeout = 30 * 60 * 1000; // 30 minutes timeout for orphaned sessions
+  private sessionTimeout = PTY_SESSION_TIMEOUT_MS;
 
   /**
    * Get the default shell for the current platform
@@ -136,7 +158,7 @@ class PtyService {
           this.sessions.delete(sessionId);
           logger.info('Cleaned up exited PTY session', { sessionId });
         }
-      }, 60000); // Keep exited sessions for 1 minute
+      }, PTY_EXITED_SESSION_RETENTION_MS);
     });
 
     this.setupWebSocketHandlers(session, ws);
