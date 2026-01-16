@@ -39,68 +39,104 @@ function createConversationId(): string {
   return `conv_${uuidv4().replace(/-/g, '').slice(0, 16)}`;
 }
 
-// Prepared statements
-const insertThreadStmt = db.prepare(`
-  INSERT INTO conversation_threads
-    (conversation_id, run_id, parent_conversation_id, branch_point_seq, name, is_active, created_at, updated_at)
-  VALUES
-    (@conversation_id, @run_id, @parent_conversation_id, @branch_point_seq, @name, @is_active, @created_at, @updated_at)
-`);
+interface NextSeqResult {
+  next_seq: number;
+}
 
-const getThreadStmt = db.prepare(`
-  SELECT * FROM conversation_threads WHERE conversation_id = ?
-`);
+// Type guard for SQLite sequence result
+function isNextSeqResult(value: unknown): value is NextSeqResult {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'next_seq' in value &&
+    typeof (value as NextSeqResult).next_seq === 'number'
+  );
+}
 
-const getThreadsByRunStmt = db.prepare(`
-  SELECT * FROM conversation_threads WHERE run_id = ? ORDER BY created_at ASC
-`);
+// Lazy-initialized prepared statements (for hot-reload compatibility)
+function getInsertThreadStmt() {
+  return db.prepare(`
+    INSERT INTO conversation_threads
+      (conversation_id, run_id, parent_conversation_id, branch_point_seq, name, is_active, created_at, updated_at)
+    VALUES
+      (@conversation_id, @run_id, @parent_conversation_id, @branch_point_seq, @name, @is_active, @created_at, @updated_at)
+  `);
+}
 
-const getActiveThreadStmt = db.prepare(`
-  SELECT * FROM conversation_threads WHERE run_id = ? AND is_active = 1 LIMIT 1
-`);
+function getGetThreadStmt() {
+  return db.prepare(`
+    SELECT * FROM conversation_threads WHERE conversation_id = ?
+  `);
+}
 
-const updateThreadStmt = db.prepare(`
-  UPDATE conversation_threads SET
-    name = COALESCE(@name, name),
-    is_active = @is_active,
-    updated_at = @updated_at
-  WHERE conversation_id = @conversation_id
-`);
+function getGetThreadsByRunStmt() {
+  return db.prepare(`
+    SELECT * FROM conversation_threads WHERE run_id = ? ORDER BY created_at ASC
+  `);
+}
 
-const deactivateAllThreadsStmt = db.prepare(`
-  UPDATE conversation_threads SET is_active = 0, updated_at = ? WHERE run_id = ?
-`);
+function getGetActiveThreadStmt() {
+  return db.prepare(`
+    SELECT * FROM conversation_threads WHERE run_id = ? AND is_active = 1 LIMIT 1
+  `);
+}
 
-const deleteThreadStmt = db.prepare(`
-  DELETE FROM conversation_threads WHERE conversation_id = ?
-`);
+function getUpdateThreadStmt() {
+  return db.prepare(`
+    UPDATE conversation_threads SET
+      name = COALESCE(@name, name),
+      is_active = @is_active,
+      updated_at = @updated_at
+    WHERE conversation_id = @conversation_id
+  `);
+}
 
-const getThreadMessagesStmt = db.prepare(`
-  SELECT * FROM conversation_messages
-  WHERE conversation_id = ?
-  ORDER BY seq ASC
-`);
+function getDeactivateAllThreadsStmt() {
+  return db.prepare(`
+    UPDATE conversation_threads SET is_active = 0, updated_at = ? WHERE run_id = ?
+  `);
+}
 
-const insertMessageWithThreadStmt = db.prepare(`
-  INSERT INTO conversation_messages
-    (run_id, conversation_id, seq, role, content, tool_calls_json, created_at)
-  VALUES
-    (@run_id, @conversation_id, @seq, @role, @content, @tool_calls_json, @created_at)
-`);
+function getDeleteThreadStmt() {
+  return db.prepare(`
+    DELETE FROM conversation_threads WHERE conversation_id = ?
+  `);
+}
 
-const getNextSeqForThreadStmt = db.prepare(`
-  SELECT COALESCE(MAX(seq), -1) + 1 as next_seq
-  FROM conversation_messages
-  WHERE conversation_id = ?
-`);
+function getGetThreadMessagesStmt() {
+  return db.prepare(`
+    SELECT * FROM conversation_messages
+    WHERE conversation_id = ?
+    ORDER BY seq ASC
+  `);
+}
 
-const copyMessagesUpToSeqStmt = db.prepare(`
-  INSERT INTO conversation_messages (run_id, conversation_id, seq, role, content, tool_calls_json, created_at)
-  SELECT run_id, ?, seq, role, content, tool_calls_json, created_at
-  FROM conversation_messages
-  WHERE conversation_id = ? AND seq <= ?
-  ORDER BY seq ASC
-`);
+function getInsertMessageWithThreadStmt() {
+  return db.prepare(`
+    INSERT INTO conversation_messages
+      (run_id, conversation_id, seq, role, content, tool_calls_json, created_at)
+    VALUES
+      (@run_id, @conversation_id, @seq, @role, @content, @tool_calls_json, @created_at)
+  `);
+}
+
+function getGetNextSeqForThreadStmt() {
+  return db.prepare(`
+    SELECT COALESCE(MAX(seq), -1) + 1 as next_seq
+    FROM conversation_messages
+    WHERE conversation_id = ?
+  `);
+}
+
+function getCopyMessagesUpToSeqStmt() {
+  return db.prepare(`
+    INSERT INTO conversation_messages (run_id, conversation_id, seq, role, content, tool_calls_json, created_at)
+    SELECT run_id, ?, seq, role, content, tool_calls_json, created_at
+    FROM conversation_messages
+    WHERE conversation_id = ? AND seq <= ?
+    ORDER BY seq ASC
+  `);
+}
 
 interface ThreadRow {
   conversation_id: string;
@@ -126,41 +162,43 @@ function rowToThread(row: ThreadRow): ConversationThread {
   };
 }
 
-// Transaction wrapper for multi-step operations
-const createThreadTransaction = db.transaction((
-  conversationId: string,
-  runId: string,
-  options: {
-    name?: string;
-    parentConversationId?: string;
-    branchPointSeq?: number;
-  },
-  now: string
-) => {
-  // If branching, copy messages up to branch point
-  if (options.parentConversationId && options.branchPointSeq !== undefined) {
-    copyMessagesUpToSeqStmt.run(
-      conversationId,
-      options.parentConversationId,
-      options.branchPointSeq
-    );
-  }
+// Lazy-initialized transaction wrapper for multi-step operations
+function getCreateThreadTransaction() {
+  return db.transaction((
+    conversationId: string,
+    runId: string,
+    options: {
+      name?: string;
+      parentConversationId?: string;
+      branchPointSeq?: number;
+    },
+    now: string
+  ) => {
+    // If branching, copy messages up to branch point
+    if (options.parentConversationId && options.branchPointSeq !== undefined) {
+      getCopyMessagesUpToSeqStmt().run(
+        conversationId,
+        options.parentConversationId,
+        options.branchPointSeq
+      );
+    }
 
-  // Deactivate other threads if this is a new active thread
-  deactivateAllThreadsStmt.run(now, runId);
+    // Deactivate other threads if this is a new active thread
+    getDeactivateAllThreadsStmt().run(now, runId);
 
-  // Insert the new thread
-  insertThreadStmt.run({
-    conversation_id: conversationId,
-    run_id: runId,
-    parent_conversation_id: options.parentConversationId || null,
-    branch_point_seq: options.branchPointSeq ?? null,
-    name: options.name || null,
-    is_active: 1,
-    created_at: now,
-    updated_at: now,
+    // Insert the new thread
+    getInsertThreadStmt().run({
+      conversation_id: conversationId,
+      run_id: runId,
+      parent_conversation_id: options.parentConversationId || null,
+      branch_point_seq: options.branchPointSeq ?? null,
+      name: options.name || null,
+      is_active: 1,
+      created_at: now,
+      updated_at: now,
+    });
   });
-});
+}
 
 /**
  * Create a new conversation thread for a run
@@ -179,7 +217,7 @@ export function createThread(
 
   try {
     // Execute all operations in a single transaction
-    createThreadTransaction(conversationId, runId, options, now);
+    getCreateThreadTransaction()(conversationId, runId, options, now);
 
     logger.debug('Created conversation thread', {
       conversationId,
@@ -211,7 +249,7 @@ export function createThread(
  */
 export function getThread(conversationId: string): ConversationThread | undefined {
   try {
-    const row = getThreadStmt.get(conversationId) as ThreadRow | undefined;
+    const row = getGetThreadStmt().get(conversationId) as ThreadRow | undefined;
     if (!row) return undefined;
     return rowToThread(row);
   } catch (err) {
@@ -228,7 +266,7 @@ export function getThread(conversationId: string): ConversationThread | undefine
  */
 export function getThreadsForRun(runId: string): ConversationThread[] {
   try {
-    const rows = getThreadsByRunStmt.all(runId) as ThreadRow[];
+    const rows = getGetThreadsByRunStmt().all(runId) as ThreadRow[];
     return rows.map(rowToThread);
   } catch (err) {
     logger.error('Failed to get threads for run', {
@@ -244,7 +282,7 @@ export function getThreadsForRun(runId: string): ConversationThread[] {
  */
 export function getActiveThread(runId: string): ConversationThread | undefined {
   try {
-    const row = getActiveThreadStmt.get(runId) as ThreadRow | undefined;
+    const row = getGetActiveThreadStmt().get(runId) as ThreadRow | undefined;
     if (!row) return undefined;
     return rowToThread(row);
   } catch (err) {
@@ -267,23 +305,25 @@ export function getOrCreateActiveThread(runId: string): ConversationThread {
   return createThread(runId, { name: 'Main' });
 }
 
-// Transaction wrapper for thread switching
-const switchThreadTransaction = db.transaction((
-  runId: string,
-  conversationId: string,
-  now: string
-) => {
-  // Deactivate all threads
-  deactivateAllThreadsStmt.run(now, runId);
+// Lazy-initialized transaction wrapper for thread switching
+function getSwitchThreadTransaction() {
+  return db.transaction((
+    runId: string,
+    conversationId: string,
+    now: string
+  ) => {
+    // Deactivate all threads
+    getDeactivateAllThreadsStmt().run(now, runId);
 
-  // Activate the target thread
-  updateThreadStmt.run({
-    conversation_id: conversationId,
-    name: null, // Keep existing name
-    is_active: 1,
-    updated_at: now,
+    // Activate the target thread
+    getUpdateThreadStmt().run({
+      conversation_id: conversationId,
+      name: null, // Keep existing name
+      is_active: 1,
+      updated_at: now,
+    });
   });
-});
+}
 
 /**
  * Switch to a different conversation thread
@@ -294,7 +334,7 @@ export function switchThread(runId: string, conversationId: string): boolean {
     const now = new Date().toISOString();
 
     // Execute in transaction
-    switchThreadTransaction(runId, conversationId, now);
+    getSwitchThreadTransaction()(runId, conversationId, now);
 
     logger.debug('Switched conversation thread', { runId, conversationId });
     return true;
@@ -338,8 +378,42 @@ export function branchFromMessage(
   }
 }
 
+// Lazy-initialized transaction wrapper for adding message with atomic sequence generation
+function getAddMessageTransaction() {
+  return db.transaction((
+    thread: ConversationThread,
+    conversationId: string,
+    message: {
+      role: 'user' | 'assistant' | 'system';
+      content: string;
+      tool_calls?: unknown;
+    },
+    now: string
+  ): number => {
+    // Get next sequence within transaction to prevent race conditions
+    const seqResult = getGetNextSeqForThreadStmt().get(conversationId);
+    if (!isNextSeqResult(seqResult)) {
+      throw new Error('Failed to get next sequence number for thread');
+    }
+    const nextSeq = seqResult.next_seq;
+
+    getInsertMessageWithThreadStmt().run({
+      run_id: thread.run_id,
+      conversation_id: conversationId,
+      seq: nextSeq,
+      role: message.role,
+      content: message.content,
+      tool_calls_json: message.tool_calls ? JSON.stringify(message.tool_calls) : null,
+      created_at: now,
+    });
+
+    return nextSeq;
+  });
+}
+
 /**
  * Add a message to a conversation thread
+ * Uses a transaction to prevent sequence number race conditions
  */
 export function addMessageToThread(
   conversationId: string,
@@ -355,21 +429,10 @@ export function addMessageToThread(
       throw new Error(`Thread not found: ${conversationId}`);
     }
 
-    const seqResult = getNextSeqForThreadStmt.get(conversationId) as { next_seq: number };
-    const nextSeq = seqResult.next_seq;
     const now = new Date().toISOString();
 
-    insertMessageWithThreadStmt.run({
-      run_id: thread.run_id,
-      conversation_id: conversationId,
-      seq: nextSeq,
-      role: message.role,
-      content: message.content,
-      tool_calls_json: message.tool_calls ? JSON.stringify(message.tool_calls) : null,
-      created_at: now,
-    });
-
-    return nextSeq;
+    // Execute in transaction to ensure atomic sequence generation
+    return getAddMessageTransaction()(thread, conversationId, message, now);
   } catch (err) {
     logger.error('Failed to add message to thread', {
       conversationId,
@@ -384,7 +447,7 @@ export function addMessageToThread(
  */
 export function getThreadMessages(conversationId: string): ThreadMessage[] {
   try {
-    const rows = getThreadMessagesStmt.all(conversationId) as Array<{
+    const rows = getGetThreadMessagesStmt().all(conversationId) as Array<{
       id: number;
       conversation_id: string;
       seq: number;
@@ -418,7 +481,7 @@ export function getThreadMessages(conversationId: string): ThreadMessage[] {
 export function deleteThread(conversationId: string): boolean {
   try {
     // Messages are deleted via CASCADE
-    const result = deleteThreadStmt.run(conversationId);
+    const result = getDeleteThreadStmt().run(conversationId);
     return result.changes > 0;
   } catch (err) {
     logger.error('Failed to delete thread', {

@@ -112,7 +112,8 @@ export class WorkerInstance {
           const preview = event.result.length > LOG_PREVIEW_LENGTH
             ? event.result.slice(0, LOG_PREVIEW_LENGTH) + '...'
             : event.result;
-          eventLog(this.config.runId, 'info', 'codex', `Result: ${preview}`, {
+          const source = this.config.executorType === 'claude' ? 'claude' : 'codex';
+          eventLog(this.config.runId, 'info', source, `Result: ${preview}`, {
             task_id: node.task_id,
             worker_id: this.worker.worker_id,
           });

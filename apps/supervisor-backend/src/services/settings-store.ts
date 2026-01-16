@@ -1,11 +1,16 @@
 /**
  * Settings store for application configuration
  * Stores API keys and other settings in SQLite
+ *
+ * SECURITY: Sensitive values (API keys, tokens) are encrypted at rest
+ * using AES-256-GCM authenticated encryption.
  */
 
 import { db } from './db.js';
+import { encrypt, decrypt, isEncrypted } from './crypto.js';
+import { logger } from './logger.js';
 
-export type ExecutorMode = 'agent' | 'codex_only' | 'claude_only';
+export type ExecutorMode = 'agent' | 'codex_only' | 'claude_only' | 'claude_direct' | 'codex_direct';
 
 export interface AppSettings {
   openai_api_key?: string;
@@ -99,32 +104,86 @@ export const DEFAULT_SHELL_ALLOWLIST = [
 
 type SettingKey = typeof SETTING_KEYS[keyof typeof SETTING_KEYS];
 
-const getStmt = db.prepare('SELECT value FROM settings WHERE key = ?');
-const upsertStmt = db.prepare(`
-  INSERT INTO settings (key, value, updated_at)
-  VALUES (@key, @value, @updated_at)
-  ON CONFLICT(key) DO UPDATE SET
-    value = excluded.value,
-    updated_at = excluded.updated_at
-`);
-const deleteStmt = db.prepare('DELETE FROM settings WHERE key = ?');
-const listStmt = db.prepare('SELECT key, value, updated_at FROM settings');
+/** Keys that contain sensitive data and should be encrypted */
+const SENSITIVE_KEYS: readonly SettingKey[] = [
+  SETTING_KEYS.OPENAI_API_KEY,
+  SETTING_KEYS.ANTHROPIC_API_KEY,
+  SETTING_KEYS.GITHUB_TOKEN,
+] as const;
+
+/**
+ * Check if a setting key contains sensitive data
+ */
+function isSensitiveKey(key: SettingKey): boolean {
+  return SENSITIVE_KEYS.includes(key);
+}
+
+// Lazy-initialized prepared statements
+function getGetStmt() {
+  return db.prepare('SELECT value FROM settings WHERE key = ?');
+}
+
+function getUpsertStmt() {
+  return db.prepare(`
+    INSERT INTO settings (key, value, updated_at)
+    VALUES (@key, @value, @updated_at)
+    ON CONFLICT(key) DO UPDATE SET
+      value = excluded.value,
+      updated_at = excluded.updated_at
+  `);
+}
+
+function getDeleteStmt() {
+  return db.prepare('DELETE FROM settings WHERE key = ?');
+}
+
+function getListStmt() {
+  return db.prepare('SELECT key, value, updated_at FROM settings');
+}
 
 /**
  * Get a setting value
+ * Automatically decrypts sensitive values
  */
 export function getSetting(key: SettingKey): string | undefined {
-  const row = getStmt.get(key) as { value: string } | undefined;
-  return row?.value;
+  const row = getGetStmt().get(key) as { value: string } | undefined;
+  if (!row?.value) {
+    return undefined;
+  }
+
+  // Decrypt sensitive values
+  if (isSensitiveKey(key) && isEncrypted(row.value)) {
+    const decrypted = decrypt(row.value);
+    if (decrypted === null) {
+      logger.error('Failed to decrypt setting', { key });
+      return undefined;
+    }
+    return decrypted;
+  }
+
+  return row.value;
 }
 
 /**
  * Set a setting value
+ * Automatically encrypts sensitive values
  */
 export function setSetting(key: SettingKey, value: string): void {
-  upsertStmt.run({
+  let storedValue = value;
+
+  // Encrypt sensitive values
+  if (isSensitiveKey(key)) {
+    const encrypted = encrypt(value);
+    if (encrypted === null) {
+      logger.error('Failed to encrypt setting', { key });
+      throw new Error(`Failed to encrypt setting: ${key}`);
+    }
+    storedValue = encrypted;
+  }
+
+  getUpsertStmt().run({
     key,
-    value,
+    value: storedValue,
     updated_at: new Date().toISOString(),
   });
 }
@@ -133,7 +192,7 @@ export function setSetting(key: SettingKey, value: string): void {
  * Delete a setting
  */
 export function deleteSetting(key: SettingKey): boolean {
-  const result = deleteStmt.run(key);
+  const result = getDeleteStmt().run(key);
   return result.changes > 0;
 }
 
@@ -141,7 +200,7 @@ export function deleteSetting(key: SettingKey): boolean {
  * Get all settings as an object
  */
 export function getAllSettings(): AppSettings {
-  const rows = listStmt.all() as Array<{ key: string; value: string }>;
+  const rows = getListStmt().all() as Array<{ key: string; value: string }>;
   const settings: AppSettings = {};
 
   for (const row of rows) {
@@ -193,85 +252,85 @@ export function updateSettings(settings: Partial<AppSettings>): void {
 
   if (settings.openai_api_key !== undefined) {
     if (settings.openai_api_key) {
-      upsertStmt.run({ key: SETTING_KEYS.OPENAI_API_KEY, value: settings.openai_api_key, updated_at: now });
+      getUpsertStmt().run({ key: SETTING_KEYS.OPENAI_API_KEY, value: settings.openai_api_key, updated_at: now });
     } else {
-      deleteStmt.run(SETTING_KEYS.OPENAI_API_KEY);
+      getDeleteStmt().run(SETTING_KEYS.OPENAI_API_KEY);
     }
   }
 
   if (settings.anthropic_api_key !== undefined) {
     if (settings.anthropic_api_key) {
-      upsertStmt.run({ key: SETTING_KEYS.ANTHROPIC_API_KEY, value: settings.anthropic_api_key, updated_at: now });
+      getUpsertStmt().run({ key: SETTING_KEYS.ANTHROPIC_API_KEY, value: settings.anthropic_api_key, updated_at: now });
     } else {
-      deleteStmt.run(SETTING_KEYS.ANTHROPIC_API_KEY);
+      getDeleteStmt().run(SETTING_KEYS.ANTHROPIC_API_KEY);
     }
   }
 
   if (settings.default_model !== undefined) {
     if (settings.default_model) {
-      upsertStmt.run({ key: SETTING_KEYS.DEFAULT_MODEL, value: settings.default_model, updated_at: now });
+      getUpsertStmt().run({ key: SETTING_KEYS.DEFAULT_MODEL, value: settings.default_model, updated_at: now });
     } else {
-      deleteStmt.run(SETTING_KEYS.DEFAULT_MODEL);
+      getDeleteStmt().run(SETTING_KEYS.DEFAULT_MODEL);
     }
   }
 
   if (settings.copilot_api_url !== undefined) {
     if (settings.copilot_api_url) {
-      upsertStmt.run({ key: SETTING_KEYS.COPILOT_API_URL, value: settings.copilot_api_url, updated_at: now });
+      getUpsertStmt().run({ key: SETTING_KEYS.COPILOT_API_URL, value: settings.copilot_api_url, updated_at: now });
     } else {
-      deleteStmt.run(SETTING_KEYS.COPILOT_API_URL);
+      getDeleteStmt().run(SETTING_KEYS.COPILOT_API_URL);
     }
   }
 
   if (settings.github_token !== undefined) {
     if (settings.github_token) {
-      upsertStmt.run({ key: SETTING_KEYS.GITHUB_TOKEN, value: settings.github_token, updated_at: now });
+      getUpsertStmt().run({ key: SETTING_KEYS.GITHUB_TOKEN, value: settings.github_token, updated_at: now });
     } else {
-      deleteStmt.run(SETTING_KEYS.GITHUB_TOKEN);
+      getDeleteStmt().run(SETTING_KEYS.GITHUB_TOKEN);
     }
   }
 
   if (settings.use_copilot_api !== undefined) {
-    upsertStmt.run({ key: SETTING_KEYS.USE_COPILOT_API, value: String(settings.use_copilot_api), updated_at: now });
+    getUpsertStmt().run({ key: SETTING_KEYS.USE_COPILOT_API, value: String(settings.use_copilot_api), updated_at: now });
   }
 
   if (settings.dag_model !== undefined) {
     if (settings.dag_model) {
-      upsertStmt.run({ key: SETTING_KEYS.DAG_MODEL, value: settings.dag_model, updated_at: now });
+      getUpsertStmt().run({ key: SETTING_KEYS.DAG_MODEL, value: settings.dag_model, updated_at: now });
     } else {
-      deleteStmt.run(SETTING_KEYS.DAG_MODEL);
+      getDeleteStmt().run(SETTING_KEYS.DAG_MODEL);
     }
   }
 
   if (settings.executor_mode !== undefined) {
     if (settings.executor_mode) {
-      upsertStmt.run({ key: SETTING_KEYS.EXECUTOR_MODE, value: settings.executor_mode, updated_at: now });
+      getUpsertStmt().run({ key: SETTING_KEYS.EXECUTOR_MODE, value: settings.executor_mode, updated_at: now });
     } else {
-      deleteStmt.run(SETTING_KEYS.EXECUTOR_MODE);
+      getDeleteStmt().run(SETTING_KEYS.EXECUTOR_MODE);
     }
   }
 
   if (settings.spec_model !== undefined) {
     if (settings.spec_model) {
-      upsertStmt.run({ key: SETTING_KEYS.SPEC_MODEL, value: settings.spec_model, updated_at: now });
+      getUpsertStmt().run({ key: SETTING_KEYS.SPEC_MODEL, value: settings.spec_model, updated_at: now });
     } else {
-      deleteStmt.run(SETTING_KEYS.SPEC_MODEL);
+      getDeleteStmt().run(SETTING_KEYS.SPEC_MODEL);
     }
   }
 
   if (settings.claude_model !== undefined) {
     if (settings.claude_model) {
-      upsertStmt.run({ key: SETTING_KEYS.CLAUDE_MODEL, value: settings.claude_model, updated_at: now });
+      getUpsertStmt().run({ key: SETTING_KEYS.CLAUDE_MODEL, value: settings.claude_model, updated_at: now });
     } else {
-      deleteStmt.run(SETTING_KEYS.CLAUDE_MODEL);
+      getDeleteStmt().run(SETTING_KEYS.CLAUDE_MODEL);
     }
   }
 
   if (settings.codex_model !== undefined) {
     if (settings.codex_model) {
-      upsertStmt.run({ key: SETTING_KEYS.CODEX_MODEL, value: settings.codex_model, updated_at: now });
+      getUpsertStmt().run({ key: SETTING_KEYS.CODEX_MODEL, value: settings.codex_model, updated_at: now });
     } else {
-      deleteStmt.run(SETTING_KEYS.CODEX_MODEL);
+      getDeleteStmt().run(SETTING_KEYS.CODEX_MODEL);
     }
   }
 }
@@ -282,7 +341,8 @@ export function updateSettings(settings: Partial<AppSettings>): void {
  */
 export function getExecutorMode(): ExecutorMode {
   const fromSettings = getSetting(SETTING_KEYS.EXECUTOR_MODE);
-  if (fromSettings && ['agent', 'codex_only', 'claude_only'].includes(fromSettings)) {
+  const validModes: ExecutorMode[] = ['agent', 'codex_only', 'claude_only', 'claude_direct', 'codex_direct'];
+  if (fromSettings && validModes.includes(fromSettings as ExecutorMode)) {
     return fromSettings as ExecutorMode;
   }
   return 'agent';
@@ -367,12 +427,11 @@ export interface OpenAIConfig {
 export function getOpenAIConfig(): OpenAIConfig | undefined {
   const copilotConfig = getCopilotAPIConfig();
 
-  // If Copilot API is enabled, use it
-  if (copilotConfig.enabled) {
-    // Copilot API doesn't need an API key, but we'll use a dummy one for compatibility
+  // If Copilot API is enabled AND has a valid token, use it
+  if (copilotConfig.enabled && copilotConfig.githubToken) {
     return {
-      apiKey: copilotConfig.githubToken || COPILOT_PROXY_KEY,
-      baseUrl: copilotConfig.baseUrl,
+      apiKey: copilotConfig.githubToken,
+      baseUrl: `${copilotConfig.baseUrl}/v1`,
       useCopilot: true,
     };
   }

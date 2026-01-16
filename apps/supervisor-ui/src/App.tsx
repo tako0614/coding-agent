@@ -3,6 +3,7 @@ import Layout from './components/Layout';
 import ProjectsPage from './pages/ProjectsPage';
 import ProjectDetailPage from './pages/ProjectDetailPage';
 import AgentsPage from './pages/AgentsPage';
+import DirectExecutorPage from './pages/DirectExecutorPage';
 import ShellPage from './pages/ShellPage';
 import SettingsPage from './pages/SettingsPage';
 
@@ -21,6 +22,7 @@ function App() {
               <Route path="/" element={<Navigate to="/projects" replace />} />
               <Route path="/projects" element={<ProjectsPage />} />
               <Route path="/agents" element={<AgentsPage />} />
+              <Route path="/executor" element={<DirectExecutorPage />} />
               {/* Legacy routes redirect to new paths */}
               <Route path="/runs" element={<Navigate to="/projects" replace />} />
               <Route path="/runs/:runId" element={<Navigate to="/projects/:runId" replace />} />

@@ -29,6 +29,8 @@ import {
 } from '../../spec-agent/index.js';
 import { logger } from '../../services/logger.js';
 import { validateRepoPath, PathSecurityError } from '../../services/path-sandbox.js';
+import { withRunLock, LockTimeoutError } from '../../services/run-lock.js';
+import { eventBus } from '../../services/event-bus.js';
 import type { Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 
@@ -183,15 +185,28 @@ runs.post('/', async (c) => {
     }
 
     // Implementation mode: Use Supervisor Agent
+    // IMPORTANT: Insert run record FIRST so logs can be saved (foreign key constraint)
+    // We create a deferred promise that we resolve/reject when the actual run completes
+    let resolveRun: (value: SimplifiedSupervisorStateType) => void;
+    let rejectRun: (reason: unknown) => void;
+    const deferredPromise = new Promise<SimplifiedSupervisorStateType>((resolve, reject) => {
+      resolveRun = resolve;
+      rejectRun = reject;
+    });
+
+    // Register the run FIRST (inserts DB record)
+    runStore.setRunning(runId, deferredPromise, request.goal, request.project_id, validatedRepoPath, 'implementation');
+
+    // NOW start the supervisor (logs can be saved because run record exists)
     const runPromise = runSimplifiedSupervisor({
       userGoal: request.goal,
       repoPath: validatedRepoPath,
       runId,
       projectId: request.project_id,
     });
-    runStore.setRunning(runId, runPromise, request.goal, request.project_id, validatedRepoPath, 'implementation');
 
     runPromise.then(finalState => {
+      resolveRun!(finalState);
       try {
         runStore.set(runId, finalState);
         logger.info('Run completed', { runId, status: finalState.status });
@@ -206,6 +221,7 @@ runs.post('/', async (c) => {
         }
       }
     }).catch(error => {
+      rejectRun!(error);
       logger.error('Run failed', { runId, error: error instanceof Error ? error.message : String(error) });
       // Store error state using markFailed to properly cleanup tracking
       const errorMsg = error instanceof Error ? error.message : String(error);
@@ -264,22 +280,16 @@ runs.get('/:id', async (c) => {
 
 /**
  * GET /api/runs/:id/logs
- * Get logs for a run
+ * Get logs for a run (from database)
  */
 runs.get('/:id/logs', (c) => {
   const runId = c.req.param('id');
-  const state = runStore.get(runId);
+  const since = c.req.query('since');
 
-  if (!state) {
-    return c.json({
-      error: {
-        message: `Run ${runId} not found`,
-      },
-    }, 404);
-  }
+  // Load logs from database via eventBus
+  const logs = eventBus.getLogs(runId, since || undefined);
 
-  // Logs are available via SSE events, return empty for now
-  return c.json({ logs: [] });
+  return c.json({ logs });
 });
 
 /**
@@ -379,39 +389,42 @@ runs.post('/:id/restart', async (c) => {
   const runId = c.req.param('id');
   logger.info('POST /api/runs/:id/restart received', { runId });
 
-  // Check if run is currently running
-  if (runStore.isRunning(runId)) {
-    return c.json({
-      error: {
-        message: `Run ${runId} is still running, cannot restart`,
-      },
-    }, 409);
-  }
+  try {
+    // Use lock to prevent concurrent restart/cancel operations
+    return await withRunLock(runId, 'restart', async () => {
+      // Check if run is currently running
+      if (runStore.isRunning(runId)) {
+        return c.json({
+          error: {
+            message: `Run ${runId} is still running, cannot restart`,
+          },
+        }, 409);
+      }
 
-  // Get the agent instance
-  const agent = agentStore.get(runId);
-  if (!agent) {
-    return c.json({
-      error: {
-        message: `Agent instance not found for run ${runId}. Cannot restart - please create a new run.`,
-      },
-    }, 404);
-  }
+      // Get the agent instance
+      const agent = agentStore.get(runId);
+      if (!agent) {
+        return c.json({
+          error: {
+            message: `Agent instance not found for run ${runId}. Cannot restart - please create a new run.`,
+          },
+        }, 404);
+      }
 
-  // Check if agent can be restarted
-  if (!agent.canRestart()) {
-    return c.json({
-      error: {
-        message: `Run ${runId} cannot be restarted (current state doesn't allow restart)`,
-      },
-    }, 400);
-  }
+      // Check if agent can be restarted
+      if (!agent.canRestart()) {
+        return c.json({
+          error: {
+            message: `Run ${runId} cannot be restarted (current state doesn't allow restart)`,
+          },
+        }, 400);
+      }
 
-  // Get the stored state to preserve project_id
-  const storedState = runStore.get(runId);
-  const projectId = storedState?.project_id;
+      // Get the stored state to preserve project_id
+      const storedState = runStore.get(runId);
+      const projectId = storedState?.project_id;
 
-  // Start restart in background
+      // Start restart in background
   const restartPromise: Promise<SimplifiedSupervisorStateType> = agent.restart().then(finalState => {
     // Convert SupervisorState to SimplifiedSupervisorStateType
     let simplifiedState: SimplifiedSupervisorStateType;
@@ -469,40 +482,67 @@ runs.post('/:id/restart', async (c) => {
     };
   });
 
-  // Track as running
-  runStore.setRunning(runId, restartPromise, agent.getState().user_goal);
+      // Track as running
+      runStore.setRunning(runId, restartPromise, agent.getState().user_goal);
 
-  return c.json({
-    run_id: runId,
-    status: 'restarting',
-    message: 'Run is being restarted',
-  }, 202);
+      return c.json({
+        run_id: runId,
+        status: 'restarting',
+        message: 'Run is being restarted',
+      }, 202);
+    }); // End of withRunLock
+  } catch (error) {
+    if (error instanceof LockTimeoutError) {
+      return c.json({
+        error: {
+          message: `Run ${runId} is currently being modified by another operation`,
+          type: 'lock_timeout',
+        },
+      }, 409);
+    }
+    throw error;
+  }
 });
 
 /**
  * POST /api/runs/:id/cancel
  * Cancel a running run
  */
-runs.post('/:id/cancel', (c) => {
+runs.post('/:id/cancel', async (c) => {
   const runId = c.req.param('id');
   logger.info('POST /api/runs/:id/cancel received', { runId });
 
-  const agent = agentStore.get(runId);
-  if (!agent) {
-    return c.json({
-      error: {
-        message: `Agent instance not found for run ${runId}`,
-      },
-    }, 404);
+  try {
+    // Use lock to prevent concurrent restart/cancel operations
+    return await withRunLock(runId, 'cancel', async () => {
+      const agent = agentStore.get(runId);
+      if (!agent) {
+        return c.json({
+          error: {
+            message: `Agent instance not found for run ${runId}`,
+          },
+        }, 404);
+      }
+
+      agent.cancel('Cancelled by user via API');
+
+      return c.json({
+        run_id: runId,
+        status: 'cancelled',
+        message: 'Run has been cancelled',
+      });
+    });
+  } catch (error) {
+    if (error instanceof LockTimeoutError) {
+      return c.json({
+        error: {
+          message: `Run ${runId} is currently being modified by another operation`,
+          type: 'lock_timeout',
+        },
+      }, 409);
+    }
+    throw error;
   }
-
-  agent.cancel('Cancelled by user via API');
-
-  return c.json({
-    run_id: runId,
-    status: 'cancelled',
-    message: 'Run has been cancelled',
-  });
 });
 
 /**

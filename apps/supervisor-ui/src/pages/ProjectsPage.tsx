@@ -12,7 +12,7 @@ import {
   GitBranch,
 } from 'lucide-react';
 import { fetchProjects, createProject, deleteProject, type Project } from '../lib/api';
-import { openFolderDialog, isTauri } from '../lib/tauri';
+import FileBrowser from '../components/FileBrowser';
 
 function ProjectCard({ project, onDelete }: { project: Project; onDelete: () => void }) {
   const { t } = useTranslation();
@@ -69,6 +69,7 @@ export default function ProjectsPage() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [showNewProject, setShowNewProject] = useState(false);
+  const [showFileBrowser, setShowFileBrowser] = useState(false);
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [folderPath, setFolderPath] = useState('');
@@ -98,15 +99,17 @@ export default function ProjectsPage() {
     },
   });
 
-  const handleBrowseFolder = async () => {
-    const selected = await openFolderDialog();
-    if (selected) {
-      setFolderPath(selected);
-      // Auto-fill name from folder name if empty
-      if (!name) {
-        const folderName = selected.split(/[/\\]/).pop() || '';
-        setName(folderName);
-      }
+  const handleBrowseFolder = () => {
+    setShowFileBrowser(true);
+  };
+
+  const handleFolderSelected = (selected: string) => {
+    setFolderPath(selected);
+    setShowFileBrowser(false);
+    // Auto-fill name from folder name if empty
+    if (!name) {
+      const folderName = selected.split(/[/\\]/).pop() || '';
+      setName(folderName);
     }
   };
 
@@ -184,16 +187,14 @@ export default function ProjectsPage() {
                       className="flex-1 px-4 py-3 text-base border border-slate-300 rounded-xl focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
                       required
                     />
-                    {isTauri && (
-                      <button
-                        type="button"
-                        onClick={handleBrowseFolder}
-                        className="px-4 py-3 bg-slate-100 text-slate-700 rounded-xl hover:bg-slate-200 active:bg-slate-300 transition-colors"
-                        title={t('projects.browse')}
-                      >
-                        <FolderOpen size={18} />
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      onClick={handleBrowseFolder}
+                      className="px-4 py-3 bg-slate-100 text-slate-700 rounded-xl hover:bg-slate-200 active:bg-slate-300 transition-colors"
+                      title={t('projects.browse')}
+                    >
+                      <FolderOpen size={18} />
+                    </button>
                   </div>
                 </div>
               </div>
@@ -222,6 +223,22 @@ export default function ProjectsPage() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* File Browser Modal */}
+      {showFileBrowser && (
+        <div className="fixed inset-0 bg-black/50 flex items-end sm:items-center justify-center z-[60] p-0 sm:p-4">
+          <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-xl w-full sm:max-w-lg overflow-hidden">
+            <div className="px-5 py-4 border-b border-slate-200">
+              <h2 className="text-lg font-semibold">{t('fileBrowser.title', 'Select Folder')}</h2>
+            </div>
+            <FileBrowser
+              onSelect={handleFolderSelected}
+              onCancel={() => setShowFileBrowser(false)}
+              initialPath={folderPath}
+            />
           </div>
         </div>
       )}

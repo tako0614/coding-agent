@@ -36,48 +36,63 @@ export interface LogEntry {
   metadata?: Record<string, unknown>;
 }
 
-// Prepared statements for run_logs table
-const insertLogStmt = db.prepare(`
-  INSERT INTO run_logs (run_id, timestamp, level, source, message, metadata_json)
-  VALUES (@run_id, @timestamp, @level, @source, @message, @metadata_json)
-`);
+// Lazy-initialized prepared statements for run_logs table
+// Using functions to ensure statements are created with the current db instance
+function getInsertLogStmt() {
+  return db.prepare(`
+    INSERT INTO run_logs (run_id, timestamp, level, source, message, metadata_json)
+    VALUES (@run_id, @timestamp, @level, @source, @message, @metadata_json)
+  `);
+}
 
-const getLogsStmt = db.prepare(`
-  SELECT * FROM run_logs WHERE run_id = ? ORDER BY timestamp ASC
-`);
+function getGetLogsStmt() {
+  return db.prepare(`
+    SELECT * FROM run_logs WHERE run_id = ? ORDER BY timestamp ASC
+  `);
+}
 
-const getLogsSinceStmt = db.prepare(`
-  SELECT * FROM run_logs WHERE run_id = ? AND timestamp > ? ORDER BY timestamp ASC
-`);
+function getGetLogsSinceStmt() {
+  return db.prepare(`
+    SELECT * FROM run_logs WHERE run_id = ? AND timestamp > ? ORDER BY timestamp ASC
+  `);
+}
 
-const getLogsSinceIdStmt = db.prepare(`
-  SELECT * FROM run_logs WHERE run_id = ? AND id > ? ORDER BY id ASC LIMIT ?
-`);
+function getGetLogsSinceIdStmt() {
+  return db.prepare(`
+    SELECT * FROM run_logs WHERE run_id = ? AND id > ? ORDER BY id ASC LIMIT ?
+  `);
+}
 
-const getLogsWithLimitStmt = db.prepare(`
-  SELECT * FROM run_logs WHERE run_id = ? ORDER BY id ASC LIMIT ?
-`);
+function getGetLogsWithLimitStmt() {
+  return db.prepare(`
+    SELECT * FROM run_logs WHERE run_id = ? ORDER BY id ASC LIMIT ?
+  `);
+}
 
-const deleteLogsStmt = db.prepare(`
-  DELETE FROM run_logs WHERE run_id = ?
-`);
+function getDeleteLogsStmt() {
+  return db.prepare(`
+    DELETE FROM run_logs WHERE run_id = ?
+  `);
+}
 
 // Get orphaned log sessions (logs exist but no completed/failed run record)
 // These are from interrupted runs where server stopped before completion
-const getOrphanedLogSessionsStmt = db.prepare(`
-  SELECT DISTINCT
-    rl.run_id,
-    MIN(rl.timestamp) as first_log,
-    MAX(rl.timestamp) as last_log,
-    COUNT(*) as log_count,
-    (SELECT message FROM run_logs WHERE run_id = rl.run_id ORDER BY timestamp ASC LIMIT 1) as first_message
-  FROM run_logs rl
-  LEFT JOIN runs r ON rl.run_id = r.run_id
-  WHERE r.run_id IS NULL
-  GROUP BY rl.run_id
-  ORDER BY last_log DESC
-  LIMIT 50
-`);
+function getGetOrphanedLogSessionsStmt() {
+  return db.prepare(`
+    SELECT DISTINCT
+      rl.run_id,
+      MIN(rl.timestamp) as first_log,
+      MAX(rl.timestamp) as last_log,
+      COUNT(*) as log_count,
+      (SELECT message FROM run_logs WHERE run_id = rl.run_id ORDER BY timestamp ASC LIMIT 1) as first_message
+    FROM run_logs rl
+    LEFT JOIN runs r ON rl.run_id = r.run_id
+    WHERE r.run_id IS NULL
+    GROUP BY rl.run_id
+    ORDER BY last_log DESC
+    LIMIT 50
+  `);
+}
 
 interface OrphanedSession {
   run_id: string;
@@ -280,7 +295,8 @@ class EventBus extends EventEmitter {
 
     // Persist to database first to get ID
     try {
-      const result = insertLogStmt.run({
+      console.log('[DEBUG] addLog: Inserting log entry', { runId: entry.runId, source: entry.source, message: entry.message.slice(0, 50) });
+      const result = getInsertLogStmt().run({
         run_id: entry.runId,
         timestamp: entry.timestamp,
         level: entry.level,
@@ -290,7 +306,14 @@ class EventBus extends EventEmitter {
       });
       logId = Number(result.lastInsertRowid);
       entry.id = logId;
+      console.log('[DEBUG] addLog: Log entry inserted successfully', { runId: entry.runId, logId });
+
+      // Verify the log was actually saved
+      const verifyStmt = db.prepare('SELECT COUNT(*) as count FROM run_logs WHERE id = ?');
+      const verifyResult = verifyStmt.get(logId) as { count: number };
+      console.log('[DEBUG] addLog: Verify after insert', { logId, exists: verifyResult.count > 0 });
     } catch (err) {
+      console.error('[DEBUG] addLog: FAILED to insert log entry', { runId: entry.runId, error: err instanceof Error ? err.message : String(err) });
       logger.error('Failed to persist log to DB', { error: err instanceof Error ? err.message : String(err) });
     }
 
@@ -347,10 +370,10 @@ class EventBus extends EventEmitter {
     // Load from database
     try {
       if (since) {
-        const rows = getLogsSinceStmt.all(runId, since) as LogRow[];
+        const rows = getGetLogsSinceStmt().all(runId, since) as LogRow[];
         return rows.map(rowToLogEntry);
       } else {
-        const rows = getLogsStmt.all(runId) as LogRow[];
+        const rows = getGetLogsStmt().all(runId) as LogRow[];
         return rows.map(rowToLogEntry);
       }
     } catch (err) {
@@ -364,7 +387,7 @@ class EventBus extends EventEmitter {
    */
   getLogsSinceId(runId: string, lastEventId: number, limit = 1000): LogEntry[] {
     try {
-      const rows = getLogsSinceIdStmt.all(runId, lastEventId, limit) as LogRow[];
+      const rows = getGetLogsSinceIdStmt().all(runId, lastEventId, limit) as LogRow[];
       return rows.map(rowToLogEntry);
     } catch (err) {
       logger.error('Failed to load logs since ID', { error: err instanceof Error ? err.message : String(err) });
@@ -384,7 +407,7 @@ class EventBus extends EventEmitter {
 
     // Load from database
     try {
-      const rows = getLogsWithLimitStmt.all(runId, limit) as LogRow[];
+      const rows = getGetLogsWithLimitStmt().all(runId, limit) as LogRow[];
       return rows.map(rowToLogEntry);
     } catch (err) {
       logger.error('Failed to load recent logs', { error: err instanceof Error ? err.message : String(err) });
@@ -415,7 +438,7 @@ class EventBus extends EventEmitter {
     this.logBuffer.delete(runId);
     this.bufferMeta.delete(runId);
     try {
-      deleteLogsStmt.run(runId);
+      getDeleteLogsStmt().run(runId);
     } catch (err) {
       logger.error('Failed to delete logs from DB', { error: err instanceof Error ? err.message : String(err) });
     }
@@ -452,7 +475,7 @@ class EventBus extends EventEmitter {
    */
   getOrphanedSessions(): OrphanedSession[] {
     try {
-      return getOrphanedLogSessionsStmt.all() as OrphanedSession[];
+      return getGetOrphanedLogSessionsStmt().all() as OrphanedSession[];
     } catch (err) {
       logger.error('Failed to get orphaned sessions', { error: err instanceof Error ? err.message : String(err) });
       return [];

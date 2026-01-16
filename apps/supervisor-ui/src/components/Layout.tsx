@@ -7,6 +7,7 @@ import {
   Settings,
   Activity,
   Bot,
+  Play,
 } from 'lucide-react';
 import { fetchHealth } from '../lib/api';
 import clsx from 'clsx';
@@ -18,6 +19,7 @@ interface LayoutProps {
 const navItems = [
   { path: '/projects', labelKey: 'nav.projects', icon: FolderKanban },
   { path: '/agents', labelKey: 'nav.agents', icon: Bot },
+  { path: '/executor', labelKey: 'nav.executor', icon: Play },
   { path: '/shell', labelKey: 'nav.shell', icon: Terminal },
   { path: '/settings', labelKey: 'nav.settings', icon: Settings },
 ];

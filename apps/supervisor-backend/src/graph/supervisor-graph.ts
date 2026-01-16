@@ -124,8 +124,9 @@ async function supervisorNode(
       }
 
       const startTime = Date.now();
+      const executorSource = (task.executor === 'claude' ? 'claude' : 'codex') as 'claude' | 'codex';
       const startMsg = `▶ Starting: ${task.instruction.slice(0, 50)}...`;
-      eventLog(state.run_id, 'info', 'codex', startMsg);
+      eventLog(state.run_id, 'info', executorSource, startMsg);
       task.onOutput?.(startMsg);
 
       try {
@@ -146,7 +147,7 @@ async function supervisorNode(
         const duration = Date.now() - startTime;
         if (report) {
           const completeMsg = `✓ Completed: ${task.instruction.slice(0, 50)}... (${Math.round(duration / 1000)}s)`;
-          eventLog(state.run_id, 'info', 'codex', completeMsg);
+          eventLog(state.run_id, 'info', executorSource, completeMsg);
           task.onOutput?.(completeMsg);
           if (report.summary) {
             task.onOutput?.(`Summary: ${report.summary}`);
@@ -163,7 +164,7 @@ async function supervisorNode(
           };
         } else {
           const failMsg = `✗ Failed: ${task.instruction.slice(0, 50)}... - No worker available`;
-          eventLog(state.run_id, 'error', 'codex', failMsg);
+          eventLog(state.run_id, 'error', executorSource, failMsg);
           task.onOutput?.(failMsg);
           return {
             task_id: task.task_id,
@@ -179,7 +180,7 @@ async function supervisorNode(
         const duration = Date.now() - startTime;
         const errorMsg = getErrorMessage(error);
         const failMsg = `✗ Failed: ${task.instruction.slice(0, 50)}... - ${errorMsg}`;
-        eventLog(state.run_id, 'error', 'codex', failMsg);
+        eventLog(state.run_id, 'error', executorSource, failMsg);
         task.onOutput?.(failMsg);
         return {
           task_id: task.task_id,
@@ -218,6 +219,7 @@ async function supervisorNode(
 
   // Create and run Supervisor Agent
   const agent = createSupervisorAgent({
+    runId: state.run_id,  // Pass the run_id to ensure consistent logging
     repoPath: state.repo_path,
     userGoal: state.user_goal,
     events: {
@@ -248,7 +250,11 @@ async function supervisorNode(
       .map((t) => t.report!);
 
     if (finalState.phase === 'completed') {
-      eventLog(state.run_id, 'info', 'supervisor', `✅ Completed: ${finalState.final_summary?.slice(0, 100)}...`);
+      // Log completion with full summary
+      eventLog(state.run_id, 'info', 'supervisor', `✅ Completed: ${finalState.final_summary || 'タスクが完了しました'}`, {
+        final_summary: finalState.final_summary,
+        completed_tasks: finalState.completed_tasks.length,
+      });
       return {
         status: 'completed',
         reports,

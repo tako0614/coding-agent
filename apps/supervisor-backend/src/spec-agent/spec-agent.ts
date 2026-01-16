@@ -17,6 +17,7 @@ import {
   type Conversation,
 } from './spec-store.js';
 import { withRunLock, LockTimeoutError } from '../services/run-lock.js';
+import { resilientAnthropicMessage } from '../services/resilient-client.js';
 
 const SPEC_SYSTEM_PROMPT = `あなたは仕様策定アシスタントです。ユーザーと対話しながら仕様書を作成します。
 
@@ -144,17 +145,19 @@ export class SpecAgent {
     while (iterationCount < MAX_TOOL_ITERATIONS) {
       iterationCount++;
 
-      const response = await this.client.messages.create({
-        model: this.model,
-        max_tokens: 4096,
-        system: SPEC_SYSTEM_PROMPT,
-        tools: SPEC_TOOLS.map(tool => ({
-          name: tool.name,
-          description: tool.description,
-          input_schema: tool.input_schema,
-        })),
-        messages,
-      });
+      const response = await resilientAnthropicMessage(() =>
+        this.client.messages.create({
+          model: this.model,
+          max_tokens: 4096,
+          system: SPEC_SYSTEM_PROMPT,
+          tools: SPEC_TOOLS.map(tool => ({
+            name: tool.name,
+            description: tool.description,
+            input_schema: tool.input_schema,
+          })),
+          messages,
+        })
+      );
 
       // Process response content
       let hasToolUse = false;
@@ -256,23 +259,31 @@ export class SpecAgent {
 
 import { db } from '../services/db.js';
 
-// Prepared statements for spec agent sessions
-const insertSessionStmt = db.prepare(`
-  INSERT OR REPLACE INTO spec_agent_sessions (run_id, repo_path, model, created_at, last_active_at)
-  VALUES (@run_id, @repo_path, @model, @created_at, @last_active_at)
-`);
+// Lazy-initialized prepared statements for spec agent sessions (for hot-reload compatibility)
+function getInsertSessionStmt() {
+  return db.prepare(`
+    INSERT OR REPLACE INTO spec_agent_sessions (run_id, repo_path, model, created_at, last_active_at)
+    VALUES (@run_id, @repo_path, @model, @created_at, @last_active_at)
+  `);
+}
 
-const getSessionStmt = db.prepare(`
-  SELECT * FROM spec_agent_sessions WHERE run_id = ?
-`);
+function getGetSessionStmt() {
+  return db.prepare(`
+    SELECT * FROM spec_agent_sessions WHERE run_id = ?
+  `);
+}
 
-const deleteSessionStmt = db.prepare(`
-  DELETE FROM spec_agent_sessions WHERE run_id = ?
-`);
+function getDeleteSessionStmt() {
+  return db.prepare(`
+    DELETE FROM spec_agent_sessions WHERE run_id = ?
+  `);
+}
 
-const updateLastActiveStmt = db.prepare(`
-  UPDATE spec_agent_sessions SET last_active_at = ? WHERE run_id = ?
-`);
+function getUpdateLastActiveStmt() {
+  return db.prepare(`
+    UPDATE spec_agent_sessions SET last_active_at = ? WHERE run_id = ?
+  `);
+}
 
 interface SessionRow {
   run_id: string;
@@ -307,7 +318,7 @@ class SpecAgentStore {
    */
   private tryRestore(runId: string): SpecAgent | undefined {
     try {
-      const row = getSessionStmt.get(runId) as SessionRow | undefined;
+      const row = getGetSessionStmt().get(runId) as SessionRow | undefined;
       if (!row) return undefined;
 
       // Recreate the agent from persisted config
@@ -338,7 +349,7 @@ class SpecAgentStore {
     // Persist session to database
     const now = new Date().toISOString();
     try {
-      insertSessionStmt.run({
+      getInsertSessionStmt().run({
         run_id: config.runId,
         repo_path: config.repoPath,
         model: getSpecModel(),
@@ -372,7 +383,7 @@ class SpecAgentStore {
 
     // Remove from database
     try {
-      deleteSessionStmt.run(runId);
+      getDeleteSessionStmt().run(runId);
     } catch (err) {
       logger.error('Failed to delete SpecAgent session', {
         runId,
@@ -392,7 +403,7 @@ class SpecAgentStore {
    */
   private updateLastActive(runId: string): void {
     try {
-      updateLastActiveStmt.run(new Date().toISOString(), runId);
+      getUpdateLastActiveStmt().run(new Date().toISOString(), runId);
     } catch {
       // Ignore errors for non-critical update
     }

@@ -60,14 +60,27 @@ function formatTime(timestamp: string) {
   });
 }
 
+// Escape HTML entities to prevent XSS
+function escapeHtml(unsafe: string): string {
+  return unsafe
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 function parseMessage(message: string) {
+  // First escape HTML to prevent XSS
+  const escaped = escapeHtml(message);
+
   // Highlight file paths
   const filePathRegex = /([\w\/\-\.]+\.(ts|tsx|js|jsx|py|md|json|yaml|yml|css|html))/g;
 
   // Highlight task names
   const taskRegex = /(✓|✗|▶|🔧|🚀|🎯|📋|🔍)/g;
 
-  return message
+  return escaped
     .replace(filePathRegex, '<span class="text-blue-600 font-mono text-xs">$1</span>')
     .replace(taskRegex, '<span class="mr-1">$1</span>');
 }

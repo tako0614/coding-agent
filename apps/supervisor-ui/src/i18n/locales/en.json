@@ -16,11 +16,13 @@
     "start": "Start",
     "stop": "Stop",
     "pause": "Pause",
-    "resume": "Resume"
+    "resume": "Resume",
+    "go": "Go"
   },
   "nav": {
     "projects": "Projects",
     "agents": "Agents",
+    "executor": "Executor",
     "shell": "Shell",
     "settings": "Settings"
   },
@@ -168,6 +170,17 @@
     "saveSettings": "Save Settings",
     "language": "Language",
     "selectLanguage": "Select Language"
+  },
+  "fileBrowser": {
+    "title": "Select Folder",
+    "pathPlaceholder": "Enter path...",
+    "root": "Root",
+    "up": "Go up",
+    "empty": "No folders found",
+    "noSelection": "No selection",
+    "selectFolder": "Select a folder",
+    "select": "Select",
+    "retry": "Go to root"
   },
   "chat": {
     "settings": "Settings",

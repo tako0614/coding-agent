@@ -16,11 +16,13 @@
     "start": "開始",
     "stop": "停止",
     "pause": "一時停止",
-    "resume": "再開"
+    "resume": "再開",
+    "go": "移動"
   },
   "nav": {
     "projects": "プロジェクト",
     "agents": "エージェント",
+    "executor": "実行環境",
     "shell": "シェル",
     "settings": "設定"
   },
@@ -174,6 +176,17 @@
     "saveSettings": "設定を保存",
     "language": "言語",
     "selectLanguage": "言語を選択"
+  },
+  "fileBrowser": {
+    "title": "フォルダを選択",
+    "pathPlaceholder": "パスを入力...",
+    "root": "ルート",
+    "up": "上へ",
+    "empty": "フォルダがありません",
+    "noSelection": "未選択",
+    "selectFolder": "フォルダを選択してください",
+    "select": "選択",
+    "retry": "ルートに戻る"
   },
   "chat": {
     "settings": "設定",

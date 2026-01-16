@@ -15,13 +15,10 @@ import { EventEmitter } from 'events';
 import { logger } from '../services/logger.js';
 import { getErrorMessage } from '../services/errors.js';
 
-export type ExecutorMode = 'agent' | 'codex_only' | 'claude_only';
+export type ExecutorMode = 'agent' | 'codex_only' | 'claude_only' | 'claude_direct' | 'codex_direct';
 
 /** Default task timeout in ms (10 minutes) */
-const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000;
-
-/** Maximum workers per executor type */
-const MAX_WORKERS_PER_TYPE = 3;
+const DEFAULT_TASK_TIMEOUT_MS = parseInt(process.env['WORKER_TASK_TIMEOUT_MS'] ?? String(10 * 60 * 1000), 10);
 
 export interface PoolContext {
   userGoal: string;
@@ -50,15 +47,6 @@ export class WorkerPool extends EventEmitter {
   private completedTasks: Map<string, string> = new Map(); // taskId -> summary
   private cancelled = false;
   private abortController: AbortController;
-  /** Lock for status updates */
-  private statusUpdateLock = false;
-  /** Queue for tasks waiting for workers */
-  private taskQueue: Map<WorkerExecutorType, Array<{
-    node: DAGNode;
-    resolve: (result: WorkReport | null) => void;
-    reject: (error: Error) => void;
-    timeoutMs?: number;
-  }>> = new Map();
   /** Pending worker requests waiting for idle workers */
   private pendingWorkerRequests: Map<WorkerExecutorType, Array<{
     resolve: (worker: WorkerInstance | null) => void;
@@ -159,30 +147,20 @@ export class WorkerPool extends EventEmitter {
       }
     }
 
-    // If no idle worker and under the limit, create a new one
-    if (workerPool.length < MAX_WORKERS_PER_TYPE) {
-      const newWorker = createWorkerInstance({
-        executorType,
-        repoPath: this.repoPath,
-        runId: this.runId,
-      });
-      workerPool.push(newWorker);
-      this.emit('worker:created', newWorker.getWorker());
-      logger.debug('Created new worker', {
-        runId: this.runId,
-        executorType,
-        poolSize: workerPool.length,
-      });
-      return newWorker;
-    }
-
-    // All workers are busy and at max capacity
-    logger.debug('All workers busy, task will be queued', {
+    // No idle worker, create a new one (no limit)
+    const newWorker = createWorkerInstance({
+      executorType,
+      repoPath: this.repoPath,
+      runId: this.runId,
+    });
+    workerPool.push(newWorker);
+    this.emit('worker:created', newWorker.getWorker());
+    logger.debug('Created new worker', {
       runId: this.runId,
       executorType,
       poolSize: workerPool.length,
     });
-    return null;
+    return newWorker;
   }
 
   /**
@@ -291,27 +269,17 @@ export class WorkerPool extends EventEmitter {
   }
 
   /**
-   * Atomically update status counters
+   * Update status counters
+   * Note: No lock needed - Node.js synchronous code is atomic
    */
   private updateTaskStats(success: boolean, taskId: string, summary?: string): void {
-    // Use a simple lock pattern to prevent interleaved updates
-    if (this.statusUpdateLock) {
-      // Shouldn't happen in Node.js single-threaded environment, but just in case
-      logger.warn('Status update lock contention', { runId: this.runId, taskId });
-    }
-
-    this.statusUpdateLock = true;
-    try {
-      if (success) {
-        this.totalTasksCompleted++;
-        if (summary) {
-          this.completedTasks.set(taskId, summary);
-        }
-      } else {
-        this.totalTasksFailed++;
+    if (success) {
+      this.totalTasksCompleted++;
+      if (summary) {
+        this.completedTasks.set(taskId, summary);
       }
-    } finally {
-      this.statusUpdateLock = false;
+    } else {
+      this.totalTasksFailed++;
     }
   }
 
@@ -453,9 +421,6 @@ export class WorkerPool extends EventEmitter {
       }
     }
     this.pendingWorkerRequests.clear();
-
-    // Clear task queue
-    this.taskQueue.clear();
 
     // Dispose all workers with error handling for each
     const errors: string[] = [];

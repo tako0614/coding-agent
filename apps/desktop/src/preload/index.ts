@@ -70,6 +70,11 @@ export interface DesktopAPI {
     openExternal: (url: string) => Promise<void>;
   };
 
+  // Dialog
+  dialog: {
+    openFolder: () => Promise<string | null>;
+  };
+
   // Check if running in Electron
   isElectron: boolean;
 }

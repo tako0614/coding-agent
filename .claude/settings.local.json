@@ -58,7 +58,14 @@
       "Bash(tasklist:*)",
       "Bash(/c/Users/shout/desktop/github/agent/apps/supervisor-backend/vendor/winvnc.exe --help)",
       "Bash(cmd /c \"taskkill /PID 1843268 /F\")",
-      "Bash(ping:*)"
+      "Bash(ping:*)",
+      "Bash(timeout:*)",
+      "Bash(find:*)",
+      "Bash(done)",
+      "Bash(cd:*)",
+      "Bash(sqlite3:*)",
+      "Bash(kill:*)",
+      "Bash(wmic:*)"
     ]
   }
 }

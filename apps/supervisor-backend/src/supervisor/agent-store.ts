@@ -185,6 +185,10 @@ class AgentStore {
    * Delete an agent instance
    */
   delete(runId: string): boolean {
+    const entry = this.agents.get(runId);
+    if (entry) {
+      this.disposeAgent(entry.agent);
+    }
     this.agentOrder = this.agentOrder.filter(id => id !== runId);
     return this.agents.delete(runId);
   }
@@ -205,6 +209,11 @@ class AgentStore {
    * Clear all agents
    */
   clear(): void {
+    // Dispose all agents before clearing
+    for (const [runId, entry] of this.agents) {
+      logger.debug('Disposing agent during clear', { runId });
+      this.disposeAgent(entry.agent);
+    }
     this.agents.clear();
     this.agentOrder = [];
     logger.info('Agent store cleared');

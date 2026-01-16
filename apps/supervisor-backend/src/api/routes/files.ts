@@ -498,4 +498,137 @@ files.post('/move', async (c) => {
   }
 });
 
+// Schema for browse endpoint
+const BrowseSchema = z.object({
+  path: z.string().optional(),
+});
+
+/**
+ * POST /api/files/browse
+ * Browse directories for folder selection
+ * Returns drives on Windows or root on Unix when no path specified
+ */
+files.post('/browse', async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const parsed = BrowseSchema.safeParse(body);
+
+    if (!parsed.success) {
+      return c.json({ error: { message: 'Invalid request', details: parsed.error.errors } }, 400);
+    }
+
+    const requestedPath = parsed.data.path;
+
+    // If no path specified, return root directories
+    if (!requestedPath) {
+      const isWindows = process.platform === 'win32';
+
+      if (isWindows) {
+        // Get available drives on Windows
+        const { execSync } = await import('node:child_process');
+        try {
+          const output = execSync('wmic logicaldisk get name', { encoding: 'utf-8' });
+          const drives = output
+            .split('\n')
+            .map(line => line.trim())
+            .filter(line => /^[A-Z]:$/i.test(line))
+            .map(drive => ({
+              name: drive,
+              path: drive + '\\',
+              isDirectory: true,
+              isDrive: true,
+            }));
+
+          return c.json({
+            path: '',
+            entries: drives,
+            isRoot: true,
+          });
+        } catch {
+          // Fallback: common drives
+          const commonDrives = ['C:', 'D:', 'E:'].map(drive => ({
+            name: drive,
+            path: drive + '\\',
+            isDirectory: true,
+            isDrive: true,
+          }));
+          return c.json({
+            path: '',
+            entries: commonDrives,
+            isRoot: true,
+          });
+        }
+      } else {
+        // Unix: return root and home
+        const os = await import('node:os');
+        const homedir = os.homedir();
+        return c.json({
+          path: '',
+          entries: [
+            { name: '/', path: '/', isDirectory: true, isDrive: false },
+            { name: 'Home', path: homedir, isDirectory: true, isDrive: false },
+          ],
+          isRoot: true,
+        });
+      }
+    }
+
+    // Browse specific directory
+    const normalizedPath = path.resolve(requestedPath);
+
+    // Security check - don't allow path traversal
+    if (requestedPath.includes('..')) {
+      return c.json({ error: { message: 'Path traversal not allowed', code: 'SECURITY_ERROR' } }, 400);
+    }
+
+    try {
+      const entries = await fs.readdir(normalizedPath, { withFileTypes: true });
+
+      // Filter to directories only and sort
+      const directories = entries
+        .filter(entry => {
+          try {
+            return entry.isDirectory();
+          } catch {
+            return false;
+          }
+        })
+        .map(entry => ({
+          name: entry.name,
+          path: path.join(normalizedPath, entry.name),
+          isDirectory: true,
+          isDrive: false,
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+
+      // Get parent directory
+      const parentPath = path.dirname(normalizedPath);
+      const isAtRoot = process.platform === 'win32'
+        ? /^[A-Z]:\\?$/i.test(normalizedPath)
+        : normalizedPath === '/';
+
+      return c.json({
+        path: normalizedPath,
+        entries: directories,
+        parent: isAtRoot ? null : parentPath,
+        isRoot: false,
+      });
+    } catch (err) {
+      const error = err as NodeJS.ErrnoException;
+      if (error.code === 'ENOENT') {
+        return c.json({ error: { message: 'Directory not found', code: 'NOT_FOUND' } }, 404);
+      }
+      if (error.code === 'EACCES' || error.code === 'EPERM') {
+        return c.json({ error: { message: 'Permission denied', code: 'PERMISSION_DENIED' } }, 403);
+      }
+      throw err;
+    }
+  } catch (error) {
+    logger.error('Browse directory error', { error: error instanceof Error ? error.message : String(error) });
+    return c.json({
+      error: { message: error instanceof Error ? error.message : 'Failed to browse directory' },
+    }, 500);
+  }
+});
+
 export { files };

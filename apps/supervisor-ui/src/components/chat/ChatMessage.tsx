@@ -3,8 +3,6 @@ import clsx from 'clsx';
 import {
   User,
   Bot,
-  ChevronDown,
-  ChevronRight,
   Terminal,
   Eye,
   Pencil,
@@ -25,8 +23,7 @@ export type MessageType =
   | 'tool_use'
   | 'tool_result'
   | 'result'
-  | 'system'
-  | 'agent';
+  | 'system';
 
 export interface ChatMessageData {
   id: string;
@@ -90,22 +87,45 @@ export function UserMessage({ message }: { message: ChatMessageData }) {
 // Assistant Message Component
 export function AssistantMessage({ message }: { message: ChatMessageData }) {
   const isThinking = message.isThinking || message.type === 'thinking';
-  const executorColor = message.executor === 'codex' ? 'text-green-600' : 'text-purple-600';
-  const executorBg = message.executor === 'codex' ? 'bg-green-100' : 'bg-purple-100';
-  const executorName = message.executor === 'codex' ? 'Codex' : 'Claude';
+
+  // Determine colors and name based on executor: claude=purple, codex=green, supervisor/undefined=slate
+  const getStyle = () => {
+    if (message.executor === 'codex') {
+      return {
+        color: 'text-green-600',
+        bg: 'bg-green-100',
+        name: 'Codex',
+      };
+    } else if (message.executor === 'claude') {
+      return {
+        color: 'text-purple-600',
+        bg: 'bg-purple-100',
+        name: 'Claude',
+      };
+    } else {
+      // Supervisor or unknown - use neutral slate colors
+      return {
+        color: 'text-slate-600',
+        bg: 'bg-slate-200',
+        name: 'Supervisor',
+      };
+    }
+  };
+
+  const style = getStyle();
 
   return (
     <div className="flex gap-3 px-4 py-4 bg-slate-50">
-      <div className={clsx('w-8 h-8 rounded-full flex items-center justify-center shrink-0', executorBg)}>
+      <div className={clsx('w-8 h-8 rounded-full flex items-center justify-center shrink-0', style.bg)}>
         {isThinking ? (
-          <Brain size={16} className={executorColor} />
+          <Brain size={16} className={style.color} />
         ) : (
-          <Bot size={16} className={executorColor} />
+          <Bot size={16} className={style.color} />
         )}
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-1">
-          <span className="text-xs text-slate-400">{executorName}</span>
+          <span className="text-xs text-slate-400">{style.name}</span>
           {isThinking && (
             <span className="text-xs text-slate-400 flex items-center gap-1">
               <Loader2 size={10} className="animate-spin" />
@@ -126,43 +146,40 @@ export function AssistantMessage({ message }: { message: ChatMessageData }) {
 
 // Tool Use Message Component
 export function ToolUseMessage({ message }: { message: ChatMessageData }) {
-  const [expanded, setExpanded] = useState(false);
-  const toolName = message.toolName || 'Unknown Tool';
+  const toolName = message.toolName || 'Tool';
   const inputStr = message.toolInput
     ? JSON.stringify(message.toolInput, null, 2)
     : '';
-
-  // Get a preview of the input
-  const preview = message.toolInput
-    ? Object.entries(message.toolInput)
-        .slice(0, 2)
-        .map(([k, v]) => `${k}: ${typeof v === 'string' ? v.slice(0, 30) : JSON.stringify(v).slice(0, 30)}`)
-        .join(', ')
-    : '';
+  const hasLongInput = inputStr.length > 300;
+  const [inputCollapsed, setInputCollapsed] = useState(hasLongInput);
 
   return (
     <div className="px-4 py-2 ml-11">
       <div className="border border-amber-200 bg-amber-50 rounded-lg overflow-hidden">
-        <button
-          onClick={() => setExpanded(!expanded)}
-          className="w-full flex items-center gap-2 px-3 py-2 hover:bg-amber-100 transition-colors"
-        >
+        <div className="flex items-center gap-2 px-3 py-2">
           <ToolIcon name={toolName} className="w-4 h-4 text-amber-600" />
           <span className="font-medium text-sm text-amber-800">{toolName}</span>
-          <span className="text-xs text-amber-600 truncate flex-1 text-left font-mono">
-            {preview && preview.length > 50 ? preview.slice(0, 50) + '...' : preview}
-          </span>
-          {expanded ? (
-            <ChevronDown size={14} className="text-amber-600" />
-          ) : (
-            <ChevronRight size={14} className="text-amber-600" />
-          )}
-        </button>
-        {expanded && inputStr && (
+        </div>
+        {/* Show message content */}
+        {message.content && (
+          <div className="px-3 pb-2">
+            <div className="text-sm text-slate-700 whitespace-pre-wrap">{message.content}</div>
+          </div>
+        )}
+        {/* Show tool input if available */}
+        {inputStr && (
           <div className="px-3 pb-3 border-t border-amber-200">
-            <pre className="mt-2 bg-white rounded p-2 text-xs font-mono text-slate-700 overflow-x-auto max-h-48 overflow-y-auto">
-              {inputStr}
+            <pre className="mt-2 bg-white rounded p-2 text-xs font-mono text-slate-700 overflow-x-auto whitespace-pre-wrap">
+              {inputCollapsed ? inputStr.slice(0, 300) + '...' : inputStr}
             </pre>
+            {hasLongInput && (
+              <button
+                onClick={() => setInputCollapsed(!inputCollapsed)}
+                className="mt-2 text-xs text-amber-600 hover:text-amber-800"
+              >
+                {inputCollapsed ? '▼ 全文を表示' : '▲ 折りたたむ'}
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -172,12 +189,12 @@ export function ToolUseMessage({ message }: { message: ChatMessageData }) {
 
 // Tool Result Message Component
 export function ToolResultMessage({ message }: { message: ChatMessageData }) {
-  const [expanded, setExpanded] = useState(false);
   const isError = message.isError;
   const content = message.content || message.toolOutput || '';
 
-  // Preview
-  const preview = content.length > 80 ? content.slice(0, 80) + '...' : content;
+  // Show full content by default, collapsible only for very long content (>500 chars)
+  const isLongContent = content.length > 500;
+  const [collapsed, setCollapsed] = useState(isLongContent);
 
   return (
     <div className="px-4 py-2 ml-11">
@@ -185,13 +202,7 @@ export function ToolResultMessage({ message }: { message: ChatMessageData }) {
         'border rounded-lg overflow-hidden',
         isError ? 'border-red-200 bg-red-50' : 'border-green-200 bg-green-50'
       )}>
-        <button
-          onClick={() => setExpanded(!expanded)}
-          className={clsx(
-            'w-full flex items-center gap-2 px-3 py-2 transition-colors',
-            isError ? 'hover:bg-red-100' : 'hover:bg-green-100'
-          )}
-        >
+        <div className="flex items-center gap-2 px-3 py-2">
           {isError ? (
             <XCircle size={14} className="text-red-500 shrink-0" />
           ) : (
@@ -203,27 +214,26 @@ export function ToolResultMessage({ message }: { message: ChatMessageData }) {
           )}>
             {isError ? 'Error' : 'Result'}
           </span>
-          <span className="text-xs text-slate-600 truncate flex-1 text-left">
-            {preview}
-          </span>
-          {content.length > 80 && (
-            expanded ? (
-              <ChevronDown size={14} className="text-slate-400" />
-            ) : (
-              <ChevronRight size={14} className="text-slate-400" />
-            )
+        </div>
+        <div className={clsx(
+          'px-3 pb-3 border-t',
+          isError ? 'border-red-200' : 'border-green-200'
+        )}>
+          <pre className="mt-2 bg-white rounded p-2 text-xs font-mono text-slate-700 overflow-x-auto whitespace-pre-wrap">
+            {collapsed ? content.slice(0, 500) + '...' : content}
+          </pre>
+          {isLongContent && (
+            <button
+              onClick={() => setCollapsed(!collapsed)}
+              className={clsx(
+                'mt-2 text-xs',
+                isError ? 'text-red-600 hover:text-red-800' : 'text-green-600 hover:text-green-800'
+              )}
+            >
+              {collapsed ? '▼ 全文を表示' : '▲ 折りたたむ'}
+            </button>
           )}
-        </button>
-        {expanded && (
-          <div className={clsx(
-            'px-3 pb-3 border-t',
-            isError ? 'border-red-200' : 'border-green-200'
-          )}>
-            <pre className="mt-2 bg-white rounded p-2 text-xs font-mono text-slate-700 overflow-x-auto max-h-64 overflow-y-auto whitespace-pre-wrap">
-              {content}
-            </pre>
-          </div>
-        )}
+        </div>
       </div>
     </div>
   );
@@ -231,20 +241,43 @@ export function ToolResultMessage({ message }: { message: ChatMessageData }) {
 
 // Final Result Message Component
 export function ResultMessage({ message }: { message: ChatMessageData }) {
-  const executorColor = message.executor === 'codex' ? 'text-green-600' : 'text-purple-600';
-  const executorBg = message.executor === 'codex' ? 'bg-green-50' : 'bg-purple-50';
-  const borderColor = message.executor === 'codex' ? 'border-green-200' : 'border-purple-200';
+  // Determine colors based on executor: claude=purple, codex=green, supervisor/undefined=slate
+  const getColors = () => {
+    if (message.executor === 'codex') {
+      return {
+        iconColor: 'text-green-600',
+        iconBg: 'bg-green-100',
+        contentBg: 'bg-green-50',
+        border: 'border-green-200',
+      };
+    } else if (message.executor === 'claude') {
+      return {
+        iconColor: 'text-purple-600',
+        iconBg: 'bg-purple-100',
+        contentBg: 'bg-purple-50',
+        border: 'border-purple-200',
+      };
+    } else {
+      // Supervisor or unknown - use neutral slate colors
+      return {
+        iconColor: 'text-slate-600',
+        iconBg: 'bg-slate-100',
+        contentBg: 'bg-slate-50',
+        border: 'border-slate-200',
+      };
+    }
+  };
+
+  const colors = getColors();
 
   return (
     <div className="flex gap-3 px-4 py-4">
-      <div className={clsx('w-8 h-8 rounded-full flex items-center justify-center shrink-0',
-        message.executor === 'codex' ? 'bg-green-100' : 'bg-purple-100'
-      )}>
-        <CheckCircle size={16} className={executorColor} />
+      <div className={clsx('w-8 h-8 rounded-full flex items-center justify-center shrink-0', colors.iconBg)}>
+        <CheckCircle size={16} className={colors.iconColor} />
       </div>
       <div className="flex-1 min-w-0">
         <div className="text-xs text-slate-400 mb-2">Task Completed</div>
-        <div className={clsx('rounded-lg border p-3', executorBg, borderColor)}>
+        <div className={clsx('rounded-lg border p-3', colors.contentBg, colors.border)}>
           <div className="text-slate-800 whitespace-pre-wrap">{message.content}</div>
         </div>
       </div>
@@ -284,6 +317,13 @@ function CompactMessage({ message }: MessageProps) {
   const isUser = message.type === 'user';
   const isError = message.status === 'error' || message.isError;
 
+  // Get icon color based on executor: claude=purple, codex=green, supervisor/undefined=slate
+  const getIconColor = () => {
+    if (message.executor === 'codex') return 'text-green-500';
+    if (message.executor === 'claude') return 'text-purple-500';
+    return 'text-slate-500'; // Supervisor or unknown
+  };
+
   return (
     <div className={clsx(
       'px-2 py-1.5 text-xs rounded',
@@ -292,10 +332,8 @@ function CompactMessage({ message }: MessageProps) {
       <div className="flex items-start gap-1.5">
         {isUser ? (
           <User size={12} className="text-blue-500 shrink-0 mt-0.5" />
-        ) : message.executor === 'codex' ? (
-          <Bot size={12} className="text-green-500 shrink-0 mt-0.5" />
         ) : (
-          <Bot size={12} className="text-purple-500 shrink-0 mt-0.5" />
+          <Bot size={12} className={clsx(getIconColor(), 'shrink-0 mt-0.5')} />
         )}
         <span className="break-words">{message.content}</span>
       </div>
@@ -305,14 +343,9 @@ function CompactMessage({ message }: MessageProps) {
 
 // Main ChatMessage router
 export function ChatMessage({ message, compact }: MessageProps) {
-  // Use compact mode for agent columns
+  // Use compact mode for agent columns (multi-panel view)
   if (compact) {
     return <CompactMessage message={message} />;
-  }
-
-  // For 'agent' type messages (from AgentsPage), use compact-like rendering
-  if (message.type === 'agent' as MessageType) {
-    return <CompactMessage message={message} compact />;
   }
 
   switch (message.type) {
@@ -330,6 +363,7 @@ export function ChatMessage({ message, compact }: MessageProps) {
     case 'system':
       return <SystemMessage message={message} />;
     default:
-      return <CompactMessage message={message} />;
+      // Fallback to assistant message for unknown types
+      return <AssistantMessage message={message} />;
   }
 }

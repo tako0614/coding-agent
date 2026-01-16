@@ -12,42 +12,56 @@ import {
   specToMarkdown,
 } from './spec-schema.js';
 
-// Prepared statements
-const insertSpecStmt = db.prepare(`
-  INSERT INTO structured_specs (spec_run_id, spec_json, markdown, created_at, updated_at)
-  VALUES (@spec_run_id, @spec_json, @markdown, @created_at, @updated_at)
-`);
+// Lazy-initialized prepared statements (for hot-reload compatibility)
+function getInsertSpecStmt() {
+  return db.prepare(`
+    INSERT INTO structured_specs (spec_run_id, spec_json, markdown, created_at, updated_at)
+    VALUES (@spec_run_id, @spec_json, @markdown, @created_at, @updated_at)
+  `);
+}
 
-const updateSpecStmt = db.prepare(`
-  UPDATE structured_specs SET
-    spec_json = @spec_json,
-    markdown = @markdown,
-    updated_at = @updated_at
-  WHERE spec_run_id = @spec_run_id
-`);
+function getUpdateSpecStmt() {
+  return db.prepare(`
+    UPDATE structured_specs SET
+      spec_json = @spec_json,
+      markdown = @markdown,
+      updated_at = @updated_at
+    WHERE spec_run_id = @spec_run_id
+  `);
+}
 
-const getSpecStmt = db.prepare(`
-  SELECT * FROM structured_specs WHERE spec_run_id = ?
-`);
+function getGetSpecStmt() {
+  return db.prepare(`
+    SELECT * FROM structured_specs WHERE spec_run_id = ?
+  `);
+}
 
-const deleteSpecStmt = db.prepare(`
-  DELETE FROM structured_specs WHERE spec_run_id = ?
-`);
+function getDeleteSpecStmt() {
+  return db.prepare(`
+    DELETE FROM structured_specs WHERE spec_run_id = ?
+  `);
+}
 
-const insertLinkStmt = db.prepare(`
-  INSERT INTO run_spec_links (impl_run_id, spec_run_id, created_at)
-  VALUES (?, ?, ?)
-`);
+function getInsertLinkStmt() {
+  return db.prepare(`
+    INSERT INTO run_spec_links (impl_run_id, spec_run_id, created_at)
+    VALUES (?, ?, ?)
+  `);
+}
 
-const getLinkedSpecStmt = db.prepare(`
-  SELECT s.* FROM structured_specs s
-  INNER JOIN run_spec_links l ON s.spec_run_id = l.spec_run_id
-  WHERE l.impl_run_id = ?
-`);
+function getLinkedSpecStmt() {
+  return db.prepare(`
+    SELECT s.* FROM structured_specs s
+    INNER JOIN run_spec_links l ON s.spec_run_id = l.spec_run_id
+    WHERE l.impl_run_id = ?
+  `);
+}
 
-const getImplementationsForSpecStmt = db.prepare(`
-  SELECT impl_run_id FROM run_spec_links WHERE spec_run_id = ?
-`);
+function getImplementationsForSpecStmt() {
+  return db.prepare(`
+    SELECT impl_run_id FROM run_spec_links WHERE spec_run_id = ?
+  `);
+}
 
 interface SpecRow {
   id: number;
@@ -77,17 +91,17 @@ export function saveStructuredSpec(
 
   try {
     // Check if exists
-    const existing = getSpecStmt.get(specRunId) as SpecRow | undefined;
+    const existing = getGetSpecStmt().get(specRunId) as SpecRow | undefined;
 
     if (existing) {
-      updateSpecStmt.run({
+      getUpdateSpecStmt().run({
         spec_run_id: specRunId,
         spec_json: specJson,
         markdown,
         updated_at: now,
       });
     } else {
-      insertSpecStmt.run({
+      getInsertSpecStmt().run({
         spec_run_id: specRunId,
         spec_json: specJson,
         markdown,
@@ -110,7 +124,7 @@ export function saveStructuredSpec(
  */
 export function getStructuredSpec(specRunId: string): StructuredSpec | undefined {
   try {
-    const row = getSpecStmt.get(specRunId) as SpecRow | undefined;
+    const row = getGetSpecStmt().get(specRunId) as SpecRow | undefined;
     if (!row) return undefined;
 
     return JSON.parse(row.spec_json) as StructuredSpec;
@@ -128,7 +142,7 @@ export function getStructuredSpec(specRunId: string): StructuredSpec | undefined
  */
 export function getSpecMarkdown(specRunId: string): string | undefined {
   try {
-    const row = getSpecStmt.get(specRunId) as SpecRow | undefined;
+    const row = getGetSpecStmt().get(specRunId) as SpecRow | undefined;
     if (!row) return undefined;
 
     return row.markdown || undefined;
@@ -146,7 +160,7 @@ export function getSpecMarkdown(specRunId: string): string | undefined {
  */
 export function deleteStructuredSpec(specRunId: string): boolean {
   try {
-    const result = deleteSpecStmt.run(specRunId);
+    const result = getDeleteSpecStmt().run(specRunId);
     return result.changes > 0;
   } catch (err) {
     logger.error('Failed to delete structured spec', {
@@ -166,7 +180,7 @@ export function linkImplementationToSpec(
 ): boolean {
   try {
     const now = new Date().toISOString();
-    insertLinkStmt.run(implRunId, specRunId, now);
+    getInsertLinkStmt().run(implRunId, specRunId, now);
     logger.debug('Linked implementation to spec', { implRunId, specRunId });
     return true;
   } catch (err) {
@@ -184,7 +198,7 @@ export function linkImplementationToSpec(
  */
 export function getSpecForImplementation(implRunId: string): StructuredSpec | undefined {
   try {
-    const row = getLinkedSpecStmt.get(implRunId) as SpecRow | undefined;
+    const row = getLinkedSpecStmt().get(implRunId) as SpecRow | undefined;
     if (!row) return undefined;
 
     return JSON.parse(row.spec_json) as StructuredSpec;
@@ -202,7 +216,7 @@ export function getSpecForImplementation(implRunId: string): StructuredSpec | un
  */
 export function getImplementationsForSpec(specRunId: string): string[] {
   try {
-    const rows = getImplementationsForSpecStmt.all(specRunId) as Array<{ impl_run_id: string }>;
+    const rows = getImplementationsForSpecStmt().all(specRunId) as Array<{ impl_run_id: string }>;
     return rows.map(r => r.impl_run_id);
   } catch (err) {
     logger.error('Failed to get implementations for spec', {

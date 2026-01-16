@@ -9,7 +9,7 @@
  * - Expose Control Plane API for Web UI
  */
 
-import { app, BrowserWindow, ipcMain, Menu, Tray, shell, nativeImage } from 'electron';
+import { app, BrowserWindow, ipcMain, Menu, Tray, shell, nativeImage, dialog } from 'electron';
 import { join } from 'path';
 import { ServerManager } from './server-manager';
 import { setupAutoUpdater, UpdaterState } from './auto-updater';
@@ -220,6 +220,7 @@ function updateTrayStatus(status: string): void {
 
 /**
  * Setup IPC handlers for renderer process communication
+ * All async handlers have error handling to prevent unhandled rejections
  */
 function setupIpcHandlers(): void {
   // Server control
@@ -228,18 +229,33 @@ function setupIpcHandlers(): void {
   });
 
   ipcMain.handle('server:restart', async () => {
-    await serverManager?.restart();
-    return serverManager?.getStatus();
+    try {
+      await serverManager?.restart();
+      return { success: true, data: serverManager?.getStatus() };
+    } catch (error) {
+      log.error('Failed to restart server', { error: error instanceof Error ? error.message : String(error) });
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to restart server' };
+    }
   });
 
   ipcMain.handle('server:stop', async () => {
-    await serverManager?.stop();
-    return serverManager?.getStatus();
+    try {
+      await serverManager?.stop();
+      return { success: true, data: serverManager?.getStatus() };
+    } catch (error) {
+      log.error('Failed to stop server', { error: error instanceof Error ? error.message : String(error) });
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to stop server' };
+    }
   });
 
   ipcMain.handle('server:start', async () => {
-    await serverManager?.start();
-    return serverManager?.getStatus();
+    try {
+      await serverManager?.start();
+      return { success: true, data: serverManager?.getStatus() };
+    } catch (error) {
+      log.error('Failed to start server', { error: error instanceof Error ? error.message : String(error) });
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to start server' };
+    }
   });
 
   // App info
@@ -253,18 +269,36 @@ function setupIpcHandlers(): void {
 
   // Update control
   ipcMain.handle('update:check', async () => {
-    const updater = setupAutoUpdater();
-    return updater.checkForUpdates();
+    try {
+      const updater = setupAutoUpdater();
+      const result = await updater.checkForUpdates();
+      return { success: true, data: result };
+    } catch (error) {
+      log.error('Failed to check for updates', { error: error instanceof Error ? error.message : String(error) });
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to check for updates' };
+    }
   });
 
   ipcMain.handle('update:download', async () => {
-    const updater = setupAutoUpdater();
-    return updater.downloadUpdate();
+    try {
+      const updater = setupAutoUpdater();
+      await updater.downloadUpdate();
+      return { success: true };
+    } catch (error) {
+      log.error('Failed to download update', { error: error instanceof Error ? error.message : String(error) });
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to download update' };
+    }
   });
 
   ipcMain.handle('update:install', () => {
-    const updater = setupAutoUpdater();
-    updater.quitAndInstall();
+    try {
+      const updater = setupAutoUpdater();
+      updater.quitAndInstall();
+      return { success: true };
+    } catch (error) {
+      log.error('Failed to install update', { error: error instanceof Error ? error.message : String(error) });
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to install update' };
+    }
   });
 
   ipcMain.handle('update:state', () => {
@@ -289,9 +323,21 @@ function setupIpcHandlers(): void {
     mainWindow?.close();
   });
 
-  // Open external URL
+  // Open external URL - validate URL scheme for security
   ipcMain.handle('shell:openExternal', (_event, url: string) => {
-    shell.openExternal(url);
+    // Only allow http and https URLs to prevent javascript: and file: exploits
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        log.warn('Blocked opening non-http(s) URL', { url, protocol: parsed.protocol });
+        return { success: false, error: 'Only http and https URLs are allowed' };
+      }
+      shell.openExternal(url);
+      return { success: true };
+    } catch (error) {
+      log.warn('Invalid URL for openExternal', { url, error: error instanceof Error ? error.message : String(error) });
+      return { success: false, error: 'Invalid URL' };
+    }
   });
 }
 

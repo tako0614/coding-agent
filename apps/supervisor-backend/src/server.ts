@@ -18,6 +18,7 @@ import { shell } from './api/routes/shell.js';
 import { files } from './api/routes/files.js';
 import { settings } from './api/routes/settings.js';
 import { copilot } from './api/routes/copilot.js';
+import { directExecutor } from './api/routes/direct-executor.js';
 import { eventBus } from './services/event-bus.js';
 import { getModelRouter } from './services/model-router.js';
 import { copilotAPIManager } from './services/copilot-api-manager.js';
@@ -25,6 +26,7 @@ import { ptyService } from './services/pty-service.js';
 import { db } from './services/db.js';
 import { detectInterruptedRuns, stopAllCheckpointManagers } from './services/checkpoint.js';
 import { logger } from './services/logger.js';
+import { validateRepoPath, PathSecurityError } from './services/path-sandbox.js';
 import { runStore } from './api/run-store.js';
 import * as fs from 'fs';
 import * as pathModule from 'path';
@@ -47,95 +49,29 @@ getModelRouter({
   copilotBaseUrl: process.env['COPILOT_API_URL'] ?? 'http://localhost:4141',
 });
 
-// Rate limiting configuration
-const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
-const RATE_LIMIT_MAX_REQUESTS = 100; // max requests per window
+// CORS configuration - restrict to localhost in dev, explicit origins in production
+const isProduction = process.env['NODE_ENV'] === 'production';
+const allowedOrigins: string[] = [];
 
-// Simple in-memory rate limiter with atomic increment
-interface RateLimitRecord {
-  count: number;
-  resetAt: number;
-}
-const rateLimitStore = new Map<string, RateLimitRecord>();
-
-/**
- * Atomically increment rate limit counter for a client
- * Returns the new count and whether the window was reset
- */
-function incrementRateLimit(clientIp: string): { count: number; resetAt: number; wasReset: boolean } {
-  const now = Date.now();
-  const existing = rateLimitStore.get(clientIp);
-
-  if (!existing || existing.resetAt < now) {
-    // Create new record or reset expired one
-    const newRecord: RateLimitRecord = { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS };
-    rateLimitStore.set(clientIp, newRecord);
-    return { count: 1, resetAt: newRecord.resetAt, wasReset: true };
-  }
-
-  // Increment existing counter (single operation, no race)
-  existing.count += 1;
-  return { count: existing.count, resetAt: existing.resetAt, wasReset: false };
+// In production, only allow explicitly configured origins
+// In development, allow localhost origins
+if (!isProduction) {
+  allowedOrigins.push(
+    'http://localhost:3000',
+    'http://localhost:5173', // Vite dev server
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:5173'
+  );
 }
 
-// Cleanup old entries periodically
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, value] of rateLimitStore.entries()) {
-    if (value.resetAt < now) {
-      rateLimitStore.delete(key);
-    }
-  }
-}, RATE_LIMIT_WINDOW_MS);
-
-// Rate limiting middleware
-app.use('*', async (c, next) => {
-  // Skip rate limiting for static files
-  if (!c.req.path.startsWith('/api/') && !c.req.path.startsWith('/v1/')) {
-    return next();
-  }
-
-  // Get client identifier (prefer X-Forwarded-For for proxied requests)
-  const clientIp = c.req.header('X-Forwarded-For')?.split(',')[0]?.trim() ||
-                   c.req.header('X-Real-IP') ||
-                   'unknown';
-
-  // Atomically get and increment the rate limit
-  const { count, resetAt } = incrementRateLimit(clientIp);
-
-  // Set rate limit headers
-  c.header('X-RateLimit-Limit', RATE_LIMIT_MAX_REQUESTS.toString());
-  c.header('X-RateLimit-Remaining', Math.max(0, RATE_LIMIT_MAX_REQUESTS - count).toString());
-  c.header('X-RateLimit-Reset', Math.ceil(resetAt / 1000).toString());
-
-  if (count > RATE_LIMIT_MAX_REQUESTS) {
-    return c.json({
-      error: {
-        message: 'Too many requests, please try again later',
-        type: 'rate_limit_exceeded',
-      },
-    }, 429);
-  }
-
-  return next();
-});
-
-// CORS configuration - restrict to localhost and configured origins
-const allowedOrigins = [
-  'http://localhost:3000',
-  'http://localhost:5173', // Vite dev server
-  'http://127.0.0.1:3000',
-  'http://127.0.0.1:5173',
-];
-
-// Allow additional origins from environment
+// Allow additional origins from environment (required for production cross-origin deployments)
 const additionalOrigins = process.env['CORS_ALLOWED_ORIGINS'];
 if (additionalOrigins) {
-  allowedOrigins.push(...additionalOrigins.split(',').map(o => o.trim()));
+  allowedOrigins.push(...additionalOrigins.split(',').map(o => o.trim()).filter(o => o.length > 0));
 }
 
-// Request size limit middleware
-const MAX_REQUEST_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
+// Request size limit middleware (configurable via environment variables)
+const MAX_REQUEST_SIZE_BYTES = parseInt(process.env['MAX_REQUEST_SIZE_BYTES'] ?? String(10 * 1024 * 1024), 10); // 10MB default
 
 app.use('*', async (c, next) => {
   const contentLength = c.req.header('Content-Length');
@@ -156,15 +92,20 @@ app.use('*', async (c, next) => {
 app.use('*', cors({
   origin: (origin) => {
     // Allow requests with no origin (same-origin, curl, mobile apps)
-    // Return the first allowed origin for CORS headers (not wildcard to avoid bypass)
-    if (!origin) return allowedOrigins[0] ?? 'http://localhost:3000';
+    if (!origin) {
+      // In production with no configured origins, deny all cross-origin
+      // In development, return localhost
+      return allowedOrigins[0] ?? (isProduction ? null : 'http://localhost:3000');
+    }
     // Check if origin is in allowed list
     if (allowedOrigins.includes(origin)) return origin;
     // For development, allow any localhost origin
-    if (origin.startsWith('http://localhost:') || origin.startsWith('http://127.0.0.1:')) {
+    if (!isProduction && (origin.startsWith('http://localhost:') || origin.startsWith('http://127.0.0.1:'))) {
       return origin;
     }
-    return null; // Deny
+    // Deny unknown origins
+    logger.debug('CORS origin denied', { origin, isProduction });
+    return null;
   },
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization', 'Last-Event-ID'],
@@ -275,6 +216,9 @@ app.route('/api/settings', settings);
 
 // Copilot API management endpoints
 app.route('/api/copilot', copilot);
+
+// Direct executor endpoints (Claude Code / Codex direct access)
+app.route('/api/direct-executor', directExecutor);
 
 // Legacy usage endpoint (for Copilot API compatibility)
 app.get('/usage', async (c) => {
@@ -388,43 +332,121 @@ app.delete('/api/sessions/orphaned/:runId', (c) => {
   return c.json({ deleted: true });
 });
 
-// Parallel sessions management
-const getParallelSessionsStmt = db.prepare('SELECT sessions_json FROM parallel_sessions WHERE id = 1');
-const updateParallelSessionsStmt = db.prepare(
-  'UPDATE parallel_sessions SET sessions_json = ?, updated_at = ? WHERE id = 1'
-);
+// Parallel sessions management with optimistic locking (lazy-initialized for hot-reload)
+function getGetParallelSessionsStmt() {
+  return db.prepare('SELECT sessions_json, version FROM parallel_sessions WHERE id = 1');
+}
+function getUpdateParallelSessionsStmt() {
+  return db.prepare(
+    'UPDATE parallel_sessions SET sessions_json = ?, updated_at = ?, version = version + 1 WHERE id = 1 AND version = ?'
+  );
+}
 
-// Get parallel sessions state
+// Get parallel sessions state (includes version for optimistic locking)
 app.get('/api/sessions/parallel', (c) => {
   try {
-    const row = getParallelSessionsStmt.get() as { sessions_json: string } | undefined;
+    const row = getGetParallelSessionsStmt().get() as { sessions_json: string; version: number } | undefined;
     let sessions: unknown[] = [];
-    if (row?.sessions_json) {
-      try {
-        const parsed = JSON.parse(row.sessions_json);
-        sessions = Array.isArray(parsed) ? parsed : [];
-      } catch (parseError) {
-        logger.error('Failed to parse sessions JSON', { error: parseError instanceof Error ? parseError.message : String(parseError) });
-        // Return empty array for malformed JSON
+    let version = 1;
+    if (row) {
+      version = row.version;
+      if (row.sessions_json) {
+        try {
+          const parsed = JSON.parse(row.sessions_json);
+          sessions = Array.isArray(parsed) ? parsed : [];
+        } catch (parseError) {
+          logger.error('Failed to parse sessions JSON', { error: parseError instanceof Error ? parseError.message : String(parseError) });
+          // Return empty array for malformed JSON
+        }
       }
     }
-    return c.json({ sessions });
+    return c.json({ sessions, version });
   } catch (error) {
     logger.error('Failed to get parallel sessions', { error: error instanceof Error ? error.message : String(error) });
-    return c.json({ sessions: [] });
+    return c.json({ sessions: [], version: 1 });
   }
 });
 
-// Save parallel sessions state
+// Save parallel sessions state (requires version for optimistic locking)
 app.put('/api/sessions/parallel', async (c) => {
   try {
     const body = await c.req.json();
     const sessions = body.sessions || [];
-    updateParallelSessionsStmt.run(JSON.stringify(sessions), new Date().toISOString());
-    return c.json({ success: true });
+    const version = body.version;
+
+    // Version is required for optimistic locking
+    if (typeof version !== 'number') {
+      return c.json({ error: { message: 'Version is required for update', type: 'invalid_request', code: 'VERSION_REQUIRED' } }, 400);
+    }
+
+    const result = getUpdateParallelSessionsStmt().run(JSON.stringify(sessions), new Date().toISOString(), version);
+
+    // Check if update was successful (version matched)
+    if (result.changes === 0) {
+      // Version mismatch - concurrent modification detected
+      logger.warn('Parallel sessions update conflict', { providedVersion: version });
+      return c.json({
+        error: {
+          message: 'Conflict: sessions were modified by another request',
+          type: 'conflict',
+          code: 'VERSION_CONFLICT'
+        }
+      }, 409);
+    }
+
+    return c.json({ success: true, version: version + 1 });
   } catch (error) {
     logger.error('Failed to save parallel sessions', { error: error instanceof Error ? error.message : String(error) });
-    return c.json({ error: 'Failed to save sessions' }, 500);
+    return c.json({ error: { message: 'Failed to save sessions', type: 'internal_error' } }, 500);
+  }
+});
+
+// Shell tabs management (lazy-initialized for hot-reload)
+function getGetShellTabsStmt() {
+  return db.prepare('SELECT tabs_json, active_tab_id FROM shell_tabs WHERE id = 1');
+}
+function getUpdateShellTabsStmt() {
+  return db.prepare(
+    'UPDATE shell_tabs SET tabs_json = ?, active_tab_id = ?, updated_at = ? WHERE id = 1'
+  );
+}
+
+// Get shell tabs state
+app.get('/api/sessions/shell-tabs', (c) => {
+  try {
+    const row = getGetShellTabsStmt().get() as { tabs_json: string; active_tab_id: string | null } | undefined;
+    let tabs: unknown[] = [];
+    let activeTabId: string | null = null;
+    if (row) {
+      activeTabId = row.active_tab_id;
+      if (row.tabs_json) {
+        try {
+          const parsed = JSON.parse(row.tabs_json);
+          tabs = Array.isArray(parsed) ? parsed : [];
+        } catch (parseError) {
+          logger.error('Failed to parse shell tabs JSON', { error: parseError instanceof Error ? parseError.message : String(parseError) });
+        }
+      }
+    }
+    return c.json({ tabs, activeTabId });
+  } catch (error) {
+    logger.error('Failed to get shell tabs', { error: error instanceof Error ? error.message : String(error) });
+    return c.json({ tabs: [], activeTabId: null });
+  }
+});
+
+// Save shell tabs state
+app.put('/api/sessions/shell-tabs', async (c) => {
+  try {
+    const body = await c.req.json();
+    const tabs = body.tabs || [];
+    const activeTabId = body.activeTabId || null;
+
+    getUpdateShellTabsStmt().run(JSON.stringify(tabs), activeTabId, new Date().toISOString());
+    return c.json({ success: true });
+  } catch (error) {
+    logger.error('Failed to save shell tabs', { error: error instanceof Error ? error.message : String(error) });
+    return c.json({ error: { message: 'Failed to save shell tabs', type: 'internal_error' } }, 500);
   }
 });
 
@@ -492,14 +514,103 @@ const server = serve({
 // Set up WebSocket server for PTY sessions
 const wss = new WebSocketServer({ noServer: true });
 
+// WebSocket connection limits (configurable via environment)
+const MAX_WEBSOCKET_CONNECTIONS = parseInt(process.env['MAX_WEBSOCKET_CONNECTIONS'] ?? '100', 10);
+const MAX_WEBSOCKET_CONNECTIONS_PER_IP = parseInt(process.env['MAX_WEBSOCKET_CONNECTIONS_PER_IP'] ?? '10', 10);
+
+// Track connections per IP for rate limiting
+const wsConnectionsPerIp = new Map<string, number>();
+let totalWsConnections = 0;
+
+/**
+ * Track WebSocket connection open
+ */
+function trackWsConnectionOpen(clientIp: string): boolean {
+  // Check global limit
+  if (totalWsConnections >= MAX_WEBSOCKET_CONNECTIONS) {
+    logger.warn('WebSocket connection rejected: global limit reached', {
+      total: totalWsConnections,
+      limit: MAX_WEBSOCKET_CONNECTIONS,
+    });
+    return false;
+  }
+
+  // Check per-IP limit
+  const currentCount = wsConnectionsPerIp.get(clientIp) ?? 0;
+  if (currentCount >= MAX_WEBSOCKET_CONNECTIONS_PER_IP) {
+    logger.warn('WebSocket connection rejected: per-IP limit reached', {
+      clientIp,
+      count: currentCount,
+      limit: MAX_WEBSOCKET_CONNECTIONS_PER_IP,
+    });
+    return false;
+  }
+
+  // Update counters
+  wsConnectionsPerIp.set(clientIp, currentCount + 1);
+  totalWsConnections++;
+  return true;
+}
+
+/**
+ * Track WebSocket connection close
+ */
+function trackWsConnectionClose(clientIp: string): void {
+  const currentCount = wsConnectionsPerIp.get(clientIp) ?? 0;
+  if (currentCount <= 1) {
+    wsConnectionsPerIp.delete(clientIp);
+  } else {
+    wsConnectionsPerIp.set(clientIp, currentCount - 1);
+  }
+  totalWsConnections = Math.max(0, totalWsConnections - 1);
+}
+
 wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
+  const clientIp = req.socket.remoteAddress || 'unknown';
+
+  // Check connection limits before processing
+  if (!trackWsConnectionOpen(clientIp)) {
+    ws.close(1013, 'Connection limit reached'); // 1013 = Try Again Later
+    return;
+  }
+
+  // Track connection close to decrement counter
+  ws.on('close', () => {
+    trackWsConnectionClose(clientIp);
+  });
+
   const url = new URL(req.url || '', `http://localhost:${port}`);
-  const cwd = url.searchParams.get('cwd') || undefined;
+  const sessionId = url.searchParams.get('sessionId') || undefined;
+  const rawCwd = url.searchParams.get('cwd') || undefined;
   const cols = parseInt(url.searchParams.get('cols') || '80', 10);
   const rows = parseInt(url.searchParams.get('rows') || '24', 10);
 
-  logger.info('New PTY WebSocket connection', { remoteAddress: req.socket.remoteAddress });
-  ptyService.createSession(ws, { cwd, cols, rows });
+  // If sessionId is provided, try to reconnect to existing session
+  if (sessionId) {
+    logger.info('PTY WebSocket reconnection attempt', { sessionId, remoteAddress: clientIp });
+    const reconnected = ptyService.reconnectSession(sessionId, ws);
+    if (reconnected) {
+      return;
+    }
+    // If reconnection failed, fall through to create new session
+    logger.info('Reconnection failed, creating new session');
+  }
+
+  // Validate cwd if provided to prevent path traversal
+  let validatedCwd: string | undefined;
+  if (rawCwd) {
+    try {
+      validatedCwd = validateRepoPath(rawCwd);
+    } catch (err) {
+      const message = err instanceof PathSecurityError ? err.message : 'Invalid working directory';
+      logger.warn('PTY WebSocket connection rejected: invalid cwd', { cwd: rawCwd, error: message });
+      ws.close(1008, message); // 1008 = Policy Violation
+      return;
+    }
+  }
+
+  logger.info('New PTY WebSocket connection', { remoteAddress: clientIp, cwd: validatedCwd });
+  ptyService.createSession(ws, { cwd: validatedCwd, cols, rows });
 });
 
 // Handle upgrade requests

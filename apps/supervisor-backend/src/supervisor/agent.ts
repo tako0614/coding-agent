@@ -12,32 +12,37 @@ import type {
   WorkerTaskResult,
 } from './types.js';
 import { SUPERVISOR_TOOLS, ToolExecutor } from './tools.js';
-import { createRunId } from '@supervisor/protocol';
 import { logger } from '../services/logger.js';
-import { getCopilotAPIConfig, getDAGModel, getMaxContextTokens, DEFAULT_MAX_CONTEXT_TOKENS, COPILOT_PROXY_KEY } from '../services/settings-store.js';
+import { getOpenAIConfig, getDAGModel, getMaxContextTokens, DEFAULT_MAX_CONTEXT_TOKENS } from '../services/settings-store.js';
 import { getErrorMessage, isRetryableError as checkRetryableError } from '../services/errors.js';
 
 // =============================================================================
-// Constants
+// Constants (configurable via environment variables)
 // =============================================================================
 
 /** Maximum retries for API calls */
-const MAX_API_RETRIES = 3;
+const MAX_API_RETRIES = parseInt(process.env['SUPERVISOR_MAX_API_RETRIES'] ?? '3', 10);
 
 /** Base delay for exponential backoff (ms) */
-const BASE_RETRY_DELAY_MS = 1000;
+const BASE_RETRY_DELAY_MS = parseInt(process.env['SUPERVISOR_RETRY_DELAY_MS'] ?? '1000', 10);
 
 /** Max consecutive responses without tool calls before warning */
-const MAX_NO_TOOL_RESPONSES = 5;
+const MAX_NO_TOOL_RESPONSES = parseInt(process.env['SUPERVISOR_MAX_NO_TOOL_RESPONSES'] ?? '5', 10);
 
 /** Max consecutive errors before failing */
-const MAX_CONSECUTIVE_ERRORS = 10;
+const MAX_CONSECUTIVE_ERRORS = parseInt(process.env['SUPERVISOR_MAX_CONSECUTIVE_ERRORS'] ?? '10', 10);
 
 /** Max summarization attempts per step to prevent loops */
-const MAX_SUMMARIZATION_ATTEMPTS = 2;
+const MAX_SUMMARIZATION_ATTEMPTS = parseInt(process.env['SUPERVISOR_MAX_SUMMARIZATION_ATTEMPTS'] ?? '2', 10);
 
 /** Default agent timeout in ms (30 minutes) */
-const DEFAULT_AGENT_TIMEOUT_MS = 30 * 60 * 1000;
+const DEFAULT_AGENT_TIMEOUT_MS = parseInt(process.env['SUPERVISOR_TIMEOUT_MS'] ?? String(30 * 60 * 1000), 10);
+
+/** Maximum number of messages before forcing summarization */
+const MAX_MESSAGES_BEFORE_SUMMARIZATION = parseInt(process.env['SUPERVISOR_MAX_MESSAGES_BEFORE_SUMMARIZATION'] ?? '100', 10);
+
+/** Absolute maximum messages (hard limit for memory safety) */
+const MAX_MESSAGES_HARD_LIMIT = parseInt(process.env['SUPERVISOR_MAX_MESSAGES_HARD_LIMIT'] ?? '500', 10);
 
 // =============================================================================
 // Utilities
@@ -170,6 +175,7 @@ export interface SupervisorAgentEvents {
 }
 
 export interface SupervisorAgentOptions {
+  runId: string;  // Run ID from the caller - DO NOT generate a new one
   repoPath: string;
   userGoal: string;
   events?: SupervisorAgentEvents;
@@ -195,15 +201,19 @@ export class SupervisorAgent {
     this.abortController = new AbortController();
     this.timeoutMs = options.timeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS;
 
-    // Initialize OpenAI client with Copilot API
-    const copilotConfig = getCopilotAPIConfig();
+    // Initialize OpenAI client - try Copilot API first, then direct OpenAI
+    const openaiConfig = getOpenAIConfig();
+    if (!openaiConfig) {
+      throw new Error('APIキーが設定されていません。設定画面でOpenAI APIキーまたはGitHubトークン（Copilot API用）を設定してください。');
+    }
+
     this.openai = new OpenAI({
-      apiKey: copilotConfig.githubToken || COPILOT_PROXY_KEY,
-      baseURL: copilotConfig.enabled ? `${copilotConfig.baseUrl}/v1` : undefined,
+      apiKey: openaiConfig.apiKey,
+      baseURL: openaiConfig.baseUrl,
     });
 
-    // Initialize state
-    const runId = createRunId();
+    // Initialize state - use the runId passed from caller
+    const runId = options.runId;
     this.state = {
       run_id: runId,
       phase: 'init',
@@ -466,6 +476,7 @@ export class SupervisorAgent {
 
   /**
    * Manage context length by summarizing old messages if needed
+   * Triggers on both token count and message count
    */
   private async manageContextLength(): Promise<void> {
     let summarizationAttempts = 0;
@@ -477,7 +488,11 @@ export class SupervisorAgent {
         0
       );
 
-      if (totalTokens <= maxContextTokens) {
+      const messageCount = this.state.messages.length;
+      const needsSummarization = totalTokens > maxContextTokens ||
+        messageCount > MAX_MESSAGES_BEFORE_SUMMARIZATION;
+
+      if (!needsSummarization) {
         return; // Context is within limits
       }
 
@@ -818,8 +833,23 @@ export class SupervisorAgent {
 
   /**
    * Add a message to the conversation history
+   * Enforces message limits to prevent memory exhaustion
    */
   private addMessage(message: SupervisorMessage): void {
+    // Check hard limit - drop oldest non-system messages if exceeded
+    if (this.state.messages.length >= MAX_MESSAGES_HARD_LIMIT) {
+      logger.warn('Message hard limit reached, dropping old messages', {
+        runId: this.state.run_id,
+        messageCount: this.state.messages.length,
+      });
+      // Keep system message and drop oldest messages
+      const systemMessage = this.state.messages.find(m => m.role === 'system');
+      const recentMessages = this.state.messages.slice(-Math.floor(MAX_MESSAGES_HARD_LIMIT / 2));
+      this.state.messages = systemMessage
+        ? [systemMessage, ...recentMessages.filter(m => m.role !== 'system')]
+        : recentMessages;
+    }
+
     this.state.messages.push(message);
     this.state.updated_at = new Date().toISOString();
     this.events.onStateChange?.(this.state);

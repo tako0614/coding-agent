@@ -9,98 +9,119 @@ import { db } from '../services/db.js';
 import { logger } from '../services/logger.js';
 import { DatabaseError, RunNotFoundError, getErrorMessage } from '../services/errors.js';
 
-// Prepared statements for runs table
-const insertRunStmt = db.prepare(`
-  INSERT OR REPLACE INTO runs (
-    run_id, project_id, user_goal, repo_path, mode,
-    final_report, error, dag_json, dag_progress_json,
-    created_at, updated_at
-  ) VALUES (
-    @run_id, @project_id, @user_goal, @repo_path, @mode,
-    @final_report, @error, @dag_json, @dag_progress_json,
-    @created_at, @updated_at
-  )
-`);
+// Lazy-initialized prepared statements for runs table
+// Using functions to ensure statements are created with the current db instance
+function getInsertRunStmt() {
+  return db.prepare(`
+    INSERT OR REPLACE INTO runs (
+      run_id, project_id, user_goal, repo_path, mode,
+      final_report, error, dag_json, dag_progress_json,
+      created_at, updated_at
+    ) VALUES (
+      @run_id, @project_id, @user_goal, @repo_path, @mode,
+      @final_report, @error, @dag_json, @dag_progress_json,
+      @created_at, @updated_at
+    )
+  `);
+}
 
-const getRunStmt = db.prepare(`
-  SELECT * FROM runs WHERE run_id = ?
-`);
+function getGetRunStmt() {
+  return db.prepare(`
+    SELECT * FROM runs WHERE run_id = ?
+  `);
+}
 
-const listRunsStmt = db.prepare(`
-  SELECT * FROM runs ORDER BY created_at DESC LIMIT ? OFFSET ?
-`);
+function getListRunsStmt() {
+  return db.prepare(`
+    SELECT * FROM runs ORDER BY created_at DESC LIMIT ? OFFSET ?
+  `);
+}
 
-const listRunsByProjectStmt = db.prepare(`
-  SELECT * FROM runs WHERE project_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?
-`);
+function getListRunsByProjectStmt() {
+  return db.prepare(`
+    SELECT * FROM runs WHERE project_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?
+  `);
+}
 
-const countRunsStmt = db.prepare(`
-  SELECT COUNT(*) as count FROM runs
-`);
+function getCountRunsStmt() {
+  return db.prepare(`
+    SELECT COUNT(*) as count FROM runs
+  `);
+}
 
-const countRunsByProjectStmt = db.prepare(`
-  SELECT COUNT(*) as count FROM runs WHERE project_id = ?
-`);
+function getCountRunsByProjectStmt() {
+  return db.prepare(`
+    SELECT COUNT(*) as count FROM runs WHERE project_id = ?
+  `);
+}
 
-const deleteRunStmt = db.prepare(`
-  DELETE FROM runs WHERE run_id = ?
-`);
+function getDeleteRunStmt() {
+  return db.prepare(`
+    DELETE FROM runs WHERE run_id = ?
+  `);
+}
 
-const updateRunStmt = db.prepare(`
-  UPDATE runs SET updated_at = @updated_at,
-    final_report = @final_report, error = @error
-  WHERE run_id = @run_id
-`);
+function getUpdateRunStmt() {
+  return db.prepare(`
+    UPDATE runs SET updated_at = @updated_at,
+      final_report = @final_report, error = @error
+    WHERE run_id = @run_id
+  `);
+}
 
-// Transaction wrappers for atomic operations
-const markFailedTransaction = db.transaction((params: {
-  run_id: string;
-  project_id: string | null;
-  user_goal: string;
-  repo_path: string;
-  mode: string;
-  error: string;
-  created_at: string;
-  updated_at: string;
-}) => {
-  insertRunStmt.run({
-    run_id: params.run_id,
-    project_id: params.project_id,
-    user_goal: params.user_goal,
-    repo_path: params.repo_path,
-    mode: params.mode,
-    final_report: null,
-    error: params.error,
-    dag_json: null,
-    dag_progress_json: null,
-    created_at: params.created_at,
-    updated_at: params.updated_at,
+// Lazy-initialized transaction wrappers for atomic operations (for hot-reload compatibility)
+function getMarkFailedTransaction() {
+  return db.transaction((params: {
+    run_id: string;
+    project_id: string | null;
+    user_goal: string;
+    repo_path: string;
+    mode: string;
+    error: string;
+    created_at: string;
+    updated_at: string;
+  }) => {
+    getInsertRunStmt().run({
+      run_id: params.run_id,
+      project_id: params.project_id,
+      user_goal: params.user_goal,
+      repo_path: params.repo_path,
+      mode: params.mode,
+      final_report: null,
+      error: params.error,
+      dag_json: null,
+      dag_progress_json: null,
+      created_at: params.created_at,
+      updated_at: params.updated_at,
+    });
   });
-});
+}
 
-const setRunningTransaction = db.transaction((params: {
-  run_id: string;
-  project_id: string | null;
-  user_goal: string;
-  repo_path: string;
-  mode: string;
-  created_at: string;
-  updated_at: string;
-}) => {
-  insertRunStmt.run({
-    run_id: params.run_id,
-    project_id: params.project_id,
-    user_goal: params.user_goal,
-    repo_path: params.repo_path,
-    mode: params.mode,
-    final_report: null,
-    error: null,
-    dag_json: null,
-    dag_progress_json: null,
-    created_at: params.created_at,
-    updated_at: params.updated_at,
+function getSetRunningTransaction() {
+  return db.transaction((params: {
+    run_id: string;
+    project_id: string | null;
+    user_goal: string;
+    repo_path: string;
+    mode: string;
+    created_at: string;
+    updated_at: string;
+  }) => {
+    getInsertRunStmt().run({
+      run_id: params.run_id,
+      project_id: params.project_id,
+      user_goal: params.user_goal,
+      repo_path: params.repo_path,
+      mode: params.mode,
+      final_report: null,
+      error: null,
+      dag_json: null,
+      dag_progress_json: null,
+      created_at: params.created_at,
+      updated_at: params.updated_at,
+    });
   });
-});
+}
 
 interface RunRow {
   run_id: string;
@@ -121,6 +142,15 @@ const DEFAULT_PAGE_SIZE = 20;
 
 /** Maximum page size */
 const MAX_PAGE_SIZE = 100;
+
+/** Maximum number of completed runs to keep in memory */
+const MAX_MEMORY_RUNS = 100;
+
+/** TTL for completed runs in memory (10 minutes) */
+const RUN_MEMORY_TTL_MS = 10 * 60 * 1000;
+
+/** Cleanup interval (2 minutes) */
+const CLEANUP_INTERVAL_MS = 2 * 60 * 1000;
 
 /** Pagination options */
 export interface PaginationOptions {
@@ -172,21 +202,95 @@ function rowToRunResponse(row: RunRow): RunResponse {
 /**
  * Run store for Supervisor Agent execution
  * Persists completed runs to SQLite database
+ * Implements TTL-based cleanup for memory management
  */
 class RunStore {
   private runs: Map<string, SimplifiedSupervisorStateType> = new Map();
+  private runStoredAt: Map<string, number> = new Map(); // Track when runs were stored in memory
   private runningPromises: Map<string, Promise<SimplifiedSupervisorStateType>> = new Map();
   private runningGoals: Map<string, string> = new Map();
   private runningStartTimes: Map<string, string> = new Map();
   private runProjectIds: Map<string, string> = new Map();
   private runRepoPaths: Map<string, string> = new Map();
   private runModes: Map<string, RunMode> = new Map();
+  private cleanupTimer: NodeJS.Timeout | null = null;
+
+  constructor() {
+    this.startPeriodicCleanup();
+  }
+
+  /**
+   * Start periodic cleanup of old runs from memory
+   */
+  private startPeriodicCleanup(): void {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+    }
+
+    this.cleanupTimer = setInterval(() => {
+      this.cleanupOldRuns();
+    }, CLEANUP_INTERVAL_MS);
+
+    // Don't prevent Node.js from exiting
+    if (this.cleanupTimer.unref) {
+      this.cleanupTimer.unref();
+    }
+  }
+
+  /**
+   * Stop periodic cleanup
+   */
+  stopPeriodicCleanup(): void {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
+  }
+
+  /**
+   * Clean up old completed runs from memory
+   * They can be reloaded from DB when needed
+   */
+  private cleanupOldRuns(): void {
+    const now = Date.now();
+    const toRemove: string[] = [];
+
+    // Find expired runs
+    for (const [runId, storedAt] of this.runStoredAt) {
+      if (now - storedAt > RUN_MEMORY_TTL_MS) {
+        toRemove.push(runId);
+      }
+    }
+
+    // If still over limit, remove oldest
+    if (this.runs.size - toRemove.length > MAX_MEMORY_RUNS) {
+      const sorted = Array.from(this.runStoredAt.entries())
+        .filter(([id]) => !toRemove.includes(id))
+        .sort((a, b) => a[1] - b[1]);
+
+      const excess = this.runs.size - toRemove.length - MAX_MEMORY_RUNS;
+      for (let i = 0; i < excess && i < sorted.length; i++) {
+        toRemove.push(sorted[i]![0]);
+      }
+    }
+
+    // Remove runs from memory (they're persisted to DB)
+    for (const runId of toRemove) {
+      this.runs.delete(runId);
+      this.runStoredAt.delete(runId);
+    }
+
+    if (toRemove.length > 0) {
+      logger.debug('Cleaned up old runs from memory', { count: toRemove.length });
+    }
+  }
 
   /**
    * Store a run state (and persist to DB)
    */
   set(runId: string, state: SimplifiedSupervisorStateType): void {
     this.runs.set(runId, state);
+    this.runStoredAt.set(runId, Date.now());
     this.runningPromises.delete(runId);
     this.persistToDb(runId, state);
     // Clean up all associated tracking data
@@ -242,7 +346,7 @@ class RunStore {
   private persistToDb(runId: string, state: SimplifiedSupervisorStateType): void {
     try {
       logger.debug('Persisting run to DB', { runId });
-      insertRunStmt.run({
+      getInsertRunStmt().run({
         run_id: state.run_id,
         project_id: state.project_id || this.runProjectIds.get(runId) || null,
         user_goal: state.user_goal,
@@ -269,7 +373,7 @@ class RunStore {
    */
   updateRun(runId: string, state: SimplifiedSupervisorStateType): void {
     try {
-      updateRunStmt.run({
+      getUpdateRunStmt().run({
         run_id: runId,
         updated_at: state.updated_at,
         final_report: state.final_summary || null,
@@ -290,7 +394,7 @@ class RunStore {
     if (memState) return memState;
 
     try {
-      const row = getRunStmt.get(runId) as RunRow | undefined;
+      const row = getGetRunStmt().get(runId) as RunRow | undefined;
       if (row) {
         return this.rowToState(row);
       }
@@ -309,7 +413,7 @@ class RunStore {
       return true;
     }
     try {
-      const row = getRunStmt.get(runId) as RunRow | undefined;
+      const row = getGetRunStmt().get(runId) as RunRow | undefined;
       return !!row;
     } catch {
       return false;
@@ -322,10 +426,11 @@ class RunStore {
   delete(runId: string): boolean {
     this.runningPromises.delete(runId);
     this.cleanupRunTracking(runId);
+    this.runStoredAt.delete(runId);
     const memDeleted = this.runs.delete(runId);
 
     try {
-      const result = deleteRunStmt.run(runId);
+      const result = getDeleteRunStmt().run(runId);
       return memDeleted || result.changes > 0;
     } catch (err) {
       const errorMsg = getErrorMessage(err);
@@ -351,7 +456,7 @@ class RunStore {
 
     // Persist failed state using transaction
     try {
-      markFailedTransaction({
+      getMarkFailedTransaction()({
         run_id: runId,
         project_id: projectId || null,
         user_goal: goal || '',
@@ -393,7 +498,7 @@ class RunStore {
 
     try {
       // Get total count from DB
-      const countResult = countRunsStmt.get() as { count: number };
+      const countResult = getCountRunsStmt().get() as { count: number };
       const dbTotalCount = countResult.count;
       const totalCount = runningCount + dbTotalCount;
 
@@ -404,7 +509,7 @@ class RunStore {
         const runningSlice = running.slice(offset, offset + pageSize);
         const remainingSlots = pageSize - runningSlice.length;
         if (remainingSlots > 0) {
-          const rows = listRunsStmt.all(remainingSlots, 0) as RunRow[];
+          const rows = getListRunsStmt().all(remainingSlots, 0) as RunRow[];
           const fromDb = rows
             .filter(row => !runningIds.has(row.run_id))
             .map(rowToRunResponse);
@@ -415,7 +520,7 @@ class RunStore {
       } else {
         // Page is entirely from DB
         const dbOffset = offset - runningCount;
-        const rows = listRunsStmt.all(pageSize, dbOffset) as RunRow[];
+        const rows = getListRunsStmt().all(pageSize, dbOffset) as RunRow[];
         runs = rows
           .filter(row => !runningIds.has(row.run_id))
           .map(rowToRunResponse);
@@ -477,7 +582,7 @@ class RunStore {
 
     try {
       // Get total count from DB
-      const countResult = countRunsByProjectStmt.get(projectId) as { count: number };
+      const countResult = getCountRunsByProjectStmt().get(projectId) as { count: number };
       const dbTotalCount = countResult.count;
       const totalCount = runningCount + dbTotalCount;
 
@@ -488,7 +593,7 @@ class RunStore {
         const runningSlice = running.slice(offset, offset + pageSize);
         const remainingSlots = pageSize - runningSlice.length;
         if (remainingSlots > 0) {
-          const rows = listRunsByProjectStmt.all(projectId, remainingSlots, 0) as RunRow[];
+          const rows = getListRunsByProjectStmt().all(projectId, remainingSlots, 0) as RunRow[];
           const fromDb = rows
             .filter(row => !runningIds.has(row.run_id))
             .map(rowToRunResponse);
@@ -499,7 +604,7 @@ class RunStore {
       } else {
         // Page is entirely from DB
         const dbOffset = offset - runningCount;
-        const rows = listRunsByProjectStmt.all(projectId, pageSize, dbOffset) as RunRow[];
+        const rows = getListRunsByProjectStmt().all(projectId, pageSize, dbOffset) as RunRow[];
         runs = rows
           .filter(row => !runningIds.has(row.run_id))
           .map(rowToRunResponse);
@@ -555,7 +660,8 @@ class RunStore {
     this.runningStartTimes.set(runId, now);
 
     try {
-      setRunningTransaction({
+      console.log('[DEBUG] setRunning: Inserting run record', { runId, goal: goal?.slice(0, 50), repoPath });
+      getSetRunningTransaction()({
         run_id: runId,
         project_id: projectId || null,
         user_goal: goal || '',
@@ -564,8 +670,10 @@ class RunStore {
         created_at: now,
         updated_at: now,
       });
+      console.log('[DEBUG] setRunning: Run record inserted successfully', { runId });
     } catch (err) {
       const errorMsg = getErrorMessage(err);
+      console.error('[DEBUG] setRunning: FAILED to insert run record', { runId, error: errorMsg });
       logger.error('Failed to insert placeholder run', { runId, error: errorMsg });
     }
   }
@@ -639,6 +747,7 @@ class RunStore {
    */
   clear(): void {
     this.runs.clear();
+    this.runStoredAt.clear();
     this.runningPromises.clear();
     this.runningGoals.clear();
     this.runningStartTimes.clear();

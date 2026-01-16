@@ -31,7 +31,7 @@ const UpdateSettingsSchema = z.object({
   // DAG model (for LangGraph)
   dag_model: z.string().optional(),
   // Executor mode
-  executor_mode: z.enum(['agent', 'codex_only', 'claude_only']).optional(),
+  executor_mode: z.enum(['agent', 'codex_only', 'claude_only', 'claude_direct', 'codex_direct']).optional(),
   // Max context tokens (with validation bounds)
   max_context_tokens: z.number()
     .min(MIN_MAX_CONTEXT_TOKENS, `min_context_tokens must be at least ${MIN_MAX_CONTEXT_TOKENS}`)

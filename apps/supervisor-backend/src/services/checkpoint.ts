@@ -167,12 +167,14 @@ export function pruneCheckpoints(runId: string, keepCount = 5): number {
     }
 
     const keepIdSet = new Set(keepIds.map(r => r.id));
+    const keepIdArray = Array.from(keepIdSet);
 
-    // Delete old checkpoints
+    // Delete old checkpoints using parameterized query
+    const placeholders = keepIdArray.map(() => '?').join(',');
     const result = db.prepare(`
       DELETE FROM checkpoints
-      WHERE run_id = ? AND id NOT IN (${keepIds.map(r => r.id).join(',')})
-    `).run(runId);
+      WHERE run_id = ? AND id NOT IN (${placeholders})
+    `).run(runId, ...keepIdArray);
 
     const deletedCount = result.changes;
 

@@ -26,53 +26,69 @@ export interface Conversation {
   updated_at: string;
 }
 
-// Prepared statements for normalized messages table
-const getMessagesStmt = db.prepare(`
-  SELECT id, run_id, seq, role, content, tool_calls_json, created_at
-  FROM conversation_messages
-  WHERE run_id = ?
-  ORDER BY seq ASC
-`);
+// Lazy-initialized prepared statements for normalized messages table
+function getGetMessagesStmt() {
+  return db.prepare(`
+    SELECT id, run_id, seq, role, content, tool_calls_json, created_at
+    FROM conversation_messages
+    WHERE run_id = ?
+    ORDER BY seq ASC
+  `);
+}
 
-const insertMessageStmt = db.prepare(`
-  INSERT INTO conversation_messages (run_id, seq, role, content, tool_calls_json, created_at)
-  VALUES (@run_id, @seq, @role, @content, @tool_calls_json, @created_at)
-`);
+function getInsertMessageStmt() {
+  return db.prepare(`
+    INSERT INTO conversation_messages (run_id, seq, role, content, tool_calls_json, created_at)
+    VALUES (@run_id, @seq, @role, @content, @tool_calls_json, @created_at)
+  `);
+}
 
-const getNextSeqStmt = db.prepare(`
-  SELECT COALESCE(MAX(seq), -1) + 1 as next_seq
-  FROM conversation_messages
-  WHERE run_id = ?
-`);
+function getGetNextSeqStmt() {
+  return db.prepare(`
+    SELECT COALESCE(MAX(seq), -1) + 1 as next_seq
+    FROM conversation_messages
+    WHERE run_id = ?
+  `);
+}
 
-const deleteMessagesStmt = db.prepare(`
-  DELETE FROM conversation_messages WHERE run_id = ?
-`);
+function getDeleteMessagesStmt() {
+  return db.prepare(`
+    DELETE FROM conversation_messages WHERE run_id = ?
+  `);
+}
 
-const getConversationMetaStmt = db.prepare(`
-  SELECT
-    MIN(created_at) as created_at,
-    MAX(created_at) as updated_at
-  FROM conversation_messages
-  WHERE run_id = ?
-`);
+function getGetConversationMetaStmt() {
+  return db.prepare(`
+    SELECT
+      MIN(created_at) as created_at,
+      MAX(created_at) as updated_at
+    FROM conversation_messages
+    WHERE run_id = ?
+  `);
+}
 
 // Legacy statements for backward compatibility
-const getConversationStmt = db.prepare(`
-  SELECT * FROM conversations WHERE run_id = ?
-`);
+function getGetConversationStmt() {
+  return db.prepare(`
+    SELECT * FROM conversations WHERE run_id = ?
+  `);
+}
 
-const upsertConversationStmt = db.prepare(`
-  INSERT INTO conversations (run_id, messages_json, created_at, updated_at)
-  VALUES (@run_id, @messages_json, @created_at, @updated_at)
-  ON CONFLICT(run_id) DO UPDATE SET
-    messages_json = excluded.messages_json,
-    updated_at = excluded.updated_at
-`);
+function getUpsertConversationStmt() {
+  return db.prepare(`
+    INSERT INTO conversations (run_id, messages_json, created_at, updated_at)
+    VALUES (@run_id, @messages_json, @created_at, @updated_at)
+    ON CONFLICT(run_id) DO UPDATE SET
+      messages_json = excluded.messages_json,
+      updated_at = excluded.updated_at
+  `);
+}
 
-const deleteConversationStmt = db.prepare(`
-  DELETE FROM conversations WHERE run_id = ?
-`);
+function getDeleteConversationStmt() {
+  return db.prepare(`
+    DELETE FROM conversations WHERE run_id = ?
+  `);
+}
 
 interface MessageRow {
   id: number;
@@ -92,13 +108,42 @@ interface ConversationRow {
   updated_at: string;
 }
 
+interface NextSeqResult {
+  next_seq: number;
+}
+
+interface ConversationMeta {
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+// Type guard for SQLite sequence result
+function isNextSeqResult(value: unknown): value is NextSeqResult {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'next_seq' in value &&
+    typeof (value as NextSeqResult).next_seq === 'number'
+  );
+}
+
+// Type guard for conversation meta
+function isConversationMeta(value: unknown): value is ConversationMeta {
+  if (typeof value !== 'object' || value === null) return false;
+  const meta = value as Record<string, unknown>;
+  return (
+    ('created_at' in meta && (typeof meta['created_at'] === 'string' || meta['created_at'] === null)) &&
+    ('updated_at' in meta && (typeof meta['updated_at'] === 'string' || meta['updated_at'] === null))
+  );
+}
+
 /**
  * Get conversation by run ID (uses normalized table)
  */
 export function getConversation(runId: string): Conversation | undefined {
   try {
     // Try normalized table first
-    const rows = getMessagesStmt.all(runId) as MessageRow[];
+    const rows = getGetMessagesStmt().all(runId) as MessageRow[];
 
     if (rows.length > 0) {
       const messages: ConversationMessage[] = rows.map(row => {
@@ -118,10 +163,8 @@ export function getConversation(runId: string): Conversation | undefined {
         };
       });
 
-      const meta = getConversationMetaStmt.get(runId) as {
-        created_at: string;
-        updated_at: string;
-      } | undefined;
+      const metaResult = getGetConversationMetaStmt().get(runId);
+      const meta = isConversationMeta(metaResult) ? metaResult : undefined;
 
       const firstRow = rows[0]!;
       const lastRow = rows[rows.length - 1]!;
@@ -135,7 +178,7 @@ export function getConversation(runId: string): Conversation | undefined {
     }
 
     // Fallback to legacy JSON blob table
-    const row = getConversationStmt.get(runId) as ConversationRow | undefined;
+    const row = getGetConversationStmt().get(runId) as ConversationRow | undefined;
     if (!row) return undefined;
 
     let messages: ConversationMessage[] = [];
@@ -170,7 +213,7 @@ export function getConversation(runId: string): Conversation | undefined {
 export function saveConversation(conversation: Conversation): void {
   try {
     const now = new Date().toISOString();
-    upsertConversationStmt.run({
+    getUpsertConversationStmt().run({
       run_id: conversation.run_id,
       messages_json: JSON.stringify(conversation.messages),
       created_at: conversation.created_at || now,
@@ -194,11 +237,14 @@ function addMessageInternal(runId: string, message: ConversationMessage): Conver
 
   try {
     // Get next sequence number
-    const seqResult = getNextSeqStmt.get(runId) as { next_seq: number };
+    const seqResult = getGetNextSeqStmt().get(runId);
+    if (!isNextSeqResult(seqResult)) {
+      throw new Error('Failed to get next sequence number from database');
+    }
     const nextSeq = seqResult.next_seq;
 
     // Insert into normalized table (single row insert, no JSON rewrite)
-    insertMessageStmt.run({
+    getInsertMessageStmt().run({
       run_id: runId,
       seq: nextSeq,
       role: message.role,
@@ -269,9 +315,9 @@ export function addMessage(runId: string, message: ConversationMessage): Convers
 export function deleteConversation(runId: string): boolean {
   try {
     // Delete from normalized table
-    const normalizedResult = deleteMessagesStmt.run(runId);
+    const normalizedResult = getDeleteMessagesStmt().run(runId);
     // Delete from legacy table
-    const legacyResult = deleteConversationStmt.run(runId);
+    const legacyResult = getDeleteConversationStmt().run(runId);
     return normalizedResult.changes > 0 || legacyResult.changes > 0;
   } catch (error) {
     logger.error('Failed to delete conversation', {

@@ -1,34 +1,85 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Terminal as TerminalIcon, Plus, X, FolderOpen } from 'lucide-react';
+import { Terminal as TerminalIcon, Plus, X, FolderOpen, RefreshCw } from 'lucide-react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
+import { useQuery, useMutation } from '@tanstack/react-query';
+import { fetchShellTabs, saveShellTabs, type ShellTab } from '../lib/api';
 import '@xterm/xterm/css/xterm.css';
 
-interface TerminalTab {
-  id: string;
-  title: string;
-  cwd: string;
+interface TerminalTabState extends ShellTab {
+  connected: boolean;
 }
 
 export default function ShellPage() {
   const { t } = useTranslation();
-  const [tabs, setTabs] = useState<TerminalTab[]>([]);
+  const [tabs, setTabs] = useState<TerminalTabState[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [cwd, setCwd] = useState('');
+  const [loaded, setLoaded] = useState(false);
   const terminalRefs = useRef<Map<string, { terminal: Terminal; ws: WebSocket; fitAddon: FitAddon }>>(new Map());
   const containerRef = useRef<HTMLDivElement>(null);
+
+  // Load saved tabs
+  const { data: savedTabs } = useQuery({
+    queryKey: ['shellTabs'],
+    queryFn: fetchShellTabs,
+  });
+
+  // Save tabs mutation
+  const saveMutation = useMutation({
+    mutationFn: ({ tabs, activeTabId }: { tabs: ShellTab[]; activeTabId: string | null }) =>
+      saveShellTabs(tabs, activeTabId),
+  });
+
+  // Load saved tabs on mount
+  useEffect(() => {
+    if (savedTabs && !loaded) {
+      const loadedTabs: TerminalTabState[] = savedTabs.tabs.map((tab: ShellTab) => ({
+        ...tab,
+        connected: false,
+      }));
+      setTabs(loadedTabs);
+      setActiveTabId(savedTabs.activeTabId);
+      setLoaded(true);
+
+      // Initialize terminals for loaded tabs
+      setTimeout(() => {
+        loadedTabs.forEach((tab) => {
+          initializeTerminal(tab.id, tab.cwd, tab.ptySessionId);
+        });
+      }, 100);
+    }
+  }, [savedTabs, loaded]);
+
+  // Save tabs when they change
+  useEffect(() => {
+    if (!loaded) return;
+
+    const timeout = setTimeout(() => {
+      const tabsToSave: ShellTab[] = tabs.map((t) => ({
+        id: t.id,
+        title: t.title,
+        cwd: t.cwd,
+        ptySessionId: t.ptySessionId,
+      }));
+      saveMutation.mutate({ tabs: tabsToSave, activeTabId });
+    }, 500);
+
+    return () => clearTimeout(timeout);
+  }, [tabs, activeTabId, loaded]);
 
   // Create a new terminal tab
   const createTab = useCallback((initialCwd?: string) => {
     const tabId = `tab-${Date.now()}`;
     const workingDir = initialCwd || cwd || '';
 
-    const newTab: TerminalTab = {
+    const newTab: TerminalTabState = {
       id: tabId,
       title: workingDir ? workingDir.split(/[/\\]/).pop() || 'Terminal' : 'Terminal',
       cwd: workingDir,
+      connected: false,
     };
 
     setTabs((prev) => [...prev, newTab]);
@@ -39,9 +90,12 @@ export default function ShellPage() {
   }, [cwd]);
 
   // Initialize xterm.js terminal
-  const initializeTerminal = useCallback((tabId: string, workingDir: string) => {
+  const initializeTerminal = useCallback((tabId: string, workingDir: string, ptySessionId?: string) => {
     const container = document.getElementById(`terminal-${tabId}`);
     if (!container) return;
+
+    // Check if already initialized
+    if (terminalRefs.current.has(tabId)) return;
 
     // Create terminal
     const terminal = new Terminal({
@@ -83,15 +137,26 @@ export default function ShellPage() {
     terminal.open(container);
     fitAddon.fit();
 
-    // Connect to WebSocket
+    // Connect to WebSocket (with optional sessionId for reconnection)
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
-    const wsUrl = `${protocol}//${host}/api/terminal?cwd=${encodeURIComponent(workingDir)}&cols=${terminal.cols}&rows=${terminal.rows}`;
+    let wsUrl = `${protocol}//${host}/api/terminal?cols=${terminal.cols}&rows=${terminal.rows}`;
+    if (ptySessionId) {
+      wsUrl += `&sessionId=${encodeURIComponent(ptySessionId)}`;
+    }
+    if (workingDir) {
+      wsUrl += `&cwd=${encodeURIComponent(workingDir)}`;
+    }
 
     const ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
-      terminal.writeln('\x1b[32m● Connected to terminal\x1b[0m\r\n');
+      if (!ptySessionId) {
+        terminal.writeln('\x1b[32m● Connected to terminal\x1b[0m\r\n');
+      }
+      setTabs((prev) =>
+        prev.map((tab) => (tab.id === tabId ? { ...tab, connected: true } : tab))
+      );
     };
 
     ws.onmessage = (event) => {
@@ -100,19 +165,35 @@ export default function ShellPage() {
         switch (msg.type) {
           case 'output':
             terminal.write(msg.data);
+            if (msg.replayed) {
+              terminal.writeln('\r\n\x1b[32m● Reconnected (output restored)\x1b[0m\r\n');
+            }
             break;
           case 'session':
-            // Update tab title with shell info
+            // Store the PTY session ID for reconnection
             setTabs((prev) =>
               prev.map((tab) =>
                 tab.id === tabId
-                  ? { ...tab, title: msg.cwd.split(/[/\\]/).pop() || msg.shell }
+                  ? {
+                      ...tab,
+                      title: msg.cwd.split(/[/\\]/).pop() || msg.shell,
+                      ptySessionId: msg.sessionId,
+                    }
                   : tab
               )
             );
+            if (msg.reconnected) {
+              terminal.writeln('\x1b[32m● Session reconnected\x1b[0m');
+            }
             break;
           case 'exit':
             terminal.writeln(`\r\n\x1b[33m● Process exited with code ${msg.exitCode}\x1b[0m`);
+            // Clear ptySessionId since the session is gone
+            setTabs((prev) =>
+              prev.map((tab) =>
+                tab.id === tabId ? { ...tab, ptySessionId: undefined } : tab
+              )
+            );
             break;
         }
       } catch {
@@ -123,6 +204,9 @@ export default function ShellPage() {
 
     ws.onclose = () => {
       terminal.writeln('\r\n\x1b[31m● Disconnected from terminal\x1b[0m');
+      setTabs((prev) =>
+        prev.map((tab) => (tab.id === tabId ? { ...tab, connected: false } : tab))
+      );
     };
 
     ws.onerror = () => {
@@ -170,6 +254,20 @@ export default function ShellPage() {
     });
   }, [activeTabId]);
 
+  // Reconnect a tab
+  const reconnectTab = useCallback((tabId: string) => {
+    const tab = tabs.find((t) => t.id === tabId);
+    const ref = terminalRefs.current.get(tabId);
+    if (ref && tab) {
+      ref.ws.close();
+      ref.terminal.clear();
+      terminalRefs.current.delete(tabId);
+
+      // Reinitialize with the saved ptySessionId
+      setTimeout(() => initializeTerminal(tabId, tab.cwd, tab.ptySessionId), 100);
+    }
+  }, [tabs, initializeTerminal]);
+
   // Handle window resize
   useEffect(() => {
     const handleResize = () => {
@@ -198,12 +296,14 @@ export default function ShellPage() {
     }
   }, [activeTabId]);
 
-  // Create initial tab
+  // Create initial tab if no saved tabs
   useEffect(() => {
-    if (tabs.length === 0) {
+    if (loaded && tabs.length === 0) {
       createTab();
     }
-  }, []);
+  }, [loaded, tabs.length, createTab]);
+
+  const activeTab = tabs.find((t) => t.id === activeTabId);
 
   return (
     <div className="h-full flex flex-col">
@@ -249,6 +349,24 @@ export default function ShellPage() {
             >
               <TerminalIcon size={14} />
               <span className="text-sm max-w-32 truncate">{tab.title}</span>
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  tab.connected ? 'bg-green-500' : 'bg-red-500'
+                }`}
+                title={tab.connected ? 'Connected' : 'Disconnected'}
+              />
+              {!tab.connected && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    reconnectTab(tab.id);
+                  }}
+                  className="p-0.5 hover:bg-slate-600 rounded"
+                  title="Reconnect"
+                >
+                  <RefreshCw size={12} />
+                </button>
+              )}
               <button
                 onClick={(e) => {
                   e.stopPropagation();
@@ -295,6 +413,11 @@ export default function ShellPage() {
 
       <p className="mt-4 text-sm text-slate-500">
         {t('shell.tip')}
+        {activeTab?.ptySessionId && (
+          <span className="ml-2 text-xs text-slate-400">
+            (Session: {activeTab.ptySessionId.slice(0, 12)}...)
+          </span>
+        )}
       </p>
     </div>
   );

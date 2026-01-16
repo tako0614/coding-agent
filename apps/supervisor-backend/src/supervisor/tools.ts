@@ -16,29 +16,29 @@ import { logger } from '../services/logger.js';
 import { getErrorMessage, ToolExecutionError } from '../services/errors.js';
 
 // =============================================================================
-// Constants
+// Constants (configurable via environment variables)
 // =============================================================================
 
 /** Maximum file size to read (50KB) */
-const MAX_FILE_READ_SIZE = 50_000;
+const MAX_FILE_READ_SIZE = parseInt(process.env['TOOLS_MAX_FILE_READ_SIZE'] ?? '50000', 10);
 
 /** Maximum command output size (10KB) */
-const MAX_COMMAND_OUTPUT_SIZE = 10_000;
+const MAX_COMMAND_OUTPUT_SIZE = parseInt(process.env['TOOLS_MAX_COMMAND_OUTPUT_SIZE'] ?? '10000', 10);
 
 /** Maximum number of files to list */
-const MAX_LIST_FILES = 500;
+const MAX_LIST_FILES = parseInt(process.env['TOOLS_MAX_LIST_FILES'] ?? '500', 10);
 
 /** Maximum directory depth for recursive listing */
-const MAX_LIST_DEPTH = 10;
+const MAX_LIST_DEPTH = parseInt(process.env['TOOLS_MAX_LIST_DEPTH'] ?? '10', 10);
 
 /** Maximum output log lines to keep per task */
-const MAX_OUTPUT_LOG_LINES = 1000;
+const MAX_OUTPUT_LOG_LINES = parseInt(process.env['TOOLS_MAX_OUTPUT_LOG_LINES'] ?? '1000', 10);
 
 /** Command timeout in milliseconds (5 minutes) */
-const COMMAND_TIMEOUT_MS = 300_000;
+const COMMAND_TIMEOUT_MS = parseInt(process.env['TOOLS_COMMAND_TIMEOUT_MS'] ?? '300000', 10);
 
 /** Command max buffer size (10MB) */
-const COMMAND_MAX_BUFFER = 10 * 1024 * 1024;
+const COMMAND_MAX_BUFFER = parseInt(process.env['TOOLS_COMMAND_MAX_BUFFER'] ?? String(10 * 1024 * 1024), 10);
 
 /** Binary file extensions to skip reading as text */
 const BINARY_EXTENSIONS = new Set([
@@ -196,42 +196,74 @@ function validateArgs<T extends Record<string, unknown>>(
 
 /**
  * Dangerous command patterns that should be blocked
+ * These patterns are designed to be comprehensive and prevent bypass attempts
  */
 const DANGEROUS_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   // Destructive file operations on root or system directories
-  { pattern: /\brm\s+(-[rf]+\s+)*[/\\]($|\s)/i, reason: 'Deleting root directory' },
-  { pattern: /\brm\s+(-[rf]+\s+)*\/\*($|\s)/i, reason: 'Deleting all files in root' },
-  { pattern: /\brm\s+(-[rf]+\s+)*~($|\s)/i, reason: 'Deleting home directory' },
+  // Handles various forms: rm -rf /, rm -rf /*, rm -rf ~
+  { pattern: /\brm\s+(-[rRfFiIdDvV]+\s*)*[/\\]($|\s|"|\*)/i, reason: 'Deleting root directory' },
+  { pattern: /\brm\s+(-[rRfFiIdDvV]+\s*)*~($|\s|\/)/i, reason: 'Deleting home directory' },
+  { pattern: /\brm\s+(-[rRfFiIdDvV]+\s*)*\$HOME($|\s|\/)/i, reason: 'Deleting home directory' },
 
-  // System file access
-  { pattern: /\/etc\/(passwd|shadow|sudoers)/i, reason: 'Accessing system authentication files' },
-  { pattern: /\/etc\/ssh\/.*key/i, reason: 'Accessing SSH keys' },
-  { pattern: /\.ssh\/(id_|known_hosts|authorized_keys)/i, reason: 'Accessing SSH configuration' },
+  // System file access - also handle escaped paths
+  { pattern: /[/\\]etc[/\\](passwd|shadow|sudoers|gshadow)/i, reason: 'Accessing system authentication files' },
+  { pattern: /[/\\]etc[/\\]ssh[/\\]/i, reason: 'Accessing SSH configuration' },
+  { pattern: /[/\\]\.ssh[/\\]/i, reason: 'Accessing SSH directory' },
+  { pattern: /[/\\]proc[/\\]/i, reason: 'Accessing /proc filesystem' },
+  { pattern: /[/\\]sys[/\\]class/i, reason: 'Accessing /sys filesystem' },
 
-  // Environment and credential exfiltration
-  { pattern: /\bprintenv\s*\|/i, reason: 'Piping environment variables' },
-  { pattern: /\benv\s*\|/i, reason: 'Piping environment variables' },
-  { pattern: /\$[({]?.*PASSWORD/i, reason: 'Accessing password variables' },
-  { pattern: /\$[({]?.*SECRET/i, reason: 'Accessing secret variables' },
-  { pattern: /\$[({]?.*API_KEY/i, reason: 'Accessing API key variables' },
-  { pattern: /\$[({]?.*TOKEN/i, reason: 'Accessing token variables' },
+  // Environment and credential exfiltration - handle various quoting styles
+  { pattern: /\b(printenv|env)\s*(\|\||&&|\||;|\$\(|`)/i, reason: 'Piping environment variables' },
+  { pattern: /\$\{?[A-Z_]*PASSWORD\}?/i, reason: 'Accessing password variables' },
+  { pattern: /\$\{?[A-Z_]*SECRET\}?/i, reason: 'Accessing secret variables' },
+  { pattern: /\$\{?[A-Z_]*API_KEY\}?/i, reason: 'Accessing API key variables' },
+  { pattern: /\$\{?[A-Z_]*TOKEN\}?/i, reason: 'Accessing token variables' },
+  { pattern: /\$\{?[A-Z_]*PRIVATE\}?/i, reason: 'Accessing private key variables' },
+  { pattern: /\$\{?[A-Z_]*CREDENTIAL\}?/i, reason: 'Accessing credential variables' },
 
   // Network exfiltration attempts
-  { pattern: /\bcurl\s+.*-d\s*["']?\$\(/i, reason: 'Exfiltrating command output via curl' },
-  { pattern: /\bwget\s+.*--post-data/i, reason: 'Exfiltrating data via wget' },
-  { pattern: /\bnc\s+-[a-z]*e/i, reason: 'Netcat with execute flag (reverse shell)' },
+  { pattern: /\bcurl\s+.*(-d|--data|--data-raw|--data-binary|--data-urlencode)\s*['"$`]/i, reason: 'Potential data exfiltration via curl' },
+  { pattern: /\bwget\s+.*--post-(data|file)/i, reason: 'Exfiltrating data via wget' },
+  { pattern: /\bnc\s+.*-[a-z]*e/i, reason: 'Netcat with execute flag (reverse shell)' },
+  { pattern: /\bnetcat\s+.*-[a-z]*e/i, reason: 'Netcat with execute flag (reverse shell)' },
+  { pattern: /\bncat\s+.*-[a-z]*e/i, reason: 'Ncat with execute flag (reverse shell)' },
+  { pattern: /\bsocat\s+/i, reason: 'Socat (potential reverse shell)' },
+  { pattern: /\bbash\s+-i\s+/i, reason: 'Interactive bash (potential reverse shell)' },
+  { pattern: />\s*[/\\]dev[/\\]tcp[/\\]/i, reason: 'Bash TCP redirect (reverse shell)' },
 
   // Dangerous shell features
-  { pattern: /\beval\s+.*\$\(/i, reason: 'Dangerous eval with command substitution' },
-  { pattern: /`.*\$\(.*`/i, reason: 'Nested command substitution (potential injection)' },
+  { pattern: /\beval\s+.*(\$\(|`)/i, reason: 'Dangerous eval with command substitution' },
+  { pattern: /`[^`]*\$\([^)]*\)[^`]*`/i, reason: 'Nested command substitution (potential injection)' },
+  { pattern: /\bsource\s+[/\\]dev[/\\]/i, reason: 'Sourcing from /dev' },
+  { pattern: /\bbash\s+-c\s+.*base64/i, reason: 'Base64 encoded command execution' },
+  { pattern: /\becho\s+.*\|\s*base64\s+-d\s*\|/i, reason: 'Base64 decode piped to execution' },
 
   // Privilege escalation
-  { pattern: /\bchmod\s+[0-7]*7[0-7]*\s+\/bin/i, reason: 'Modifying system binary permissions' },
-  { pattern: /\bchown\s+.*\/bin/i, reason: 'Changing system binary ownership' },
+  { pattern: /\bchmod\s+[0-7]*[67][0-7]*\s+[/\\]/i, reason: 'Modifying system permissions' },
+  { pattern: /\bchown\s+.*[/\\](bin|sbin|usr|etc|lib)/i, reason: 'Changing system file ownership' },
+  { pattern: /\bsetcap\s+/i, reason: 'Setting Linux capabilities' },
+  { pattern: /\bsetfacl\s+/i, reason: 'Modifying filesystem ACLs' },
 
   // Process killing (only block system-wide kills)
-  { pattern: /\bkill\s+-9\s+-1($|\s)/i, reason: 'Killing all processes' },
-  { pattern: /\bkillall\s+-9\s+/i, reason: 'Killing processes by name' },
+  { pattern: /\bkill\s+(-[a-zA-Z0-9]+\s+)*-1($|\s)/i, reason: 'Killing all processes' },
+  { pattern: /\bkillall\s+-[a-zA-Z0-9]*9/i, reason: 'Force killing processes by name' },
+  { pattern: /\bpkill\s+-[a-zA-Z0-9]*9/i, reason: 'Force killing processes by pattern' },
+
+  // Dangerous redirects and file descriptors
+  { pattern: />\s*[/\\]dev[/\\]sd[a-z]/i, reason: 'Direct write to block device' },
+  { pattern: /dd\s+.*of=[/\\]dev[/\\]sd/i, reason: 'dd write to block device' },
+  { pattern: /mkfs\s+/i, reason: 'Formatting filesystem' },
+
+  // Cron and scheduled task manipulation
+  { pattern: /crontab\s+-(r|e)/i, reason: 'Modifying crontab' },
+  { pattern: /\bat\s+/i, reason: 'Scheduling commands with at' },
+
+  // Service and system control
+  { pattern: /\bsystemctl\s+(stop|disable|mask)\s+/i, reason: 'Stopping/disabling system services' },
+  { pattern: /\bservice\s+\w+\s+stop/i, reason: 'Stopping system services' },
+  { pattern: /\bshutdown\s+/i, reason: 'System shutdown' },
+  { pattern: /\breboot\s*/i, reason: 'System reboot' },
+  { pattern: /\binit\s+[0-6]/i, reason: 'Changing runlevel' },
 ];
 
 /**
@@ -637,39 +669,69 @@ const MAX_COMPLETED_TASKS = 100;
 const MAX_FILE_WRITE_SIZE = 10 * 1024 * 1024;
 
 /**
- * Simple async mutex for protecting asyncTasks Map operations
+ * Async mutex with timeout support for protecting critical sections
+ * Prevents deadlocks through timeout mechanism
  */
 class AsyncMutex {
   private locked = false;
-  private queue: (() => void)[] = [];
+  private queue: Array<{
+    resolve: () => void;
+    reject: (err: Error) => void;
+    timeoutId: NodeJS.Timeout;
+  }> = [];
+  private static readonly DEFAULT_TIMEOUT_MS = 30000; // 30 seconds
 
-  async acquire(): Promise<void> {
+  async acquire(timeoutMs = AsyncMutex.DEFAULT_TIMEOUT_MS): Promise<void> {
     if (!this.locked) {
       this.locked = true;
       return;
     }
 
-    return new Promise<void>(resolve => {
-      this.queue.push(resolve);
+    return new Promise<void>((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        // Remove from queue on timeout
+        const index = this.queue.findIndex(item => item.resolve === resolve);
+        if (index !== -1) {
+          this.queue.splice(index, 1);
+        }
+        reject(new Error(`Mutex acquire timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      this.queue.push({ resolve, reject, timeoutId });
     });
   }
 
   release(): void {
     const next = this.queue.shift();
     if (next) {
-      next();
+      clearTimeout(next.timeoutId);
+      next.resolve();
     } else {
       this.locked = false;
     }
   }
 
-  async withLock<T>(fn: () => T | Promise<T>): Promise<T> {
-    await this.acquire();
+  async withLock<T>(fn: () => T | Promise<T>, timeoutMs?: number): Promise<T> {
+    await this.acquire(timeoutMs);
     try {
       return await fn();
     } finally {
       this.release();
     }
+  }
+
+  /**
+   * Check if mutex is currently locked (for debugging)
+   */
+  isLocked(): boolean {
+    return this.locked;
+  }
+
+  /**
+   * Get queue length (for debugging/monitoring)
+   */
+  getQueueLength(): number {
+    return this.queue.length;
   }
 }
 
@@ -686,6 +748,7 @@ export class ToolExecutor {
    * Set the worker executor function
    */
   setWorkerExecutor(executor: (tasks: WorkerTask[], signal?: AbortSignal) => Promise<WorkerTaskResult[]>): void {
+    console.log('[DEBUG] setWorkerExecutor: Worker executor configured');
     this.workerExecutor = executor;
   }
 
@@ -1027,7 +1090,9 @@ export class ToolExecutor {
     executor: 'claude' | 'codex';
     context?: string;
   }>): Promise<ToolResult> {
+    console.log('[DEBUG] spawnWorkers called', { taskCount: tasks.length, hasWorkerExecutor: !!this.workerExecutor });
     if (!this.workerExecutor) {
+      console.error('[DEBUG] spawnWorkers: Worker executor NOT configured!');
       return { success: false, error: 'Worker executor not configured' };
     }
 
@@ -1096,7 +1161,9 @@ export class ToolExecutor {
     executor: 'claude' | 'codex';
     context?: string;
   }>): ToolResult {
+    console.log('[DEBUG] spawnWorkersAsync called', { taskCount: tasks.length, hasWorkerExecutor: !!this.workerExecutor });
     if (!this.workerExecutor) {
+      console.error('[DEBUG] spawnWorkersAsync: Worker executor NOT configured!');
       return { success: false, error: 'Worker executor not configured' };
     }
 

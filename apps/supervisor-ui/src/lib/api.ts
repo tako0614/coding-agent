@@ -219,25 +219,61 @@ export interface ParallelSession {
   id: string;
   projectId: string | null;
   runId: string | null;
+  mode: RunMode;
   status: 'idle' | 'running' | 'completed' | 'failed' | 'interrupted';
   input: string;
   selectedModel?: string;
   executorMode?: ExecutorMode;
+  terminalSessionId?: string;  // PTY session ID for reconnection
 }
 
-export async function fetchParallelSessions(): Promise<{ sessions: ParallelSession[] }> {
+export async function fetchParallelSessions(): Promise<{ sessions: ParallelSession[]; version: number }> {
   const res = await fetch(`${API_BASE}/api/sessions/parallel`);
   if (!res.ok) throw new Error('Failed to fetch parallel sessions');
   return res.json();
 }
 
-export async function saveParallelSessions(sessions: ParallelSession[]): Promise<void> {
+export class ParallelSessionsConflictError extends Error {
+  constructor() {
+    super('Sessions were modified by another request');
+    this.name = 'ParallelSessionsConflictError';
+  }
+}
+
+export async function saveParallelSessions(sessions: ParallelSession[], version: number): Promise<{ version: number }> {
   const res = await fetch(`${API_BASE}/api/sessions/parallel`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sessions }),
+    body: JSON.stringify({ sessions, version }),
   });
+  if (res.status === 409) {
+    throw new ParallelSessionsConflictError();
+  }
   if (!res.ok) throw new Error('Failed to save parallel sessions');
+  return res.json();
+}
+
+// Shell Tabs API
+export interface ShellTab {
+  id: string;
+  title: string;
+  cwd: string;
+  ptySessionId?: string;  // PTY session ID for reconnection
+}
+
+export async function fetchShellTabs(): Promise<{ tabs: ShellTab[]; activeTabId: string | null }> {
+  const res = await fetch(`${API_BASE}/api/sessions/shell-tabs`);
+  if (!res.ok) throw new Error('Failed to fetch shell tabs');
+  return res.json();
+}
+
+export async function saveShellTabs(tabs: ShellTab[], activeTabId: string | null): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/sessions/shell-tabs`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tabs, activeTabId }),
+  });
+  if (!res.ok) throw new Error('Failed to save shell tabs');
 }
 
 // Usage API
@@ -406,7 +442,7 @@ export async function generatePlanWithAI(runId: string): Promise<Plan> {
 }
 
 // Settings types
-export type ExecutorMode = 'agent' | 'codex_only' | 'claude_only';
+export type ExecutorMode = 'agent' | 'codex_only' | 'claude_only' | 'claude_direct' | 'codex_direct';
 
 export interface AppSettings {
   openai_api_key?: string;
@@ -592,6 +628,34 @@ export async function renameFile(source: string, destination: string, cwd: strin
   return res.json();
 }
 
+// Directory browsing for folder selection
+export interface BrowseEntry {
+  name: string;
+  path: string;
+  isDirectory: boolean;
+  isDrive: boolean;
+}
+
+export interface BrowseResult {
+  path: string;
+  entries: BrowseEntry[];
+  parent?: string | null;
+  isRoot: boolean;
+}
+
+export async function browseDirectory(path?: string): Promise<BrowseResult> {
+  const res = await fetch(`${API_BASE}/api/files/browse`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  });
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ error: { message: 'Failed to browse directory' } }));
+    throw new Error(error.error?.message || 'Failed to browse directory');
+  }
+  return res.json();
+}
+
 // Desktop Applications API
 export interface GUIApplication {
   pid: number;
@@ -662,5 +726,224 @@ export async function fetchConversation(runId: string): Promise<Conversation | n
   const res = await fetch(`${API_BASE}/api/runs/${runId}/conversation`);
   if (res.status === 404) return null;
   if (!res.ok) throw new Error('Failed to fetch conversation');
+  return res.json();
+}
+
+// Direct Executor API types
+export type DirectExecutorType = 'claude' | 'codex';
+
+export interface DirectExecutorSession {
+  session_id: string;
+  executor_type: DirectExecutorType;
+  cwd: string;
+  claude_session_id?: string;
+  codex_thread_id?: string;
+  created_at: string;
+  last_activity: string;
+}
+
+export interface DirectExecutorMessage {
+  executor: DirectExecutorType;
+  message: ClaudeMessage | CodexMessage;
+  timestamp: string;
+}
+
+// Claude message types
+export interface ClaudeMessage {
+  type: 'system' | 'assistant' | 'tool_use' | 'tool_result' | 'result';
+  subtype?: 'init' | 'error';
+  session_id?: string;
+  message?: string;
+  content?: string;
+  tool_use_id?: string;
+  tool_name?: string;
+  tool_input?: Record<string, unknown>;
+  is_error?: boolean;
+  result?: string;
+}
+
+// Codex message types
+export interface CodexMessage {
+  type: 'text' | 'tool_call' | 'tool_result' | 'file_change' | 'complete';
+  content?: string;
+  tool_call_id?: string;
+  tool_name?: string;
+  arguments?: Record<string, unknown>;
+  output?: string;
+  is_error?: boolean;
+  path?: string;
+  action?: 'create' | 'modify' | 'delete';
+  result?: string;
+  thread_id?: string;
+}
+
+// Direct Executor API functions
+export async function createDirectExecutorSession(
+  executorType: DirectExecutorType,
+  cwd: string
+): Promise<DirectExecutorSession> {
+  const res = await fetch(`${API_BASE}/api/direct-executor/sessions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ executor_type: executorType, cwd }),
+  });
+  if (!res.ok) throw new Error('Failed to create executor session');
+  return res.json();
+}
+
+export async function fetchDirectExecutorSessions(): Promise<{ sessions: DirectExecutorSession[] }> {
+  const res = await fetch(`${API_BASE}/api/direct-executor/sessions`);
+  if (!res.ok) throw new Error('Failed to fetch executor sessions');
+  return res.json();
+}
+
+export async function fetchDirectExecutorSession(sessionId: string): Promise<{ session: DirectExecutorSession }> {
+  const res = await fetch(`${API_BASE}/api/direct-executor/sessions/${sessionId}`);
+  if (!res.ok) throw new Error('Failed to fetch executor session');
+  return res.json();
+}
+
+export async function deleteDirectExecutorSession(sessionId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/direct-executor/sessions/${sessionId}`, { method: 'DELETE' });
+  if (!res.ok) throw new Error('Failed to delete executor session');
+}
+
+/**
+ * Subscribe to direct executor query results via SSE
+ */
+export function subscribeToDirectExecutorQuery(
+  sessionId: string,
+  prompt: string,
+  onMessage: (msg: DirectExecutorMessage) => void,
+  onError?: (error: Error) => void,
+  onComplete?: () => void
+): () => void {
+  const controller = new AbortController();
+
+  fetch(`${API_BASE}/api/direct-executor/sessions/${sessionId}/query`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt }),
+    signal: controller.signal,
+  })
+    .then(async (response) => {
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({ error: { message: 'Unknown error' } }));
+        throw new Error(error.error?.message || 'Query failed');
+      }
+
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+
+      if (!reader) {
+        onError?.(new Error('No response body'));
+        return;
+      }
+
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6);
+            try {
+              const parsed = JSON.parse(data);
+              if (parsed.type === 'done' || parsed.type === 'error') {
+                if (parsed.type === 'error') {
+                  onError?.(new Error(parsed.message));
+                }
+                onComplete?.();
+                return;
+              }
+              // It's a message event
+              if (parsed.executor && parsed.message) {
+                onMessage(parsed as DirectExecutorMessage);
+              }
+            } catch {
+              // Ignore parse errors for incomplete data
+            }
+          }
+        }
+      }
+      onComplete?.();
+    })
+    .catch((error) => {
+      if (error.name !== 'AbortError') {
+        onError?.(error);
+      }
+    });
+
+  return () => controller.abort();
+}
+
+// =============================================================================
+// MCP OAuth API
+// =============================================================================
+
+export interface MCPOAuthClient {
+  client_id: string;
+  client_name: string;
+  client_secret?: string;
+  redirect_uris: string[];
+  scope: string;
+  is_public: boolean;
+  created_at: string;
+}
+
+export interface MCPServerConfig {
+  mcp_server_url: string;
+  oauth_endpoints: {
+    authorization: string;
+    authorize: string;
+    token: string;
+  };
+  available_scopes: string[];
+}
+
+export async function fetchMCPClients(): Promise<{ clients: MCPOAuthClient[] }> {
+  const res = await fetch(`${API_BASE}/api/mcp/clients`);
+  if (!res.ok) throw new Error('Failed to fetch MCP clients');
+  return res.json();
+}
+
+export async function fetchMCPConfig(): Promise<MCPServerConfig> {
+  const res = await fetch(`${API_BASE}/api/mcp/config`);
+  if (!res.ok) throw new Error('Failed to fetch MCP config');
+  return res.json();
+}
+
+export async function createMCPClient(data: {
+  client_name: string;
+  redirect_uris: string[];
+  scope: string;
+  is_public: boolean;
+}): Promise<MCPOAuthClient> {
+  const res = await fetch(`${API_BASE}/api/mcp/clients`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error('Failed to create MCP client');
+  return res.json();
+}
+
+export async function deleteMCPClient(clientId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/mcp/clients/${clientId}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) throw new Error('Failed to delete MCP client');
+}
+
+export async function regenerateMCPClientSecret(clientId: string): Promise<MCPOAuthClient> {
+  const res = await fetch(`${API_BASE}/api/mcp/clients/${clientId}/regenerate-secret`, {
+    method: 'POST',
+  });
+  if (!res.ok) throw new Error('Failed to regenerate MCP client secret');
   return res.json();
 }

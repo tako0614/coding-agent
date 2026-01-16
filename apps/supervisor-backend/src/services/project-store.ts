@@ -19,31 +19,43 @@ const columns = [
   'updated_at',
 ].join(', ');
 
-const listStmt = db.prepare(`SELECT ${columns} FROM projects ORDER BY updated_at DESC`);
-const getStmt = db.prepare(`SELECT ${columns} FROM projects WHERE project_id = ?`);
-const upsertStmt = db.prepare(`
-  INSERT INTO projects (
-    project_id,
-    name,
-    description,
-    repo_path,
-    created_at,
-    updated_at
-  ) VALUES (
-    @project_id,
-    @name,
-    @description,
-    @repo_path,
-    @created_at,
-    @updated_at
-  )
-  ON CONFLICT(project_id) DO UPDATE SET
-    name = excluded.name,
-    description = excluded.description,
-    repo_path = excluded.repo_path,
-    updated_at = excluded.updated_at
-`);
-const deleteStmt = db.prepare('DELETE FROM projects WHERE project_id = ?');
+// Lazy-initialized prepared statements
+function getListStmt() {
+  return db.prepare(`SELECT ${columns} FROM projects ORDER BY updated_at DESC`);
+}
+
+function getGetStmt() {
+  return db.prepare(`SELECT ${columns} FROM projects WHERE project_id = ?`);
+}
+
+function getUpsertStmt() {
+  return db.prepare(`
+    INSERT INTO projects (
+      project_id,
+      name,
+      description,
+      repo_path,
+      created_at,
+      updated_at
+    ) VALUES (
+      @project_id,
+      @name,
+      @description,
+      @repo_path,
+      @created_at,
+      @updated_at
+    )
+    ON CONFLICT(project_id) DO UPDATE SET
+      name = excluded.name,
+      description = excluded.description,
+      repo_path = excluded.repo_path,
+      updated_at = excluded.updated_at
+  `);
+}
+
+function getDeleteStmt() {
+  return db.prepare('DELETE FROM projects WHERE project_id = ?');
+}
 
 function rowToProject(row: ProjectRow): Project {
   return {
@@ -68,20 +80,20 @@ function projectToParams(project: Project): ProjectRow {
 }
 
 export function listProjects(): Project[] {
-  const rows = listStmt.all() as ProjectRow[];
+  const rows = getListStmt().all() as ProjectRow[];
   return rows.map(rowToProject);
 }
 
 export function getProject(projectId: string): Project | undefined {
-  const row = getStmt.get(projectId) as ProjectRow | undefined;
+  const row = getGetStmt().get(projectId) as ProjectRow | undefined;
   return row ? rowToProject(row) : undefined;
 }
 
 export function saveProject(project: Project): void {
-  upsertStmt.run(projectToParams(project));
+  getUpsertStmt().run(projectToParams(project));
 }
 
 export function deleteProject(projectId: string): boolean {
-  const result = deleteStmt.run(projectId);
+  const result = getDeleteStmt().run(projectId);
   return result.changes > 0;
 }

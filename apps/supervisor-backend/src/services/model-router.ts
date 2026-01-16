@@ -4,6 +4,7 @@
  */
 
 import { createCopilotProvider, type CopilotProvider, type UsageInfo } from '@supervisor/provider-copilot';
+import { logger } from './logger.js';
 
 export interface ModelRouterConfig {
   /** Copilot API base URL */
@@ -68,7 +69,7 @@ export class ModelRouterService {
       this.usageCacheTime = now;
       return this.cachedUsage;
     } catch (error) {
-      console.warn('[ModelRouter] Failed to get usage:', error);
+      logger.warn('Failed to get usage', { error: error instanceof Error ? error.message : String(error) });
       return null;
     }
   }

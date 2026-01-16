@@ -2,6 +2,7 @@ import Database, { type Database as DatabaseType } from 'better-sqlite3';
 import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { logger } from './logger.js';
 
 const isPackaged = (process as NodeJS.Process & { pkg?: unknown }).pkg !== undefined;
 
@@ -18,16 +19,21 @@ if (!existsSync(dbDir)) {
 }
 
 export const db: DatabaseType = new Database(dbPath);
-console.log(`[DB] Using database: ${dbPath}`);
+logger.info('Using database', { path: dbPath });
+console.log('[DEBUG] Database opened at:', dbPath);
 
-// Enable WAL mode for better concurrency
-db.pragma('journal_mode = WAL');
+// Use DELETE journal mode (synchronous, no WAL)
+// This ensures data is immediately written to disk, preventing data loss on crash
+db.pragma('journal_mode = DELETE');
 
 // Enable foreign key constraints (SQLite doesn't enforce them by default)
 db.pragma('foreign_keys = ON');
 
 // Set busy timeout to handle concurrent writes gracefully
 db.pragma('busy_timeout = 5000');
+
+// Ensure full synchronous mode for data integrity
+db.pragma('synchronous = FULL');
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS projects (
@@ -93,6 +99,18 @@ db.exec(`
   -- Initialize with empty array if not exists
   INSERT OR IGNORE INTO parallel_sessions (id, sessions_json, updated_at)
   VALUES (1, '[]', datetime('now'));
+
+  -- Shell tabs state (stored as JSON)
+  CREATE TABLE IF NOT EXISTS shell_tabs (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    tabs_json TEXT NOT NULL,
+    active_tab_id TEXT,
+    updated_at TEXT NOT NULL
+  );
+
+  -- Initialize with empty array if not exists
+  INSERT OR IGNORE INTO shell_tabs (id, tabs_json, active_tab_id, updated_at)
+  VALUES (1, '[]', NULL, datetime('now'));
 
   -- Checkpoints for run state recovery
   CREATE TABLE IF NOT EXISTS checkpoints (
@@ -221,7 +239,7 @@ try {
   `).get() as { count: number };
 
   if (hasOldData.count > 0 && hasNewData.count === 0) {
-    console.log('[DB] Migrating conversation messages to normalized table...');
+    logger.info('Migrating conversation messages to normalized table');
     const conversations = db.prepare(`
       SELECT run_id, messages_json, created_at FROM conversations
     `).all() as Array<{ run_id: string; messages_json: string; created_at: string }>;
@@ -250,27 +268,64 @@ try {
             msg.timestamp || conv.created_at
           );
         }
-      } catch {
-        // Skip malformed conversations
+      } catch (parseError) {
+        // Log warning for malformed conversations but continue migration
+        logger.warn('Skipping malformed conversation', { runId: conv.run_id, error: parseError instanceof Error ? parseError.message : String(parseError) });
       }
     }
-    console.log(`[DB] Migrated ${conversations.length} conversations`);
+    logger.info('Migrated conversations', { count: conversations.length });
   }
-} catch {
-  // Table might not exist yet, ignore
+} catch (error) {
+  // Only ignore "no such table" errors (tables might not exist on fresh install)
+  if (error instanceof Error && error.message.includes('no such table')) {
+    // Expected on fresh install, tables will be created by CREATE TABLE IF NOT EXISTS
+  } else {
+    logger.error('Migration error', { error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
+}
+
+// Helper to check if error is "column already exists" (expected during migrations)
+function isColumnExistsError(error: unknown): boolean {
+  if (error instanceof Error) {
+    return error.message.includes('duplicate column name') ||
+           error.message.includes('already exists');
+  }
+  return false;
 }
 
 // Migration: Add mode column if it doesn't exist (for existing databases)
 try {
   db.exec(`ALTER TABLE runs ADD COLUMN mode TEXT NOT NULL DEFAULT 'implementation'`);
-} catch {
-  // Column already exists, ignore
+  logger.info('Added mode column to runs');
+} catch (error) {
+  if (!isColumnExistsError(error)) {
+    logger.error('Failed to add mode column', { error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
+  // Column already exists, which is expected
 }
 
 // Migration: Add conversation_id column to conversation_messages if it doesn't exist
 try {
   db.exec(`ALTER TABLE conversation_messages ADD COLUMN conversation_id TEXT`);
-  console.log('[DB] Added conversation_id column to conversation_messages');
-} catch {
-  // Column already exists, ignore
+  logger.info('Added conversation_id column to conversation_messages');
+} catch (error) {
+  if (!isColumnExistsError(error)) {
+    logger.error('Failed to add conversation_id column', { error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
+  // Column already exists, which is expected
+}
+
+// Migration: Add version column to parallel_sessions for optimistic locking
+try {
+  db.exec(`ALTER TABLE parallel_sessions ADD COLUMN version INTEGER NOT NULL DEFAULT 1`);
+  logger.info('Added version column to parallel_sessions');
+} catch (error) {
+  if (!isColumnExistsError(error)) {
+    logger.error('Failed to add version column', { error: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
+  // Column already exists, which is expected
 }

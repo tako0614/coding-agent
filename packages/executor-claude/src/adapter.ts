@@ -27,6 +27,61 @@ const debug = {
   },
 };
 
+/**
+ * Async mutex for protecting global process.env modifications
+ * This prevents concurrent executions from interfering with each other's environment
+ */
+class EnvMutex {
+  private locked = false;
+  private queue: Array<{
+    resolve: () => void;
+    reject: (err: Error) => void;
+    timeoutId: NodeJS.Timeout;
+  }> = [];
+  private static readonly TIMEOUT_MS = 300000; // 5 minutes
+
+  async acquire(): Promise<void> {
+    if (!this.locked) {
+      this.locked = true;
+      return;
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        const index = this.queue.findIndex(item => item.resolve === resolve);
+        if (index !== -1) {
+          this.queue.splice(index, 1);
+        }
+        reject(new Error(`EnvMutex acquire timeout after ${EnvMutex.TIMEOUT_MS}ms`));
+      }, EnvMutex.TIMEOUT_MS);
+
+      this.queue.push({ resolve, reject, timeoutId });
+    });
+  }
+
+  release(): void {
+    const next = this.queue.shift();
+    if (next) {
+      clearTimeout(next.timeoutId);
+      next.resolve();
+    } else {
+      this.locked = false;
+    }
+  }
+
+  async withLock<T>(fn: () => Promise<T>): Promise<T> {
+    await this.acquire();
+    try {
+      return await fn();
+    } finally {
+      this.release();
+    }
+  }
+}
+
+/** Global mutex for environment variable modifications */
+const envMutex = new EnvMutex();
+
 /** Helper to safely get property from unknown object */
 function getProp<T>(obj: unknown, key: string): T | undefined {
   if (obj && typeof obj === 'object' && key in obj) {
@@ -151,152 +206,158 @@ export class ClaudeAdapter {
         sdkOptions['systemPrompt'] = this.config.systemPrompt;
       }
 
-      // Save original environment variables before modification
-      const originalEnv: Record<string, string | undefined> = {};
-      if (options.env) {
-        for (const key of Object.keys(options.env)) {
-          originalEnv[key] = process.env[key];
-          process.env[key] = options.env[key];
-        }
-      }
-
       // NOTE: Do NOT use process.chdir() - it affects global state
       // The working directory is set via sdkOptions.cwd instead
 
-      // Restore environment variables helper
-      const restoreEnv = () => {
-        for (const [key, value] of Object.entries(originalEnv)) {
-          if (value === undefined) {
-            delete process.env[key];
-          } else {
-            process.env[key] = value;
+      // Use mutex to protect process.env modifications from concurrent access
+      const executeWithEnv = async () => {
+        // Save original environment variables before modification
+        const originalEnv: Record<string, string | undefined> = {};
+        if (options.env) {
+          for (const key of Object.keys(options.env)) {
+            originalEnv[key] = process.env[key];
+            process.env[key] = options.env[key];
           }
+        }
+
+        // Restore environment variables helper
+        const restoreEnv = () => {
+          for (const [key, value] of Object.entries(originalEnv)) {
+            if (value === undefined) {
+              delete process.env[key];
+            } else {
+              process.env[key] = value;
+            }
+          }
+        };
+
+        try {
+          // Execute using the SDK's async generator
+          debug.log('Starting SDK query...');
+          debug.log('Options:', JSON.stringify(sdkOptions, null, 2));
+
+          for await (const message of query({
+            prompt,
+            options: sdkOptions,
+          })) {
+            debug.log('Message:', JSON.stringify(message, null, 2).slice(0, 500));
+            // Call message handler if provided
+            if (options.onMessage) {
+              options.onMessage(message as ClaudeAgentMessage);
+            }
+
+            // Process message types
+            const msgType = getProp<string>(message, 'type');
+            const msgSubtype = getProp<string>(message, 'subtype');
+
+            // Capture session ID from init message
+            if (msgType === 'system' && msgSubtype === 'init') {
+              const sid = getProp<string>(message, 'session_id');
+              if (sid) sessionId = sid;
+            }
+
+            // Track file modifications from Edit/Write tool uses
+            if (msgType === 'tool_use') {
+              const toolName = getProp<string>(message, 'tool_name');
+              const toolInput = getProp<Record<string, unknown>>(message, 'tool_input');
+
+              if ((toolName === 'Edit' || toolName === 'Write') && toolInput) {
+                const filePath = getProp<string>(toolInput, 'file_path');
+                if (filePath && !filesModified.includes(filePath)) {
+                  filesModified.push(filePath);
+                }
+              }
+
+              // Track Bash commands
+              if (toolName === 'Bash' && toolInput) {
+                const cmd = getProp<string>(toolInput, 'command');
+                if (cmd) {
+                  commandsRun.push({
+                    command: cmd,
+                    exitCode: 0, // Will be updated from tool_result
+                    output: '',
+                  });
+                }
+              }
+            }
+
+            // Track tool results for exit codes
+            if (msgType === 'tool_result') {
+              const isError = getProp<boolean>(message, 'is_error');
+              const content = getProp<string>(message, 'content');
+              const lastCmd = commandsRun[commandsRun.length - 1];
+              if (lastCmd) {
+                if (isError) {
+                  lastCmd.exitCode = 1;
+                }
+                if (content) {
+                  lastCmd.output = content;
+                }
+              }
+            }
+
+            // Capture final result
+            if (msgType === 'result' || getProp<string>(message, 'result')) {
+              finalResult = getProp<string>(message, 'result');
+              const sid = getProp<string>(message, 'session_id');
+              if (sid) sessionId = sid;
+            }
+
+            // Handle errors
+            if (msgType === 'system' && msgSubtype === 'error') {
+              hasError = true;
+              errorMessage = getProp<string>(message, 'message');
+            }
+          }
+
+          const endTime = new Date();
+
+          // Build command results
+          const commandResults: CommandResult[] = commandsRun.map((cmd) => ({
+            cmd: cmd.command,
+            exit_code: cmd.exitCode,
+            stdout: cmd.output,
+          }));
+
+          // Determine status
+          const status: WorkReport['status'] = hasError ? 'failed' : 'done';
+
+          return {
+            report_id: createWorkReportId(),
+            order_id: order.order_id,
+            run_id: order.run_id,
+            executor: 'claude' as const,
+            status,
+            summary: hasError
+              ? `Failed: ${errorMessage}`
+              : `Completed: ${filesModified.length} files modified, ${commandsRun.length} commands run`,
+            changes: {
+              files_modified: filesModified,
+            },
+            commands_run: commandResults,
+            verification: {
+              passed: !hasError,
+              details: hasError ? errorMessage : 'Executor reports success',
+            },
+            error: hasError
+              ? {
+                  message: errorMessage ?? 'Unknown error',
+                }
+              : undefined,
+            metadata: {
+              started_at: startTime.toISOString(),
+              completed_at: endTime.toISOString(),
+              model: this.config.model,
+            },
+          };
+        } finally {
+          // Restore original environment variables
+          restoreEnv();
         }
       };
 
-      try {
-        // Execute using the SDK's async generator
-        debug.log('Starting SDK query...');
-        debug.log('Options:', JSON.stringify(sdkOptions, null, 2));
-
-      for await (const message of query({
-        prompt,
-        options: sdkOptions,
-      })) {
-        debug.log('Message:', JSON.stringify(message, null, 2).slice(0, 500));
-        // Call message handler if provided
-        if (options.onMessage) {
-          options.onMessage(message as ClaudeAgentMessage);
-        }
-
-        // Process message types
-        const msgType = getProp<string>(message, 'type');
-        const msgSubtype = getProp<string>(message, 'subtype');
-
-        // Capture session ID from init message
-        if (msgType === 'system' && msgSubtype === 'init') {
-          const sid = getProp<string>(message, 'session_id');
-          if (sid) sessionId = sid;
-        }
-
-        // Track file modifications from Edit/Write tool uses
-        if (msgType === 'tool_use') {
-          const toolName = getProp<string>(message, 'tool_name');
-          const toolInput = getProp<Record<string, unknown>>(message, 'tool_input');
-
-          if ((toolName === 'Edit' || toolName === 'Write') && toolInput) {
-            const filePath = getProp<string>(toolInput, 'file_path');
-            if (filePath && !filesModified.includes(filePath)) {
-              filesModified.push(filePath);
-            }
-          }
-
-          // Track Bash commands
-          if (toolName === 'Bash' && toolInput) {
-            const cmd = getProp<string>(toolInput, 'command');
-            if (cmd) {
-              commandsRun.push({
-                command: cmd,
-                exitCode: 0, // Will be updated from tool_result
-                output: '',
-              });
-            }
-          }
-        }
-
-        // Track tool results for exit codes
-        if (msgType === 'tool_result') {
-          const isError = getProp<boolean>(message, 'is_error');
-          const content = getProp<string>(message, 'content');
-          const lastCmd = commandsRun[commandsRun.length - 1];
-          if (lastCmd) {
-            if (isError) {
-              lastCmd.exitCode = 1;
-            }
-            if (content) {
-              lastCmd.output = content;
-            }
-          }
-        }
-
-        // Capture final result
-        if (msgType === 'result' || getProp<string>(message, 'result')) {
-          finalResult = getProp<string>(message, 'result');
-          const sid = getProp<string>(message, 'session_id');
-          if (sid) sessionId = sid;
-        }
-
-        // Handle errors
-        if (msgType === 'system' && msgSubtype === 'error') {
-          hasError = true;
-          errorMessage = getProp<string>(message, 'message');
-        }
-      }
-
-      const endTime = new Date();
-
-      // Build command results
-      const commandResults: CommandResult[] = commandsRun.map((cmd) => ({
-        cmd: cmd.command,
-        exit_code: cmd.exitCode,
-        stdout: cmd.output,
-      }));
-
-      // Determine status
-      const status: WorkReport['status'] = hasError ? 'failed' : 'done';
-
-      return {
-        report_id: createWorkReportId(),
-        order_id: order.order_id,
-        run_id: order.run_id,
-        executor: 'claude',
-        status,
-        summary: hasError
-          ? `Failed: ${errorMessage}`
-          : `Completed: ${filesModified.length} files modified, ${commandsRun.length} commands run`,
-        changes: {
-          files_modified: filesModified,
-        },
-        commands_run: commandResults,
-        verification: {
-          passed: !hasError,
-          details: hasError ? errorMessage : 'Executor reports success',
-        },
-        error: hasError
-          ? {
-              message: errorMessage ?? 'Unknown error',
-            }
-          : undefined,
-        metadata: {
-          started_at: startTime.toISOString(),
-          completed_at: endTime.toISOString(),
-          model: this.config.model,
-        },
-      };
-      } finally {
-        // Restore original environment variables
-        restoreEnv();
-      }
+      // Execute with mutex protection for process.env modifications
+      return await envMutex.withLock(executeWithEnv);
     } catch (error) {
       const endTime = new Date();
       const errMsg = error instanceof Error ? error.message : String(error);
@@ -309,7 +370,7 @@ export class ClaudeAdapter {
         report_id: createWorkReportId(),
         order_id: order.order_id,
         run_id: order.run_id,
-        executor: 'claude',
+        executor: 'claude' as const,
         status: 'failed',
         summary: `Execution failed: ${errMsg}`,
         commands_run: [],

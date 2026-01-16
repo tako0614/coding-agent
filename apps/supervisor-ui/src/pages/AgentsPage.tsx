@@ -31,6 +31,7 @@ import {
   updateSettings,
   fetchParallelSessions,
   saveParallelSessions,
+  ParallelSessionsConflictError,
   sendSpecMessage,
   fetchConversation,
   type Project,
@@ -41,7 +42,134 @@ import {
   type RunMode,
 } from '../lib/api';
 import clsx from 'clsx';
-import { ChatMessage, type ChatMessageData } from '../components/chat';
+import { ChatMessage, type ChatMessageData, type MessageType } from '../components/chat';
+
+// Helper function to parse log entries and determine message type
+function parseLogToMessage(entry: LogEntry): ChatMessageData | null {
+  const meta = entry.metadata as Record<string, unknown> | undefined;
+  const executor = (entry.source === 'claude' || entry.source === 'codex')
+    ? entry.source as 'claude' | 'codex'
+    : undefined;
+
+  // Skip debug messages
+  if (entry.level === 'debug') return null;
+
+  const msg = entry.message;
+
+  // Completion/Failure result patterns - show prominently
+  if (msg.includes('✅ Completed') || msg.includes('✅ Run completed')) {
+    // Use full summary from metadata if available, otherwise extract from message
+    const fullSummary = meta?.final_summary as string | undefined;
+    const content = fullSummary || msg.replace(/^✅\s*(Completed:|Run completed:?)\s*/i, '').trim() || '完了しました';
+    return {
+      id: `${entry.timestamp}-${Math.random()}`,
+      type: 'result' as MessageType,
+      content,
+      timestamp: entry.timestamp,
+      executor: undefined, // Supervisor completion - use neutral styling
+      metadata: meta,
+    };
+  }
+
+  if (msg.includes('❌ Failed') || msg.includes('❌ Run failed')) {
+    return {
+      id: `${entry.timestamp}-${Math.random()}`,
+      type: 'tool_result' as MessageType,
+      content: msg.replace(/^❌\s*(Failed:|Run failed:?)\s*/i, '').trim() || 'エラーが発生しました',
+      timestamp: entry.timestamp,
+      isError: true,
+      executor,
+      metadata: meta,
+    };
+  }
+
+  // Tool execution patterns
+  if (msg.includes('Executing tool') || msg.includes('Tool:')) {
+    const toolMatch = msg.match(/tool[:\s]+(\w+)/i);
+    return {
+      id: `${entry.timestamp}-${Math.random()}`,
+      type: 'tool_use' as MessageType,
+      content: msg,
+      timestamp: entry.timestamp,
+      toolName: toolMatch?.[1] || 'Tool',
+      toolInput: meta?.args as Record<string, unknown> | undefined,
+      executor,
+      metadata: meta,
+    };
+  }
+
+  // Worker task patterns
+  if (msg.includes('Spawning workers') || msg.includes('Worker') || msg.includes('タスク')) {
+    return {
+      id: `${entry.timestamp}-${Math.random()}`,
+      type: 'system' as MessageType,
+      content: msg,
+      timestamp: entry.timestamp,
+      executor,
+      metadata: meta,
+    };
+  }
+
+  // Error patterns
+  if (entry.level === 'error') {
+    return {
+      id: `${entry.timestamp}-${Math.random()}`,
+      type: 'tool_result' as MessageType,
+      content: msg,
+      timestamp: entry.timestamp,
+      isError: true,
+      executor,
+      metadata: meta,
+    };
+  }
+
+  // Result patterns
+  if (msg.includes('Result:') || msg.includes('完了') || msg.includes('成功')) {
+    return {
+      id: `${entry.timestamp}-${Math.random()}`,
+      type: 'tool_result' as MessageType,
+      content: msg,
+      timestamp: entry.timestamp,
+      isError: false,
+      executor,
+      metadata: meta,
+    };
+  }
+
+  // Supervisor/Agent messages - display as assistant (NOT Claude!)
+  if (entry.source === 'supervisor' || entry.source === 'system') {
+    return {
+      id: `${entry.timestamp}-${Math.random()}`,
+      type: 'assistant' as MessageType,
+      content: msg,
+      timestamp: entry.timestamp,
+      executor: undefined, // Supervisor - use neutral styling, NOT Claude
+      metadata: meta,
+    };
+  }
+
+  // Claude/Codex executor messages
+  if (executor) {
+    return {
+      id: `${entry.timestamp}-${Math.random()}`,
+      type: 'assistant' as MessageType,
+      content: msg,
+      timestamp: entry.timestamp,
+      executor,
+      metadata: meta,
+    };
+  }
+
+  // Default: show as assistant message (errors handled above, so this is info/warn)
+  return {
+    id: `${entry.timestamp}-${Math.random()}`,
+    type: 'assistant' as MessageType,
+    content: msg,
+    timestamp: entry.timestamp,
+    status: entry.level === 'warn' ? 'error' : 'success',
+    metadata: meta,
+  };
+}
 
 // --- Types ---
 type AgentStatus = 'idle' | 'running' | 'completed' | 'failed' | 'interrupted';
@@ -57,6 +185,7 @@ interface AgentSession {
   logs: LogEntry[];
   selectedModel?: string;
   executorMode?: ExecutorMode;
+  terminalSessionId?: string;  // PTY session ID for reconnection
 }
 
 // --- Shared Agent Panel Component ---
@@ -110,30 +239,18 @@ function AgentPanel({
         logs: [...session.logs, entry],
       });
 
-      const meta = entry.metadata as Record<string, unknown> | undefined;
-      const executor = (entry.source === 'claude' || entry.source === 'codex')
-        ? entry.source as 'claude' | 'codex'
-        : undefined;
-
-      if (entry.level === 'info' || entry.level === 'warn' || entry.level === 'error') {
-        const newMessage: ChatMessageData = {
-          id: `${entry.timestamp}-${Math.random()}`,
-          type: 'agent',
-          content: entry.message,
-          timestamp: entry.timestamp,
-          status: entry.level === 'error' ? 'error' : 'success',
-          executor,
-          metadata: meta,
-        };
-
+      // Parse log entry to appropriate message type
+      const newMessage = parseLogToMessage(entry);
+      if (newMessage) {
         onUpdate({
           messages: [...session.messages, newMessage],
         });
       }
 
-      if (entry.message.includes('✅ Run completed') || entry.message.includes('Run completed successfully')) {
+      // Check for completion
+      if (entry.message.includes('✅ Completed') || entry.message.includes('Run completed')) {
         onUpdate({ status: 'completed' });
-      } else if (entry.message.includes('❌ Run failed') || entry.message.includes('Run failed')) {
+      } else if (entry.message.includes('❌ Failed') || entry.message.includes('Run failed')) {
         onUpdate({ status: 'failed' });
       }
     });
@@ -148,23 +265,18 @@ function AgentPanel({
     const restore = async () => {
       try {
         const run = await fetchRun(session.runId!);
+        // Always load logs from database
+        const { logs } = await fetchLogs(session.runId!);
+        const restoredMessages: ChatMessageData[] = logs
+          .map(l => parseLogToMessage(l))
+          .filter((m): m is ChatMessageData => m !== null);
+
         if (run.status === 'running' || run.status === 'pending') {
-          onUpdate({ status: 'running' });
-          const { logs } = await fetchLogs(session.runId!);
-          const restoredMessages: ChatMessageData[] = logs
-            .filter(l => l.level === 'info' || l.level === 'warn' || l.level === 'error')
-            .map(l => ({
-              id: `${l.timestamp}-${Math.random()}`,
-              type: 'agent' as const,
-              content: l.message,
-              timestamp: l.timestamp,
-              status: l.level === 'error' ? 'error' as const : 'success' as const,
-            }));
-          onUpdate({ messages: restoredMessages, logs });
+          onUpdate({ status: 'running', messages: restoredMessages, logs });
         } else if (run.status === 'completed') {
-          onUpdate({ status: 'completed' });
-        } else if (run.status === 'failed') {
-          onUpdate({ status: 'failed' });
+          onUpdate({ status: 'completed', messages: restoredMessages, logs });
+        } else if (run.status === 'failed' || run.status === 'interrupted') {
+          onUpdate({ status: 'failed', messages: restoredMessages, logs });
         }
       } catch {
         onUpdate({ runId: null, status: 'idle' });
@@ -426,23 +538,35 @@ function AgentPanel({
                       'flex items-center gap-1.5 px-2 py-1 text-xs rounded transition-colors',
                       executorMode === 'codex_only' && 'bg-green-100 text-green-700',
                       executorMode === 'claude_only' && 'bg-purple-100 text-purple-700',
+                      executorMode === 'claude_direct' && 'bg-purple-200 text-purple-800',
+                      executorMode === 'codex_direct' && 'bg-green-200 text-green-800',
                       executorMode === 'agent' && 'bg-slate-100 text-slate-500 hover:bg-slate-200'
                     )}
                   >
                     <span className="w-2 h-2 rounded-full" style={{
-                      backgroundColor: executorMode === 'codex_only' ? '#22c55e' : executorMode === 'claude_only' ? '#a855f7' : '#94a3b8'
+                      backgroundColor:
+                        executorMode === 'codex_only' ? '#22c55e' :
+                        executorMode === 'claude_only' ? '#a855f7' :
+                        executorMode === 'claude_direct' ? '#7c3aed' :
+                        executorMode === 'codex_direct' ? '#16a34a' :
+                        '#94a3b8'
                     }} />
                     <span>
-                      {executorMode === 'codex_only' ? 'Codex' : executorMode === 'claude_only' ? 'Claude' : 'Agent'}
+                      {executorMode === 'codex_only' ? 'Codexのみ' :
+                       executorMode === 'claude_only' ? 'Claudeのみ' :
+                       executorMode === 'claude_direct' ? 'Claude Code' :
+                       executorMode === 'codex_direct' ? 'Codex CLI' :
+                       '自動'}
                     </span>
                     <ChevronDown size={12} />
                   </button>
                   {showExecutorDropdown && (
-                    <div className="absolute bottom-full left-0 mb-1 bg-white border border-slate-200 rounded-lg shadow-lg py-1 min-w-[140px] z-50">
+                    <div className="absolute bottom-full left-0 mb-1 bg-white border border-slate-200 rounded-lg shadow-lg py-1 min-w-[160px] z-50">
+                      <div className="px-2 py-1 text-[10px] text-slate-400 uppercase tracking-wide">Supervisor経由</div>
                       {([
-                        { value: 'agent', label: 'Agent', color: '#94a3b8' },
-                        { value: 'codex_only', label: 'Codex', color: '#22c55e' },
-                        { value: 'claude_only', label: 'Claude', color: '#a855f7' },
+                        { value: 'agent', label: '自動 (両方)', color: '#94a3b8' },
+                        { value: 'codex_only', label: 'Codexのみ', color: '#22c55e' },
+                        { value: 'claude_only', label: 'Claudeのみ', color: '#a855f7' },
                       ] as const).map((opt) => (
                         <button
                           key={opt.value}
@@ -459,6 +583,28 @@ function AgentPanel({
                           {opt.label}
                         </button>
                       ))}
+                      <div className="border-t border-slate-100 mt-1 pt-1">
+                        <div className="px-2 py-1 text-[10px] text-slate-400 uppercase tracking-wide">直接実行</div>
+                        {([
+                          { value: 'claude_direct', label: 'Claude Code', color: '#7c3aed' },
+                          { value: 'codex_direct', label: 'Codex CLI', color: '#16a34a' },
+                        ] as const).map((opt) => (
+                          <button
+                            key={opt.value}
+                            onClick={() => {
+                              onExecutorModeChange(opt.value);
+                              setShowExecutorDropdown(false);
+                            }}
+                            className={clsx(
+                              'w-full text-left px-3 py-1.5 text-xs hover:bg-slate-50 flex items-center gap-2',
+                              opt.value === executorMode && 'bg-primary-50'
+                            )}
+                          >
+                            <span className="w-2 h-2 rounded-full" style={{ backgroundColor: opt.color }} />
+                            {opt.label}
+                          </button>
+                        ))}
+                      </div>
                     </div>
                   )}
                 </div>
@@ -540,7 +686,7 @@ function SpecAgentPanel({
         if (conversation) {
           const messages: ChatMessageData[] = conversation.messages.map(m => ({
             id: `${m.timestamp}-${Math.random()}`,
-            type: m.role === 'user' ? 'user' : 'agent',
+            type: m.role === 'user' ? 'user' : 'assistant',
             content: m.content,
             timestamp: m.timestamp,
             status: 'success',
@@ -576,7 +722,7 @@ function SpecAgentPanel({
 
       const assistantMessage: ChatMessageData = {
         id: `assistant-${Date.now()}`,
-        type: 'agent',
+        type: 'assistant',
         content: response.message,
         timestamp: new Date().toISOString(),
         status: 'success',
@@ -589,7 +735,7 @@ function SpecAgentPanel({
     } catch (error) {
       const errorMessage: ChatMessageData = {
         id: `error-${Date.now()}`,
-        type: 'agent',
+        type: 'assistant',
         content: error instanceof Error ? error.message : 'エラーが発生しました',
         timestamp: new Date().toISOString(),
         status: 'error',
@@ -1047,31 +1193,6 @@ function TimelineView({
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-4">
               <h1 className="text-lg font-semibold text-slate-800">Agents</h1>
-              {/* Mode Selector */}
-              <div className="flex items-center bg-slate-100 rounded-lg p-0.5">
-                <button
-                  onClick={() => setSelectedMode('spec')}
-                  className={clsx(
-                    'px-3 py-1 text-xs font-medium rounded-md transition-colors',
-                    selectedMode === 'spec'
-                      ? 'bg-purple-500 text-white'
-                      : 'text-slate-600 hover:text-slate-800'
-                  )}
-                >
-                  仕様策定
-                </button>
-                <button
-                  onClick={() => setSelectedMode('implementation')}
-                  className={clsx(
-                    'px-3 py-1 text-xs font-medium rounded-md transition-colors',
-                    selectedMode === 'implementation'
-                      ? 'bg-primary-500 text-white'
-                      : 'text-slate-600 hover:text-slate-800'
-                  )}
-                >
-                  実装
-                </button>
-              </div>
             </div>
             <button
               onClick={onSwitchToParallel}
@@ -1170,44 +1291,74 @@ function TimelineView({
                 rows={3}
               />
             )}
-            {selectedMode === 'implementation' && (
-              <div className="absolute left-2 right-2 bottom-2 flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  {/* Executor Mode */}
-                  <div className="relative">
-                    <button
-                      onClick={() => setShowExecutorDropdown(!showExecutorDropdown)}
-                      className={clsx(
-                        'flex items-center gap-1.5 px-2 py-1 text-xs rounded-md transition-colors',
-                        executorMode === 'codex_only' && 'bg-green-100 text-green-700',
-                        executorMode === 'claude_only' && 'bg-purple-100 text-purple-700',
-                        executorMode === 'agent' && 'bg-slate-100 text-slate-500 hover:bg-slate-200'
-                      )}
-                    >
-                      <span className="w-2 h-2 rounded-full" style={{
-                        backgroundColor: executorMode === 'codex_only' ? '#22c55e' : executorMode === 'claude_only' ? '#a855f7' : '#94a3b8'
-                      }} />
-                      <span>
-                        {executorMode === 'codex_only' ? 'Codex' : executorMode === 'claude_only' ? 'Claude' : 'Agent'}
-                      </span>
-                      <ChevronDown size={12} />
-                    </button>
-                    {showExecutorDropdown && (
-                      <div className="absolute bottom-full left-0 mb-1 bg-white border border-slate-200 rounded-lg shadow-lg py-1 min-w-[140px] z-50">
+            <div className="absolute left-2 right-2 bottom-2 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                {/* Mode & Executor Selector */}
+                <div className="relative">
+                  <button
+                    onClick={() => setShowExecutorDropdown(!showExecutorDropdown)}
+                    className={clsx(
+                      'flex items-center gap-1.5 px-2 py-1 text-xs rounded-md transition-colors',
+                      selectedMode === 'spec' && 'bg-amber-100 text-amber-700',
+                      selectedMode === 'implementation' && executorMode === 'codex_only' && 'bg-green-100 text-green-700',
+                      selectedMode === 'implementation' && executorMode === 'claude_only' && 'bg-purple-100 text-purple-700',
+                      selectedMode === 'implementation' && executorMode === 'claude_direct' && 'bg-purple-200 text-purple-800',
+                      selectedMode === 'implementation' && executorMode === 'codex_direct' && 'bg-green-200 text-green-800',
+                      selectedMode === 'implementation' && executorMode === 'agent' && 'bg-slate-100 text-slate-500 hover:bg-slate-200'
+                    )}
+                  >
+                    <span className="w-2 h-2 rounded-full" style={{
+                      backgroundColor:
+                        selectedMode === 'spec' ? '#f59e0b' :
+                        executorMode === 'codex_only' ? '#22c55e' :
+                        executorMode === 'claude_only' ? '#a855f7' :
+                        executorMode === 'claude_direct' ? '#7c3aed' :
+                        executorMode === 'codex_direct' ? '#16a34a' :
+                        '#94a3b8'
+                    }} />
+                    <span>
+                      {selectedMode === 'spec' ? '仕様策定' :
+                       executorMode === 'codex_only' ? 'Codexのみ' :
+                       executorMode === 'claude_only' ? 'Claudeのみ' :
+                       executorMode === 'claude_direct' ? 'Claude Code' :
+                       executorMode === 'codex_direct' ? 'Codex CLI' :
+                       '自動'}
+                    </span>
+                    <ChevronDown size={12} />
+                  </button>
+                  {showExecutorDropdown && (
+                    <div className="absolute bottom-full left-0 mb-1 bg-white border border-slate-200 rounded-lg shadow-lg py-1 min-w-[160px] z-50">
+                      {/* Plan Mode */}
+                      <button
+                        onClick={() => {
+                          setSelectedMode('spec');
+                          setShowExecutorDropdown(false);
+                        }}
+                        className={clsx(
+                          'w-full text-left px-3 py-1.5 text-xs hover:bg-slate-50 flex items-center gap-2',
+                          selectedMode === 'spec' && 'bg-amber-50'
+                        )}
+                      >
+                        <span className="w-2 h-2 rounded-full" style={{ backgroundColor: '#f59e0b' }} />
+                        仕様策定 (Plan)
+                      </button>
+                      <div className="border-t border-slate-100 mt-1 pt-1">
+                        <div className="px-2 py-1 text-[10px] text-slate-400 uppercase tracking-wide">実装 - Supervisor経由</div>
                         {([
-                          { value: 'agent', label: 'Agent', color: '#94a3b8' },
-                          { value: 'codex_only', label: 'Codex', color: '#22c55e' },
-                          { value: 'claude_only', label: 'Claude', color: '#a855f7' },
+                          { value: 'agent', label: '自動 (両方)', color: '#94a3b8' },
+                          { value: 'codex_only', label: 'Codexのみ', color: '#22c55e' },
+                          { value: 'claude_only', label: 'Claudeのみ', color: '#a855f7' },
                         ] as const).map((opt) => (
                           <button
                             key={opt.value}
                             onClick={() => {
+                              setSelectedMode('implementation');
                               onExecutorModeChange(opt.value);
                               setShowExecutorDropdown(false);
                             }}
                             className={clsx(
                               'w-full text-left px-3 py-1.5 text-xs hover:bg-slate-50 flex items-center gap-2',
-                              opt.value === executorMode && 'bg-primary-50'
+                              selectedMode === 'implementation' && opt.value === executorMode && 'bg-primary-50'
                             )}
                           >
                             <span className="w-2 h-2 rounded-full" style={{ backgroundColor: opt.color }} />
@@ -1215,41 +1366,66 @@ function TimelineView({
                           </button>
                         ))}
                       </div>
-                    )}
-                  </div>
-
-                  {/* Token Threshold */}
-                  <div className="relative">
-                    <button
-                      onClick={() => setShowTokensDropdown(!showTokensDropdown)}
-                      className="flex items-center gap-1 px-2 py-1 text-xs text-slate-500 bg-slate-100 hover:bg-slate-200 rounded-md transition-colors"
-                    >
-                      <span>{Math.round(maxContextTokens / 1000)}K tokens</span>
-                      <ChevronDown size={12} />
-                    </button>
-                    {showTokensDropdown && (
-                      <div className="absolute bottom-full left-0 mb-1 bg-white border border-slate-200 rounded-lg shadow-lg py-1 min-w-[100px] z-50">
-                        {tokenOptions.map((opt) => (
+                      <div className="border-t border-slate-100 mt-1 pt-1">
+                        <div className="px-2 py-1 text-[10px] text-slate-400 uppercase tracking-wide">実装 - 直接実行</div>
+                        {([
+                          { value: 'claude_direct', label: 'Claude Code', color: '#7c3aed' },
+                          { value: 'codex_direct', label: 'Codex CLI', color: '#16a34a' },
+                        ] as const).map((opt) => (
                           <button
                             key={opt.value}
                             onClick={() => {
-                              onMaxContextTokensChange(opt.value);
-                              setShowTokensDropdown(false);
+                              setSelectedMode('implementation');
+                              onExecutorModeChange(opt.value);
+                              setShowExecutorDropdown(false);
                             }}
                             className={clsx(
-                              'w-full text-left px-3 py-1.5 text-xs hover:bg-slate-50',
-                              opt.value === maxContextTokens && 'bg-primary-50 text-primary-600'
+                              'w-full text-left px-3 py-1.5 text-xs hover:bg-slate-50 flex items-center gap-2',
+                              selectedMode === 'implementation' && opt.value === executorMode && 'bg-primary-50'
                             )}
                           >
-                            {opt.label} tokens
+                            <span className="w-2 h-2 rounded-full" style={{ backgroundColor: opt.color }} />
+                            {opt.label}
                           </button>
                         ))}
                       </div>
-                    )}
-                  </div>
+                    </div>
+                  )}
                 </div>
 
-                {/* Send Button */}
+                {/* Token Threshold */}
+                <div className="relative">
+                  <button
+                    onClick={() => setShowTokensDropdown(!showTokensDropdown)}
+                    className="flex items-center gap-1 px-2 py-1 text-xs text-slate-500 bg-slate-100 hover:bg-slate-200 rounded-md transition-colors"
+                  >
+                    <span>{Math.round(maxContextTokens / 1000)}K tokens</span>
+                    <ChevronDown size={12} />
+                  </button>
+                  {showTokensDropdown && (
+                    <div className="absolute bottom-full left-0 mb-1 bg-white border border-slate-200 rounded-lg shadow-lg py-1 min-w-[100px] z-50">
+                      {tokenOptions.map((opt) => (
+                        <button
+                          key={opt.value}
+                          onClick={() => {
+                            onMaxContextTokensChange(opt.value);
+                            setShowTokensDropdown(false);
+                          }}
+                          className={clsx(
+                            'w-full text-left px-3 py-1.5 text-xs hover:bg-slate-50',
+                            opt.value === maxContextTokens && 'bg-primary-50 text-primary-600'
+                          )}
+                        >
+                          {opt.label} tokens
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Send Button */}
+              {selectedMode === 'implementation' && (
                 <button
                   onClick={handleSubmit}
                   disabled={!newGoal.trim() || !selectedProjectId}
@@ -1262,26 +1438,23 @@ function TimelineView({
                 >
                   <Send size={18} />
                 </button>
-              </div>
-            )}
-
-            {selectedMode === 'spec' && (
-              <div className="mt-3 flex justify-end">
+              )}
+              {selectedMode === 'spec' && (
                 <button
                   onClick={handleSubmit}
                   disabled={!selectedProjectId}
                   className={clsx(
-                    'px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-2',
+                    'px-3 py-1.5 rounded-lg text-xs font-medium transition-colors flex items-center gap-1.5',
                     selectedProjectId
-                      ? 'bg-purple-500 text-white hover:bg-purple-600'
+                      ? 'bg-amber-500 text-white hover:bg-amber-600'
                       : 'bg-slate-100 text-slate-400'
                   )}
                 >
-                  <MessageSquare size={16} />
-                  仕様策定を開始
+                  <MessageSquare size={14} />
+                  開始
                 </button>
-              </div>
-            )}
+              )}
+            </div>
           </div>
         </div>
       </div>
@@ -1414,6 +1587,7 @@ export default function AgentsPage() {
   const [activeSession, setActiveSession] = useState<AgentSession | null>(null);
   const [parallelSessions, setParallelSessions] = useState<AgentSession[]>([]);
   const [parallelSessionsLoaded, setParallelSessionsLoaded] = useState(false);
+  const [sessionsVersion, setSessionsVersion] = useState<number>(1);
   const [selectedModel, setSelectedModel] = useState('gpt-5.2');
   const [executorMode, setExecutorMode] = useState<ExecutorMode>('agent');
   const [maxContextTokens, setMaxContextTokens] = useState(150000);
@@ -1432,9 +1606,28 @@ export default function AgentsPage() {
     staleTime: Infinity, // Don't refetch automatically
   });
 
-  // Save parallel sessions mutation
+  // Save parallel sessions mutation with optimistic locking
+  const queryClient = useQueryClient();
   const saveSessionsMutation = useMutation({
-    mutationFn: saveParallelSessions,
+    mutationFn: ({ sessions, version }: { sessions: ParallelSession[]; version: number }) =>
+      saveParallelSessions(sessions, version),
+    onSuccess: (result) => {
+      // Update local version after successful save
+      setSessionsVersion(result.version);
+    },
+    onError: async (error) => {
+      if (error instanceof ParallelSessionsConflictError) {
+        // Conflict detected - refetch and let user know
+        console.warn('Parallel sessions conflict detected, refetching...');
+        await queryClient.invalidateQueries({ queryKey: ['parallelSessions'] });
+      }
+    },
+  });
+
+  // Create run mutation for starting new runs from timeline
+  const createRunMutation = useMutation({
+    mutationFn: (options: { goal: string; repoPath: string; projectId?: string; mode?: RunMode }) =>
+      createRun(options),
   });
 
   // Initialize view mode based on device type (only once)
@@ -1452,15 +1645,17 @@ export default function AgentsPage() {
         id: s.id,
         projectId: s.projectId,
         runId: s.runId,
-        mode: 'implementation' as RunMode, // Default to implementation mode for saved sessions
+        mode: s.mode || 'implementation', // Use saved mode, fallback to implementation
         status: s.status,
         input: s.input,
         messages: [],
         logs: [],
         selectedModel: s.selectedModel,
         executorMode: s.executorMode,
+        terminalSessionId: s.terminalSessionId,
       }));
       setParallelSessions(loadedSessions);
+      setSessionsVersion(savedSessions.version || 1);
       setParallelSessionsLoaded(true);
     }
   }, [savedSessions, parallelSessionsLoaded]);
@@ -1474,16 +1669,18 @@ export default function AgentsPage() {
         id: s.id,
         projectId: s.projectId,
         runId: s.runId,
+        mode: s.mode,
         status: s.status,
         input: s.input,
         selectedModel: s.selectedModel,
         executorMode: s.executorMode,
+        terminalSessionId: s.terminalSessionId,
       }));
-      saveSessionsMutation.mutate(sessionsToSave);
+      saveSessionsMutation.mutate({ sessions: sessionsToSave, version: sessionsVersion });
     }, 500);
 
     return () => clearTimeout(timeout);
-  }, [parallelSessions, parallelSessionsLoaded]);
+  }, [parallelSessions, parallelSessionsLoaded, sessionsVersion]);
 
   // Load copilot models
   const { data: copilotStatus } = useQuery({
@@ -1537,11 +1734,6 @@ export default function AgentsPage() {
     setMaxContextTokens(tokens);
     updateSettingsMutation.mutate({ max_context_tokens: tokens });
   };
-
-  const queryClient = useQueryClient();
-  const createRunMutation = useMutation({
-    mutationFn: (options: { goal: string; repoPath: string; projectId?: string; mode?: RunMode }) => createRun(options),
-  });
 
   // Start new agent from timeline (implementation mode)
   const startNewFromTimeline = (projectId: string, goal: string) => {
@@ -1633,7 +1825,7 @@ export default function AgentsPage() {
         const conversation = await fetchConversation(runId);
         const messages: ChatMessageData[] = conversation?.messages.map(m => ({
           id: `${m.timestamp}-${Math.random()}`,
-          type: m.role === 'user' ? 'user' : 'agent',
+          type: m.role === 'user' ? 'user' : 'assistant',
           content: m.content,
           timestamp: m.timestamp,
           status: 'success',
@@ -1664,7 +1856,7 @@ export default function AgentsPage() {
             .filter(l => l.level === 'info' || l.level === 'warn' || l.level === 'error')
             .map(l => ({
               id: `${l.timestamp}-${Math.random()}`,
-              type: 'agent' as const,
+              type: 'assistant' as const,
               content: l.message,
               timestamp: l.timestamp,
               status: l.level === 'error' ? 'error' as const : 'success' as const,
@@ -1700,7 +1892,7 @@ export default function AgentsPage() {
         .filter(l => l.level === 'info' || l.level === 'warn' || l.level === 'error')
         .map(l => ({
           id: `${l.timestamp}-${Math.random()}`,
-          type: 'agent' as const,
+          type: 'assistant' as const,
           content: l.message,
           timestamp: l.timestamp,
           status: l.level === 'error' ? 'error' as const : 'success' as const,
@@ -1783,7 +1975,7 @@ export default function AgentsPage() {
           .filter(l => l.level === 'info' || l.level === 'warn' || l.level === 'error')
           .map(l => ({
             id: `${l.timestamp}-${Math.random()}`,
-            type: 'agent' as const,
+            type: 'assistant' as const,
             content: l.message,
             timestamp: l.timestamp,
             status: l.level === 'error' ? 'error' as const : 'success' as const,
