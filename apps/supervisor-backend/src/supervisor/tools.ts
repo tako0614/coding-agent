@@ -753,7 +753,7 @@ export class ToolExecutor {
    * Set the worker executor function
    */
   setWorkerExecutor(executor: (tasks: WorkerTask[], signal?: AbortSignal) => Promise<WorkerTaskResult[]>): void {
-    console.log('[DEBUG] setWorkerExecutor: Worker executor configured');
+    logger.debug('Worker executor configured');
     this.workerExecutor = executor;
   }
 
@@ -1108,9 +1108,9 @@ export class ToolExecutor {
     executor: 'claude' | 'codex';
     context?: string;
   }>): Promise<ToolResult> {
-    console.log('[DEBUG] spawnWorkers called', { taskCount: tasks.length, hasWorkerExecutor: !!this.workerExecutor });
+    logger.debug('spawnWorkers called', { taskCount: tasks.length, hasWorkerExecutor: !!this.workerExecutor });
     if (!this.workerExecutor) {
-      console.error('[DEBUG] spawnWorkers: Worker executor NOT configured!');
+      logger.error('Worker executor not configured');
       return { success: false, error: 'Worker executor not configured' };
     }
 
@@ -1179,9 +1179,9 @@ export class ToolExecutor {
     executor: 'claude' | 'codex';
     context?: string;
   }>): ToolResult {
-    console.log('[DEBUG] spawnWorkersAsync called', { taskCount: tasks.length, hasWorkerExecutor: !!this.workerExecutor });
+    logger.debug('spawnWorkersAsync called', { taskCount: tasks.length, hasWorkerExecutor: !!this.workerExecutor });
     if (!this.workerExecutor) {
-      console.error('[DEBUG] spawnWorkersAsync: Worker executor NOT configured!');
+      logger.error('Worker executor not configured');
       return { success: false, error: 'Worker executor not configured' };
     }
 

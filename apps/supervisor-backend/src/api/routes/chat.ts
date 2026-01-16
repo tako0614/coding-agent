@@ -19,7 +19,17 @@ const chat = new Hono();
  */
 chat.post('/completions', async (c) => {
   try {
-    const body = await c.req.json();
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({
+        error: {
+          message: 'Invalid JSON in request body',
+          type: 'invalid_request_error',
+        },
+      }, 400);
+    }
     const parsed = ChatCompletionRequestSchema.safeParse(body);
 
     if (!parsed.success) {

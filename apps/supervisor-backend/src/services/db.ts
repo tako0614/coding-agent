@@ -20,7 +20,6 @@ if (!existsSync(dbDir)) {
 
 export const db: DatabaseType = new Database(dbPath);
 logger.info('Using database', { path: dbPath });
-console.log('[DEBUG] Database opened at:', dbPath);
 
 // Use DELETE journal mode (synchronous, no WAL)
 // This ensures data is immediately written to disk, preventing data loss on crash

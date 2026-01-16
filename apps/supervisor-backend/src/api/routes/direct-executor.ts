@@ -10,6 +10,7 @@ import {
   type DirectExecutorType,
 } from '../../services/direct-executor-store.js';
 import { PathSecurityError } from '../../services/path-sandbox.js';
+import { logger } from '../../services/logger.js';
 import type { WorkOrder } from '@supervisor/protocol';
 import { createWorkOrderId, createRunId } from '@supervisor/protocol';
 import type { ClaudeAgentMessage } from '@supervisor/executor-claude';
@@ -23,10 +24,16 @@ const directExecutor = new Hono();
  * Create a new executor session
  */
 directExecutor.post('/sessions', async (c) => {
-  const body = await c.req.json().catch(() => ({}));
+  let body: Record<string, unknown> = {};
+  try {
+    body = await c.req.json() as Record<string, unknown>;
+  } catch (err) {
+    logger.debug('Failed to parse JSON in /sessions', { error: err instanceof Error ? err.message : String(err) });
+    return c.json({ error: { message: 'Invalid JSON in request body', type: 'invalid_request' } }, 400);
+  }
 
-  const executor_type = body.executor_type;
-  const cwd = body.cwd;
+  const executor_type = body['executor_type'];
+  const cwd = body['cwd'];
 
   // Validate
   if (!executor_type || (executor_type !== 'claude' && executor_type !== 'codex')) {
@@ -101,8 +108,14 @@ directExecutor.delete('/sessions/:id', async (c) => {
  */
 directExecutor.post('/sessions/:id/query', async (c) => {
   const sessionId = c.req.param('id');
-  const body = await c.req.json().catch(() => ({}));
-  const prompt = body.prompt;
+  let body: Record<string, unknown> = {};
+  try {
+    body = await c.req.json() as Record<string, unknown>;
+  } catch (err) {
+    logger.debug('Failed to parse JSON in /sessions/:id/query', { error: err instanceof Error ? err.message : String(err) });
+    return c.json({ error: { message: 'Invalid JSON in request body', type: 'invalid_request' } }, 400);
+  }
+  const prompt = body['prompt'];
 
   if (!prompt || typeof prompt !== 'string' || prompt.trim().length === 0) {
     return c.json({ error: { message: 'prompt is required' } }, 400);

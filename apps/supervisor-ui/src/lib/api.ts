@@ -5,6 +5,20 @@
 // Always use relative paths - Vite dev server proxies to backend
 // In production, the built client is served by the backend itself
 const API_BASE = '';
+const API_KEY = import.meta.env.VITE_API_KEY as string | undefined;
+
+function apiFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  if (!API_KEY) {
+    return globalThis.fetch(input, init);
+  }
+
+  const headers = new Headers(init?.headers ?? {});
+  if (!headers.has('Authorization')) {
+    headers.set('Authorization', `ApiKey ${API_KEY}`);
+  }
+
+  return globalThis.fetch(input, { ...init, headers });
+}
 
 export interface PlanTask {
   id: string;
@@ -89,13 +103,13 @@ export interface ProjectList {
 
 // Runs API
 export async function fetchRuns(): Promise<RunList> {
-  const res = await fetch(`${API_BASE}/api/runs`);
+  const res = await apiFetch(`${API_BASE}/api/runs`);
   if (!res.ok) throw new Error('Failed to fetch runs');
   return res.json();
 }
 
 export async function fetchRun(runId: string): Promise<Run> {
-  const res = await fetch(`${API_BASE}/api/runs/${runId}`);
+  const res = await apiFetch(`${API_BASE}/api/runs/${runId}`);
   if (!res.ok) throw new Error('Failed to fetch run');
   return res.json();
 }
@@ -115,7 +129,7 @@ export async function createRun(
     ? { goal: goalOrOptions, repoPath: repoPath! }
     : goalOrOptions;
 
-  const res = await fetch(`${API_BASE}/api/runs`, {
+  const res = await apiFetch(`${API_BASE}/api/runs`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -130,25 +144,25 @@ export async function createRun(
 }
 
 export async function deleteRun(runId: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/runs/${runId}`, { method: 'DELETE' });
+  const res = await apiFetch(`${API_BASE}/api/runs/${runId}`, { method: 'DELETE' });
   if (!res.ok) throw new Error('Failed to delete run');
 }
 
 export async function fetchRunReport(runId: string): Promise<string> {
-  const res = await fetch(`${API_BASE}/api/runs/${runId}/report`);
+  const res = await apiFetch(`${API_BASE}/api/runs/${runId}/report`);
   if (!res.ok) throw new Error('Failed to fetch report');
   return res.text();
 }
 
 // Projects API
 export async function fetchProjects(): Promise<ProjectList> {
-  const res = await fetch(`${API_BASE}/api/projects`);
+  const res = await apiFetch(`${API_BASE}/api/projects`);
   if (!res.ok) throw new Error('Failed to fetch projects');
   return res.json();
 }
 
 export async function fetchProject(projectId: string): Promise<Project> {
-  const res = await fetch(`${API_BASE}/api/projects/${projectId}`);
+  const res = await apiFetch(`${API_BASE}/api/projects/${projectId}`);
   if (!res.ok) throw new Error('Failed to fetch project');
   return res.json();
 }
@@ -158,7 +172,7 @@ export async function createProject(data: {
   description?: string;
   repo_path: string;
 }): Promise<Project> {
-  const res = await fetch(`${API_BASE}/api/projects`, {
+  const res = await apiFetch(`${API_BASE}/api/projects`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
@@ -171,7 +185,7 @@ export async function updateProject(
   projectId: string,
   data: Partial<Omit<Project, 'project_id' | 'created_at' | 'updated_at'>>
 ): Promise<Project> {
-  const res = await fetch(`${API_BASE}/api/projects/${projectId}`, {
+  const res = await apiFetch(`${API_BASE}/api/projects/${projectId}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
@@ -181,7 +195,7 @@ export async function updateProject(
 }
 
 export async function deleteProject(projectId: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/projects/${projectId}`, { method: 'DELETE' });
+  const res = await apiFetch(`${API_BASE}/api/projects/${projectId}`, { method: 'DELETE' });
   if (!res.ok) throw new Error('Failed to delete project');
 }
 
@@ -189,7 +203,7 @@ export async function deleteProject(projectId: string): Promise<void> {
 export async function fetchLogs(runId: string, since?: string): Promise<{ logs: LogEntry[] }> {
   const url = new URL(`${API_BASE}/api/logs/${runId}`, window.location.origin);
   if (since) url.searchParams.set('since', since);
-  const res = await fetch(url.toString());
+  const res = await apiFetch(url.toString());
   if (!res.ok) throw new Error('Failed to fetch logs');
   return res.json();
 }
@@ -204,13 +218,13 @@ export interface OrphanedSession {
 }
 
 export async function fetchOrphanedSessions(): Promise<{ sessions: OrphanedSession[] }> {
-  const res = await fetch(`${API_BASE}/api/sessions/orphaned`);
+  const res = await apiFetch(`${API_BASE}/api/sessions/orphaned`);
   if (!res.ok) throw new Error('Failed to fetch orphaned sessions');
   return res.json();
 }
 
 export async function deleteOrphanedSession(runId: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/sessions/orphaned/${runId}`, { method: 'DELETE' });
+  const res = await apiFetch(`${API_BASE}/api/sessions/orphaned/${runId}`, { method: 'DELETE' });
   if (!res.ok) throw new Error('Failed to delete orphaned session');
 }
 
@@ -228,7 +242,7 @@ export interface ParallelSession {
 }
 
 export async function fetchParallelSessions(): Promise<{ sessions: ParallelSession[]; version: number }> {
-  const res = await fetch(`${API_BASE}/api/sessions/parallel`);
+  const res = await apiFetch(`${API_BASE}/api/sessions/parallel`);
   if (!res.ok) throw new Error('Failed to fetch parallel sessions');
   return res.json();
 }
@@ -241,7 +255,7 @@ export class ParallelSessionsConflictError extends Error {
 }
 
 export async function saveParallelSessions(sessions: ParallelSession[], version: number): Promise<{ version: number }> {
-  const res = await fetch(`${API_BASE}/api/sessions/parallel`, {
+  const res = await apiFetch(`${API_BASE}/api/sessions/parallel`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ sessions, version }),
@@ -262,13 +276,13 @@ export interface ShellTab {
 }
 
 export async function fetchShellTabs(): Promise<{ tabs: ShellTab[]; activeTabId: string | null }> {
-  const res = await fetch(`${API_BASE}/api/sessions/shell-tabs`);
+  const res = await apiFetch(`${API_BASE}/api/sessions/shell-tabs`);
   if (!res.ok) throw new Error('Failed to fetch shell tabs');
   return res.json();
 }
 
 export async function saveShellTabs(tabs: ShellTab[], activeTabId: string | null): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/sessions/shell-tabs`, {
+  const res = await apiFetch(`${API_BASE}/api/sessions/shell-tabs`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ tabs, activeTabId }),
@@ -278,7 +292,7 @@ export async function saveShellTabs(tabs: ShellTab[], activeTabId: string | null
 
 // Usage API
 export async function fetchUsage(): Promise<UsageStats> {
-  const res = await fetch(`${API_BASE}/api/usage`);
+  const res = await apiFetch(`${API_BASE}/api/usage`);
   if (!res.ok) throw new Error('Failed to fetch usage');
   return res.json();
 }
@@ -342,7 +356,7 @@ export interface WorkerPoolStatus {
 
 // DAG API
 export async function fetchDAG(runId: string): Promise<DAG | null> {
-  const res = await fetch(`${API_BASE}/api/runs/${runId}/dag`);
+  const res = await apiFetch(`${API_BASE}/api/runs/${runId}/dag`);
   if (res.status === 404 || res.status === 202) return null;
   if (!res.ok) throw new Error('Failed to fetch DAG');
   return res.json();
@@ -350,7 +364,7 @@ export async function fetchDAG(runId: string): Promise<DAG | null> {
 
 // Workers API
 export async function fetchWorkerPool(runId: string): Promise<WorkerPoolStatus | null> {
-  const res = await fetch(`${API_BASE}/api/runs/${runId}/workers`);
+  const res = await apiFetch(`${API_BASE}/api/runs/${runId}/workers`);
   if (res.status === 404 || res.status === 202) return null;
   if (!res.ok) throw new Error('Failed to fetch worker pool');
   return res.json();
@@ -358,7 +372,7 @@ export async function fetchWorkerPool(runId: string): Promise<WorkerPoolStatus |
 
 // Health API
 export async function fetchHealth(): Promise<{ status: string; version: string }> {
-  const res = await fetch(`${API_BASE}/health`);
+  const res = await apiFetch(`${API_BASE}/health`);
   if (!res.ok) throw new Error('Failed to fetch health');
   return res.json();
 }
@@ -371,6 +385,7 @@ export function subscribeToLogs(
 ): () => void {
   const url = new URL(`${API_BASE}/api/events`, window.location.origin);
   if (runId) url.searchParams.set('run_id', runId);
+  if (API_KEY) url.searchParams.set('token', API_KEY);
 
   const eventSource = new EventSource(url.toString());
   let closed = false;
@@ -407,14 +422,14 @@ export function subscribeToLogs(
 
 // Plan API
 export async function fetchPlan(runId: string): Promise<Plan | null> {
-  const res = await fetch(`${API_BASE}/api/runs/${runId}/plan`);
+  const res = await apiFetch(`${API_BASE}/api/runs/${runId}/plan`);
   if (res.status === 404) return null;
   if (!res.ok) throw new Error('Failed to fetch plan');
   return res.json();
 }
 
 export async function savePlan(runId: string, plan: Omit<Plan, 'id' | 'created_at' | 'updated_at'>): Promise<Plan> {
-  const res = await fetch(`${API_BASE}/api/runs/${runId}/plan`, {
+  const res = await apiFetch(`${API_BASE}/api/runs/${runId}/plan`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(plan),
@@ -424,19 +439,19 @@ export async function savePlan(runId: string, plan: Omit<Plan, 'id' | 'created_a
 }
 
 export async function approvePlan(runId: string): Promise<Plan> {
-  const res = await fetch(`${API_BASE}/api/runs/${runId}/plan/approve`, { method: 'POST' });
+  const res = await apiFetch(`${API_BASE}/api/runs/${runId}/plan/approve`, { method: 'POST' });
   if (!res.ok) throw new Error('Failed to approve plan');
   return res.json();
 }
 
 export async function rejectPlan(runId: string): Promise<Plan> {
-  const res = await fetch(`${API_BASE}/api/runs/${runId}/plan/reject`, { method: 'POST' });
+  const res = await apiFetch(`${API_BASE}/api/runs/${runId}/plan/reject`, { method: 'POST' });
   if (!res.ok) throw new Error('Failed to reject plan');
   return res.json();
 }
 
 export async function generatePlanWithAI(runId: string): Promise<Plan> {
-  const res = await fetch(`${API_BASE}/api/runs/${runId}/plan/generate`, { method: 'POST' });
+  const res = await apiFetch(`${API_BASE}/api/runs/${runId}/plan/generate`, { method: 'POST' });
   if (!res.ok) throw new Error('Failed to generate plan');
   return res.json();
 }
@@ -479,13 +494,13 @@ export interface CopilotAPIStatus {
 
 // Settings API
 export async function fetchSettings(): Promise<AppSettings> {
-  const res = await fetch(`${API_BASE}/api/settings`);
+  const res = await apiFetch(`${API_BASE}/api/settings`);
   if (!res.ok) throw new Error('Failed to fetch settings');
   return res.json();
 }
 
 export async function updateSettings(settings: Partial<AppSettings>): Promise<AppSettings> {
-  const res = await fetch(`${API_BASE}/api/settings`, {
+  const res = await apiFetch(`${API_BASE}/api/settings`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(settings),
@@ -495,31 +510,31 @@ export async function updateSettings(settings: Partial<AppSettings>): Promise<Ap
 }
 
 export async function deleteSetting(key: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/settings/${key}`, { method: 'DELETE' });
+  const res = await apiFetch(`${API_BASE}/api/settings/${key}`, { method: 'DELETE' });
   if (!res.ok) throw new Error('Failed to delete setting');
 }
 
 // Copilot API management
 export async function fetchCopilotStatus(): Promise<CopilotAPIStatus> {
-  const res = await fetch(`${API_BASE}/api/copilot/status`);
+  const res = await apiFetch(`${API_BASE}/api/copilot/status`);
   if (!res.ok) throw new Error('Failed to fetch copilot status');
   return res.json();
 }
 
 export async function startCopilotAPI(): Promise<CopilotAPIStatus> {
-  const res = await fetch(`${API_BASE}/api/copilot/start`, { method: 'POST' });
+  const res = await apiFetch(`${API_BASE}/api/copilot/start`, { method: 'POST' });
   if (!res.ok) throw new Error('Failed to start copilot-api');
   return res.json();
 }
 
 export async function stopCopilotAPI(): Promise<CopilotAPIStatus> {
-  const res = await fetch(`${API_BASE}/api/copilot/stop`, { method: 'POST' });
+  const res = await apiFetch(`${API_BASE}/api/copilot/stop`, { method: 'POST' });
   if (!res.ok) throw new Error('Failed to stop copilot-api');
   return res.json();
 }
 
 export async function restartCopilotAPI(): Promise<CopilotAPIStatus> {
-  const res = await fetch(`${API_BASE}/api/copilot/restart`, { method: 'POST' });
+  const res = await apiFetch(`${API_BASE}/api/copilot/restart`, { method: 'POST' });
   if (!res.ok) throw new Error('Failed to restart copilot-api');
   return res.json();
 }
@@ -533,7 +548,7 @@ export interface CopilotModel {
 }
 
 export async function fetchCopilotModels(): Promise<{ models: CopilotModel[] }> {
-  const res = await fetch(`${API_BASE}/api/copilot/models`);
+  const res = await apiFetch(`${API_BASE}/api/copilot/models`);
   if (!res.ok) throw new Error('Failed to fetch copilot models');
   return res.json();
 }
@@ -569,7 +584,7 @@ export interface FileWriteResponse {
 
 // File API functions
 export async function listFiles(dirPath: string, cwd: string, recursive = false): Promise<FileListResponse> {
-  const res = await fetch(`${API_BASE}/api/files/list`, {
+  const res = await apiFetch(`${API_BASE}/api/files/list`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path: dirPath, cwd, recursive }),
@@ -579,7 +594,7 @@ export async function listFiles(dirPath: string, cwd: string, recursive = false)
 }
 
 export async function readFile(filePath: string, cwd: string): Promise<FileReadResponse> {
-  const res = await fetch(`${API_BASE}/api/files/read`, {
+  const res = await apiFetch(`${API_BASE}/api/files/read`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path: filePath, cwd }),
@@ -589,7 +604,7 @@ export async function readFile(filePath: string, cwd: string): Promise<FileReadR
 }
 
 export async function writeFile(filePath: string, content: string, cwd: string): Promise<FileWriteResponse> {
-  const res = await fetch(`${API_BASE}/api/files/write`, {
+  const res = await apiFetch(`${API_BASE}/api/files/write`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path: filePath, content, cwd }),
@@ -599,7 +614,7 @@ export async function writeFile(filePath: string, content: string, cwd: string):
 }
 
 export async function createDirectory(dirPath: string, cwd: string): Promise<{ path: string; created: boolean }> {
-  const res = await fetch(`${API_BASE}/api/files/mkdir`, {
+  const res = await apiFetch(`${API_BASE}/api/files/mkdir`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path: dirPath, cwd }),
@@ -609,7 +624,7 @@ export async function createDirectory(dirPath: string, cwd: string): Promise<{ p
 }
 
 export async function deleteFile(filePath: string, cwd: string): Promise<{ path: string; deleted: boolean }> {
-  const res = await fetch(`${API_BASE}/api/files/delete`, {
+  const res = await apiFetch(`${API_BASE}/api/files/delete`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path: filePath, cwd }),
@@ -619,7 +634,7 @@ export async function deleteFile(filePath: string, cwd: string): Promise<{ path:
 }
 
 export async function renameFile(source: string, destination: string, cwd: string): Promise<{ source: string; destination: string; moved: boolean }> {
-  const res = await fetch(`${API_BASE}/api/files/move`, {
+  const res = await apiFetch(`${API_BASE}/api/files/move`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ source, destination, cwd }),
@@ -644,7 +659,7 @@ export interface BrowseResult {
 }
 
 export async function browseDirectory(path?: string): Promise<BrowseResult> {
-  const res = await fetch(`${API_BASE}/api/files/browse`, {
+  const res = await apiFetch(`${API_BASE}/api/files/browse`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path }),
@@ -665,13 +680,13 @@ export interface GUIApplication {
 }
 
 export async function fetchApplications(): Promise<{ applications: GUIApplication[] }> {
-  const res = await fetch(`${API_BASE}/api/desktop/applications`);
+  const res = await apiFetch(`${API_BASE}/api/desktop/applications`);
   if (!res.ok) throw new Error('Failed to fetch applications');
   return res.json();
 }
 
 export async function focusApplication(pid: number): Promise<{ success: boolean }> {
-  const res = await fetch(`${API_BASE}/api/desktop/applications/${pid}/focus`, {
+  const res = await apiFetch(`${API_BASE}/api/desktop/applications/${pid}/focus`, {
     method: 'POST',
   });
   if (!res.ok) throw new Error('Failed to focus application');
@@ -710,7 +725,7 @@ export interface ChatResponse {
 
 // Spec Mode API functions
 export async function sendSpecMessage(runId: string, message: string): Promise<ChatResponse> {
-  const res = await fetch(`${API_BASE}/api/runs/${runId}/message`, {
+  const res = await apiFetch(`${API_BASE}/api/runs/${runId}/message`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ message }),
@@ -723,7 +738,7 @@ export async function sendSpecMessage(runId: string, message: string): Promise<C
 }
 
 export async function fetchConversation(runId: string): Promise<Conversation | null> {
-  const res = await fetch(`${API_BASE}/api/runs/${runId}/conversation`);
+  const res = await apiFetch(`${API_BASE}/api/runs/${runId}/conversation`);
   if (res.status === 404) return null;
   if (!res.ok) throw new Error('Failed to fetch conversation');
   return res.json();
@@ -782,7 +797,7 @@ export async function createDirectExecutorSession(
   executorType: DirectExecutorType,
   cwd: string
 ): Promise<DirectExecutorSession> {
-  const res = await fetch(`${API_BASE}/api/direct-executor/sessions`, {
+  const res = await apiFetch(`${API_BASE}/api/direct-executor/sessions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ executor_type: executorType, cwd }),
@@ -792,19 +807,19 @@ export async function createDirectExecutorSession(
 }
 
 export async function fetchDirectExecutorSessions(): Promise<{ sessions: DirectExecutorSession[] }> {
-  const res = await fetch(`${API_BASE}/api/direct-executor/sessions`);
+  const res = await apiFetch(`${API_BASE}/api/direct-executor/sessions`);
   if (!res.ok) throw new Error('Failed to fetch executor sessions');
   return res.json();
 }
 
 export async function fetchDirectExecutorSession(sessionId: string): Promise<{ session: DirectExecutorSession }> {
-  const res = await fetch(`${API_BASE}/api/direct-executor/sessions/${sessionId}`);
+  const res = await apiFetch(`${API_BASE}/api/direct-executor/sessions/${sessionId}`);
   if (!res.ok) throw new Error('Failed to fetch executor session');
   return res.json();
 }
 
 export async function deleteDirectExecutorSession(sessionId: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/direct-executor/sessions/${sessionId}`, { method: 'DELETE' });
+  const res = await apiFetch(`${API_BASE}/api/direct-executor/sessions/${sessionId}`, { method: 'DELETE' });
   if (!res.ok) throw new Error('Failed to delete executor session');
 }
 
@@ -820,7 +835,7 @@ export function subscribeToDirectExecutorQuery(
 ): () => void {
   const controller = new AbortController();
 
-  fetch(`${API_BASE}/api/direct-executor/sessions/${sessionId}/query`, {
+  apiFetch(`${API_BASE}/api/direct-executor/sessions/${sessionId}/query`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ prompt }),
@@ -880,70 +895,4 @@ export function subscribeToDirectExecutorQuery(
     });
 
   return () => controller.abort();
-}
-
-// =============================================================================
-// MCP OAuth API
-// =============================================================================
-
-export interface MCPOAuthClient {
-  client_id: string;
-  client_name: string;
-  client_secret?: string;
-  redirect_uris: string[];
-  scope: string;
-  is_public: boolean;
-  created_at: string;
-}
-
-export interface MCPServerConfig {
-  mcp_server_url: string;
-  oauth_endpoints: {
-    authorization: string;
-    authorize: string;
-    token: string;
-  };
-  available_scopes: string[];
-}
-
-export async function fetchMCPClients(): Promise<{ clients: MCPOAuthClient[] }> {
-  const res = await fetch(`${API_BASE}/api/mcp/clients`);
-  if (!res.ok) throw new Error('Failed to fetch MCP clients');
-  return res.json();
-}
-
-export async function fetchMCPConfig(): Promise<MCPServerConfig> {
-  const res = await fetch(`${API_BASE}/api/mcp/config`);
-  if (!res.ok) throw new Error('Failed to fetch MCP config');
-  return res.json();
-}
-
-export async function createMCPClient(data: {
-  client_name: string;
-  redirect_uris: string[];
-  scope: string;
-  is_public: boolean;
-}): Promise<MCPOAuthClient> {
-  const res = await fetch(`${API_BASE}/api/mcp/clients`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-  });
-  if (!res.ok) throw new Error('Failed to create MCP client');
-  return res.json();
-}
-
-export async function deleteMCPClient(clientId: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/mcp/clients/${clientId}`, {
-    method: 'DELETE',
-  });
-  if (!res.ok) throw new Error('Failed to delete MCP client');
-}
-
-export async function regenerateMCPClientSecret(clientId: string): Promise<MCPOAuthClient> {
-  const res = await fetch(`${API_BASE}/api/mcp/clients/${clientId}/regenerate-secret`, {
-    method: 'POST',
-  });
-  if (!res.ok) throw new Error('Failed to regenerate MCP client secret');
-  return res.json();
 }

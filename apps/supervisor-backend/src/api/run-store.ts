@@ -673,7 +673,6 @@ class RunStore {
     });
 
     try {
-      console.log('[DEBUG] setRunning: Inserting run record', { runId, goal: goal?.slice(0, 50), repoPath });
       getSetRunningTransaction()({
         run_id: runId,
         project_id: projectId || null,
@@ -683,10 +682,9 @@ class RunStore {
         created_at: now,
         updated_at: now,
       });
-      console.log('[DEBUG] setRunning: Run record inserted successfully', { runId });
+      logger.debug('Run record inserted', { runId });
     } catch (err) {
       const errorMsg = getErrorMessage(err);
-      console.error('[DEBUG] setRunning: FAILED to insert run record', { runId, error: errorMsg });
       logger.error('Failed to insert placeholder run', { runId, error: errorMsg });
     }
   }

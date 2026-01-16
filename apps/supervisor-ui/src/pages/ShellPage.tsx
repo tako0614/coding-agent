@@ -8,6 +8,8 @@ import { useQuery, useMutation } from '@tanstack/react-query';
 import { fetchShellTabs, saveShellTabs, type ShellTab } from '../lib/api';
 import '@xterm/xterm/css/xterm.css';
 
+const API_KEY = import.meta.env.VITE_API_KEY as string | undefined;
+
 interface TerminalTabState extends ShellTab {
   connected: boolean;
 }
@@ -147,6 +149,9 @@ export default function ShellPage() {
     if (workingDir) {
       wsUrl += `&cwd=${encodeURIComponent(workingDir)}`;
     }
+    if (API_KEY) {
+      wsUrl += `&token=${encodeURIComponent(API_KEY)}`;
+    }
 
     const ws = new WebSocket(wsUrl);
 
@@ -160,46 +165,52 @@ export default function ShellPage() {
     };
 
     ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        switch (msg.type) {
-          case 'output':
-            terminal.write(msg.data);
-            if (msg.replayed) {
-              terminal.writeln('\r\n\x1b[32m● Reconnected (output restored)\x1b[0m\r\n');
-            }
-            break;
-          case 'session':
-            // Store the PTY session ID for reconnection
-            setTabs((prev) =>
-              prev.map((tab) =>
-                tab.id === tabId
-                  ? {
-                      ...tab,
-                      title: msg.cwd.split(/[/\\]/).pop() || msg.shell,
-                      ptySessionId: msg.sessionId,
-                    }
-                  : tab
-              )
-            );
-            if (msg.reconnected) {
-              terminal.writeln('\x1b[32m● Session reconnected\x1b[0m');
-            }
-            break;
-          case 'exit':
-            terminal.writeln(`\r\n\x1b[33m● Process exited with code ${msg.exitCode}\x1b[0m`);
-            // Clear ptySessionId since the session is gone
-            setTabs((prev) =>
-              prev.map((tab) =>
-                tab.id === tabId ? { ...tab, ptySessionId: undefined } : tab
-              )
-            );
-            break;
+      // Check if data looks like JSON (starts with '{') before trying to parse
+      const data = event.data;
+      if (typeof data === 'string' && data.startsWith('{')) {
+        try {
+          const msg = JSON.parse(data);
+          switch (msg.type) {
+            case 'output':
+              terminal.write(msg.data);
+              if (msg.replayed) {
+                terminal.writeln('\r\n\x1b[32m● Reconnected (output restored)\x1b[0m\r\n');
+              }
+              return;
+            case 'session':
+              // Store the PTY session ID for reconnection
+              setTabs((prev) =>
+                prev.map((tab) =>
+                  tab.id === tabId
+                    ? {
+                        ...tab,
+                        title: msg.cwd.split(/[/\\]/).pop() || msg.shell,
+                        ptySessionId: msg.sessionId,
+                      }
+                    : tab
+                )
+              );
+              if (msg.reconnected) {
+                terminal.writeln('\x1b[32m● Session reconnected\x1b[0m');
+              }
+              return;
+            case 'exit':
+              terminal.writeln(`\r\n\x1b[33m● Process exited with code ${msg.exitCode}\x1b[0m`);
+              // Clear ptySessionId since the session is gone
+              setTabs((prev) =>
+                prev.map((tab) =>
+                  tab.id === tabId ? { ...tab, ptySessionId: undefined } : tab
+                )
+              );
+              return;
+          }
+        } catch (parseError) {
+          // JSON parse failed, log for debugging and fall through to raw output
+          console.debug('WebSocket message parse error:', parseError);
         }
-      } catch {
-        // Raw output
-        terminal.write(event.data);
       }
+      // Raw output (non-JSON or failed parse)
+      terminal.write(data);
     };
 
     ws.onclose = () => {
@@ -302,6 +313,22 @@ export default function ShellPage() {
       createTab();
     }
   }, [loaded, tabs.length, createTab]);
+
+  // Cleanup all terminal instances on unmount
+  useEffect(() => {
+    return () => {
+      // Dispose all terminals and close WebSockets
+      terminalRefs.current.forEach((ref) => {
+        try {
+          ref.ws.close();
+          ref.terminal.dispose();
+        } catch {
+          // Ignore cleanup errors
+        }
+      });
+      terminalRefs.current.clear();
+    };
+  }, []);
 
   const activeTab = tabs.find((t) => t.id === activeTabId);
 

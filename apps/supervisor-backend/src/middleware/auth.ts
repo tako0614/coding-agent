@@ -15,12 +15,23 @@ import { logger } from '../services/logger.js';
 // Configuration
 // =============================================================================
 
-/** JWT secret key - MUST be set in production */
-const JWT_SECRET = process.env['JWT_SECRET'] || (
-  process.env['NODE_ENV'] === 'production'
-    ? (() => { throw new Error('JWT_SECRET must be set in production'); })()
-    : 'dev-secret-key-change-in-production'
-);
+/** JWT secret key - MUST be set via environment variable */
+function getJWTSecret(): string {
+  const secret = process.env['JWT_SECRET'];
+  if (!secret) {
+    if (process.env['NODE_ENV'] === 'production') {
+      throw new Error('JWT_SECRET environment variable is required in production');
+    }
+    logger.warn('JWT_SECRET not set - using insecure default. Set JWT_SECRET in production!');
+    return 'dev-secret-key-DO-NOT-USE-IN-PRODUCTION';
+  }
+  if (secret.length < 32) {
+    logger.warn('JWT_SECRET should be at least 32 characters for security');
+  }
+  return secret;
+}
+
+const JWT_SECRET = getJWTSecret();
 
 /** Token expiration time in seconds (default: 24 hours) */
 const TOKEN_EXPIRY_SECONDS = parseInt(process.env['JWT_EXPIRY_SECONDS'] ?? '86400', 10);
@@ -130,6 +141,22 @@ export function generateToken(userId: string, scope: string[] = []): string {
 }
 
 /**
+ * Type guard to validate JWT payload structure
+ */
+function isValidJWTPayload(obj: unknown): obj is JWTPayload {
+  if (typeof obj !== 'object' || obj === null) {
+    return false;
+  }
+  const payload = obj as Record<string, unknown>;
+  return (
+    typeof payload['sub'] === 'string' &&
+    typeof payload['iat'] === 'number' &&
+    typeof payload['exp'] === 'number' &&
+    (payload['scope'] === undefined || Array.isArray(payload['scope']))
+  );
+}
+
+/**
  * Verify and decode a JWT token
  */
 export function verifyToken(token: string): JWTPayload | null {
@@ -139,29 +166,42 @@ export function verifyToken(token: string): JWTPayload | null {
       return null;
     }
 
-    const [headerB64, payloadB64, signature] = parts;
+    // Use explicit array indexing to avoid non-null assertions
+    const headerB64 = parts[0];
+    const payloadB64 = parts[1];
+    const signature = parts[2];
+
+    // TypeScript now knows these are defined due to length check
+    if (!headerB64 || !payloadB64 || !signature) {
+      return null;
+    }
 
     // Verify signature
     const expectedSignature = createSignature(`${headerB64}.${payloadB64}`);
     if (!crypto.timingSafeEqual(
-      Buffer.from(signature!, 'utf-8'),
+      Buffer.from(signature, 'utf-8'),
       Buffer.from(expectedSignature, 'utf-8')
     )) {
       logger.warn('JWT signature verification failed');
       return null;
     }
 
-    // Decode payload
-    const payload = JSON.parse(base64UrlDecode(payloadB64!)) as JWTPayload;
+    // Decode and validate payload structure
+    const decodedPayload: unknown = JSON.parse(base64UrlDecode(payloadB64));
 
-    // Check expiration
-    const now = Math.floor(Date.now() / 1000);
-    if (payload.exp < now) {
-      logger.debug('JWT token expired', { exp: payload.exp, now });
+    if (!isValidJWTPayload(decodedPayload)) {
+      logger.warn('JWT payload has invalid structure');
       return null;
     }
 
-    return payload;
+    // Check expiration
+    const now = Math.floor(Date.now() / 1000);
+    if (decodedPayload.exp < now) {
+      logger.debug('JWT token expired', { exp: decodedPayload.exp, now });
+      return null;
+    }
+
+    return decodedPayload;
   } catch (error) {
     logger.warn('JWT verification error', {
       error: error instanceof Error ? error.message : String(error),
@@ -205,15 +245,54 @@ function extractToken(authHeader: string | undefined): { type: 'bearer' | 'apike
     return null;
   }
 
-  const [scheme, value] = parts;
-  const schemeLower = scheme!.toLowerCase();
+  // Use explicit indexing to avoid non-null assertions
+  const scheme = parts[0];
+  const value = parts[1];
+
+  if (!scheme || !value) {
+    return null;
+  }
+
+  const schemeLower = scheme.toLowerCase();
 
   if (schemeLower === 'bearer') {
-    return { type: 'bearer', value: value! };
+    return { type: 'bearer', value };
   }
 
   if (schemeLower === 'apikey') {
-    return { type: 'apikey', value: value! };
+    return { type: 'apikey', value };
+  }
+
+  return null;
+}
+
+/**
+ * Extract token from query parameter (token)
+ * Supports: JWT or API key
+ *
+ * WARNING: Query parameter tokens are logged in server access logs and browser history.
+ * This method is deprecated for HTTP requests. Use Authorization header instead.
+ * Only use for WebSocket connections where headers cannot be set.
+ */
+function extractTokenFromQuery(tokenValue: string | undefined, isWebSocket = false): { type: 'bearer' | 'apikey'; value: string } | null {
+  if (!tokenValue) {
+    return null;
+  }
+
+  // Warn about query parameter token usage (except for WebSocket which may require it)
+  if (!isWebSocket) {
+    logger.warn('Token passed via query parameter - use Authorization header for better security');
+  }
+
+  // Prefer JWT if valid
+  const payload = verifyToken(tokenValue);
+  if (payload) {
+    return { type: 'bearer', value: tokenValue };
+  }
+
+  // Fall back to API key if configured
+  if (API_KEY) {
+    return { type: 'apikey', value: tokenValue };
   }
 
   return null;
@@ -256,7 +335,7 @@ export const authMiddleware = createMiddleware<{
   }
 
   const authHeader = c.req.header('Authorization');
-  const tokenInfo = extractToken(authHeader);
+  const tokenInfo = extractToken(authHeader) ?? extractTokenFromQuery(c.req.query('token'), false);
 
   if (!tokenInfo) {
     logger.debug('Missing or invalid Authorization header', { path });
@@ -357,6 +436,46 @@ export function requireScope(...requiredScopes: string[]) {
 }
 
 /**
+ * Validate API key with timing-safe comparison
+ */
+function validateApiKey(providedKey: string): boolean {
+  if (!API_KEY) return false;
+
+  const keyBuffer = Buffer.from(providedKey);
+  const expectedBuffer = Buffer.from(API_KEY);
+
+  if (keyBuffer.length !== expectedBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(keyBuffer, expectedBuffer);
+}
+
+/**
+ * Authenticate using token info and return AuthContext if valid
+ */
+function authenticateWithToken(tokenInfo: { type: 'bearer' | 'apikey'; value: string }): AuthContext | null {
+  if (tokenInfo.type === 'bearer') {
+    const payload = verifyToken(tokenInfo.value);
+    if (payload) {
+      return {
+        user: { id: payload.sub, scope: payload.scope || [] },
+        token: tokenInfo.value,
+      };
+    }
+  }
+
+  if (tokenInfo.type === 'apikey' && validateApiKey(tokenInfo.value)) {
+    return {
+      user: { id: 'api-key-user', scope: ['*'] },
+      token: tokenInfo.value,
+    };
+  }
+
+  return null;
+}
+
+/**
  * WebSocket authentication helper
  *
  * Usage:
@@ -374,19 +493,16 @@ export function authenticateWebSocket(
     };
   }
 
-  // Try to get token from query string
+  // Try to get token from query string (WebSocket may require query param auth)
   if (request.url) {
     try {
       const url = new URL(request.url, 'http://localhost');
-      const token = url.searchParams.get('token');
-      if (token) {
-        const payload = verifyToken(token);
-        if (payload) {
-          return {
-            user: { id: payload.sub, scope: payload.scope || [] },
-            token,
-          };
-        }
+      const tokenValue = url.searchParams.get('token');
+      const tokenInfo = extractTokenFromQuery(tokenValue ?? undefined, true);
+
+      if (tokenInfo) {
+        const auth = authenticateWithToken(tokenInfo);
+        if (auth) return auth;
       }
     } catch {
       // Ignore URL parsing errors
@@ -397,27 +513,9 @@ export function authenticateWebSocket(
   const authHeader = request.headers?.get('Authorization');
   const tokenInfo = extractToken(authHeader ?? undefined);
 
-  if (tokenInfo?.type === 'bearer') {
-    const payload = verifyToken(tokenInfo.value);
-    if (payload) {
-      return {
-        user: { id: payload.sub, scope: payload.scope || [] },
-        token: tokenInfo.value,
-      };
-    }
-  }
-
-  if (tokenInfo?.type === 'apikey' && API_KEY) {
-    const keyBuffer = Buffer.from(tokenInfo.value);
-    const expectedBuffer = Buffer.from(API_KEY);
-
-    if (keyBuffer.length === expectedBuffer.length &&
-        crypto.timingSafeEqual(keyBuffer, expectedBuffer)) {
-      return {
-        user: { id: 'api-key-user', scope: ['*'] },
-        token: tokenInfo.value,
-      };
-    }
+  if (tokenInfo) {
+    const auth = authenticateWithToken(tokenInfo);
+    if (auth) return auth;
   }
 
   return null;

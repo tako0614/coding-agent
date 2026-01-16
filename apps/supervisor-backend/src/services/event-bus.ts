@@ -304,7 +304,6 @@ class EventBus extends EventEmitter {
 
     // Persist to database first to get ID
     try {
-      console.log('[DEBUG] addLog: Inserting log entry', { runId: entry.runId, source: entry.source, message: entry.message.slice(0, 50) });
       const result = getInsertLogStmt().run({
         run_id: entry.runId,
         timestamp: entry.timestamp,
@@ -315,15 +314,8 @@ class EventBus extends EventEmitter {
       });
       logId = Number(result.lastInsertRowid);
       entry.id = logId;
-      console.log('[DEBUG] addLog: Log entry inserted successfully', { runId: entry.runId, logId });
-
-      // Verify the log was actually saved
-      const verifyStmt = db.prepare('SELECT COUNT(*) as count FROM run_logs WHERE id = ?');
-      const verifyResult = verifyStmt.get(logId) as { count: number };
-      console.log('[DEBUG] addLog: Verify after insert', { logId, exists: verifyResult.count > 0 });
     } catch (err) {
-      console.error('[DEBUG] addLog: FAILED to insert log entry', { runId: entry.runId, error: err instanceof Error ? err.message : String(err) });
-      logger.error('Failed to persist log to DB', { error: err instanceof Error ? err.message : String(err) });
+      logger.error('Failed to persist log to DB', { runId: entry.runId, error: err instanceof Error ? err.message : String(err) });
     }
 
     // Buffer logs per run (for real-time streaming)

@@ -28,6 +28,8 @@ import { detectInterruptedRuns, stopAllCheckpointManagers } from './services/che
 import { logger } from './services/logger.js';
 import { validateRepoPath, PathSecurityError } from './services/path-sandbox.js';
 import { runStore } from './api/run-store.js';
+import { authMiddleware, authenticateWebSocket } from './middleware/auth.js';
+import { createErrorResponse, errorResponses, errorTypeToStatus } from './middleware/error-response.js';
 import * as fs from 'fs';
 import * as pathModule from 'path';
 import { fileURLToPath } from 'url';
@@ -78,12 +80,13 @@ app.use('*', async (c, next) => {
   if (contentLength) {
     const size = parseInt(contentLength, 10);
     if (!Number.isNaN(size) && size > MAX_REQUEST_SIZE_BYTES) {
-      return c.json({
-        error: {
-          message: `Request too large. Maximum size is ${MAX_REQUEST_SIZE_BYTES / 1024 / 1024}MB`,
-          type: 'payload_too_large',
-        },
-      }, 413);
+      return c.json(
+        createErrorResponse(
+          `Request too large. Maximum size is ${MAX_REQUEST_SIZE_BYTES / 1024 / 1024}MB`,
+          'payload_too_large'
+        ),
+        413
+      );
     }
   }
   return next();
@@ -112,6 +115,8 @@ app.use('*', cors({
   credentials: true,
 }));
 app.use('*', honoLogger());
+app.use('/api/*', authMiddleware);
+app.use('/v1/*', authMiddleware);
 
 // MIME types for static files
 const MIME_TYPES: Record<string, string> = {
@@ -133,7 +138,8 @@ const MIME_TYPES: Record<string, string> = {
 };
 
 // Static file cache - avoids repeated disk reads for frequently accessed files
-const STATIC_FILE_CACHE_MAX_SIZE = parseInt(process.env['STATIC_FILE_CACHE_MAX_SIZE'] ?? String(50 * 1024 * 1024), 10); // 50MB default
+const STATIC_FILE_CACHE_MAX_SIZE = Math.max(1024 * 1024, parseInt(process.env['STATIC_FILE_CACHE_MAX_SIZE'] ?? String(50 * 1024 * 1024), 10) || 50 * 1024 * 1024); // 50MB default, min 1MB
+const STATIC_FILE_CACHE_MAX_FILES = Math.max(10, parseInt(process.env['STATIC_FILE_CACHE_MAX_FILES'] ?? '500', 10) || 500); // Max 500 files default
 const staticFileCache = new Map<string, { content: Buffer; mimeType: string; mtime: number }>();
 let staticFileCacheSize = 0;
 
@@ -163,8 +169,11 @@ function getCachedStaticFile(filePath: string): { content: Buffer; mimeType: str
         staticFileCacheSize -= cached.content.length;
       }
 
-      // Evict oldest entries if over limit (LRU via Map insertion order)
-      while (staticFileCacheSize + content.length > STATIC_FILE_CACHE_MAX_SIZE && staticFileCache.size > 0) {
+      // Evict oldest entries if over size or file count limit (LRU via Map insertion order)
+      while (
+        (staticFileCacheSize + content.length > STATIC_FILE_CACHE_MAX_SIZE || staticFileCache.size >= STATIC_FILE_CACHE_MAX_FILES) &&
+        staticFileCache.size > 0
+      ) {
         const firstKey = staticFileCache.keys().next().value;
         if (firstKey) {
           const entry = staticFileCache.get(firstKey);
@@ -291,7 +300,16 @@ app.get('/usage', async (c) => {
 app.get('/api/events', (c) => {
   const runId = c.req.query('run_id');
   const lastEventIdHeader = c.req.header('Last-Event-ID');
-  const lastEventId = lastEventIdHeader ? parseInt(lastEventIdHeader, 10) : undefined;
+
+  // Validate Last-Event-ID format (must be numeric only)
+  let lastEventId: number | undefined;
+  if (lastEventIdHeader) {
+    if (/^\d+$/.test(lastEventIdHeader)) {
+      lastEventId = parseInt(lastEventIdHeader, 10);
+    } else {
+      logger.debug('Invalid Last-Event-ID format, ignoring', { lastEventIdHeader });
+    }
+  }
 
   c.header('Content-Type', 'text/event-stream');
   c.header('Cache-Control', 'no-cache');
@@ -498,12 +516,10 @@ app.put('/api/sessions/shell-tabs', async (c) => {
 // Error handling
 app.onError((err, c) => {
   logger.error('Server error', { error: err.message });
-  return c.json({
-    error: {
-      message: err.message,
-      type: 'internal_error',
-    },
-  }, 500);
+  return c.json(
+    createErrorResponse(err.message, 'internal_error'),
+    500
+  );
 });
 
 // Not found - serve index.html for SPA routes
@@ -513,12 +529,10 @@ app.notFound(async (c) => {
   // API endpoints return JSON 404
   if (path.startsWith('/api/') || path.startsWith('/v1/')) {
     logger.debug('API 404', { path });
-    return c.json({
-      error: {
-        message: `Not found: ${path}`,
-        type: 'not_found',
-      },
-    }, 404);
+    return c.json(
+      createErrorResponse(`Not found: ${path}`, 'not_found'),
+      404
+    );
   }
 
   // SPA fallback: serve index.html for frontend routes (with caching)
@@ -528,12 +542,10 @@ app.notFound(async (c) => {
     return c.html(cachedIndex.content.toString('utf-8'));
   }
 
-  return c.json({
-    error: {
-      message: `Not found: ${path}`,
-      type: 'not_found',
-    },
-  }, 404);
+  return c.json(
+    createErrorResponse(`Not found: ${path}`, 'not_found'),
+    404
+  );
 });
 
 // Start server
@@ -554,8 +566,11 @@ const server = serve({
 const wss = new WebSocketServer({ noServer: true });
 
 // WebSocket connection limits (configurable via environment)
-const MAX_WEBSOCKET_CONNECTIONS = parseInt(process.env['MAX_WEBSOCKET_CONNECTIONS'] ?? '100', 10);
-const MAX_WEBSOCKET_CONNECTIONS_PER_IP = parseInt(process.env['MAX_WEBSOCKET_CONNECTIONS_PER_IP'] ?? '10', 10);
+const MAX_WEBSOCKET_CONNECTIONS = Math.max(1, parseInt(process.env['MAX_WEBSOCKET_CONNECTIONS'] ?? '100', 10) || 100);
+const MAX_WEBSOCKET_CONNECTIONS_PER_IP = Math.min(
+  MAX_WEBSOCKET_CONNECTIONS,
+  Math.max(1, parseInt(process.env['MAX_WEBSOCKET_CONNECTIONS_PER_IP'] ?? '10', 10) || 10)
+);
 
 // Track connections per IP for rate limiting
 const wsConnectionsPerIp = new Map<string, number>();
@@ -621,8 +636,25 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
   const url = new URL(req.url || '', `http://localhost:${port}`);
   const sessionId = url.searchParams.get('sessionId') || undefined;
   const rawCwd = url.searchParams.get('cwd') || undefined;
-  const cols = parseInt(url.searchParams.get('cols') || '80', 10);
-  const rows = parseInt(url.searchParams.get('rows') || '24', 10);
+
+  // Parse and validate terminal dimensions with sensible bounds
+  const MIN_COLS = 20;
+  const MAX_COLS = 500;
+  const MIN_ROWS = 5;
+  const MAX_ROWS = 200;
+
+  let cols = parseInt(url.searchParams.get('cols') || '80', 10);
+  let rows = parseInt(url.searchParams.get('rows') || '24', 10);
+
+  // Validate bounds
+  if (isNaN(cols) || cols < MIN_COLS || cols > MAX_COLS) {
+    logger.warn('Invalid terminal cols, using default', { provided: url.searchParams.get('cols'), default: 80 });
+    cols = 80;
+  }
+  if (isNaN(rows) || rows < MIN_ROWS || rows > MAX_ROWS) {
+    logger.warn('Invalid terminal rows, using default', { provided: url.searchParams.get('rows'), default: 24 });
+    rows = 24;
+  }
 
   // If sessionId is provided, try to reconnect to existing session
   if (sessionId) {
@@ -657,6 +689,23 @@ server.on('upgrade', (request: IncomingMessage, socket, head) => {
   const url = new URL(request.url || '', `http://localhost:${port}`);
 
   if (url.pathname === '/api/terminal') {
+    const auth = authenticateWebSocket({
+      url: request.url,
+      headers: {
+        get: (name: string) => {
+          const headerValue = request.headers[name.toLowerCase()];
+          if (Array.isArray(headerValue)) {
+            return headerValue.join(', ');
+          }
+          return headerValue ?? null;
+        },
+      },
+    });
+    if (!auth) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit('connection', ws, request);
     });
@@ -724,7 +773,15 @@ async function gracefulShutdown(signal: string): Promise<void> {
     logger.error('Failed to close WebSocket server', { error: err instanceof Error ? err.message : String(err) });
   }
 
-  // Step 3: Stop checkpoint managers
+  // Step 3: Stop EventBus periodic cleanup
+  try {
+    eventBus.stopPeriodicCleanup();
+    logger.info('EventBus cleanup timer stopped');
+  } catch (err) {
+    logger.error('Failed to stop EventBus cleanup', { error: err instanceof Error ? err.message : String(err) });
+  }
+
+  // Step 4: Stop checkpoint managers
   try {
     stopAllCheckpointManagers();
     logger.info('Checkpoint managers stopped');
@@ -732,7 +789,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
     logger.error('Failed to stop checkpoint managers', { error: err instanceof Error ? err.message : String(err) });
   }
 
-  // Step 4: Clean up PTY sessions
+  // Step 5: Clean up PTY sessions
   try {
     ptyService.cleanup();
     logger.info('PTY service cleaned up');
@@ -740,7 +797,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
     logger.error('Failed to cleanup PTY service', { error: err instanceof Error ? err.message : String(err) });
   }
 
-  // Step 5: Shutdown copilot API manager
+  // Step 6: Shutdown copilot API manager
   try {
     await copilotAPIManager.shutdown();
     logger.info('Copilot API manager shutdown');
@@ -748,7 +805,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
     logger.error('Failed to shutdown copilot API manager', { error: err instanceof Error ? err.message : String(err) });
   }
 
-  // Step 6: Close database connection
+  // Step 7: Close database connection
   try {
     db.close();
     logger.info('Database connection closed');

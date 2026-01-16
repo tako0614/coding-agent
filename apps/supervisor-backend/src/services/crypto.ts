@@ -24,15 +24,37 @@ const IV_LENGTH = 12;
 /** Auth tag length in bytes */
 const AUTH_TAG_LENGTH = 16;
 
-/** Encryption key derivation salt (can be static for deterministic key derivation) */
-const KEY_DERIVATION_SALT = process.env['ENCRYPTION_SALT'] || 'supervisor-agent-salt-v1';
+/** Encryption key derivation salt */
+function getEncryptionSalt(): string {
+  const salt = process.env['ENCRYPTION_SALT'];
+  if (!salt) {
+    if (process.env['NODE_ENV'] === 'production') {
+      logger.warn('ENCRYPTION_SALT not set in production - using default salt');
+    }
+    return 'supervisor-agent-salt-v1';
+  }
+  return salt;
+}
+
+const KEY_DERIVATION_SALT = getEncryptionSalt();
 
 /** Master password/key for encryption */
-const MASTER_KEY = process.env['ENCRYPTION_KEY'] || process.env['JWT_SECRET'] || (
-  process.env['NODE_ENV'] === 'production'
-    ? (() => { throw new Error('ENCRYPTION_KEY must be set in production'); })()
-    : 'dev-encryption-key-change-in-production'
-);
+function getEncryptionKey(): string {
+  const key = process.env['ENCRYPTION_KEY'] || process.env['JWT_SECRET'];
+  if (!key) {
+    if (process.env['NODE_ENV'] === 'production') {
+      throw new Error('ENCRYPTION_KEY or JWT_SECRET must be set in production');
+    }
+    logger.warn('ENCRYPTION_KEY not set - using insecure default. Set ENCRYPTION_KEY in production!');
+    return 'dev-encryption-key-DO-NOT-USE-IN-PRODUCTION';
+  }
+  if (key.length < 32) {
+    logger.warn('ENCRYPTION_KEY should be at least 32 characters for security');
+  }
+  return key;
+}
+
+const MASTER_KEY = getEncryptionKey();
 
 // =============================================================================
 // Key Management
