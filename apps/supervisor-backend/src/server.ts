@@ -132,6 +132,57 @@ const MIME_TYPES: Record<string, string> = {
   '.eot': 'application/vnd.ms-fontobject',
 };
 
+// Static file cache - avoids repeated disk reads for frequently accessed files
+const STATIC_FILE_CACHE_MAX_SIZE = parseInt(process.env['STATIC_FILE_CACHE_MAX_SIZE'] ?? String(50 * 1024 * 1024), 10); // 50MB default
+const staticFileCache = new Map<string, { content: Buffer; mimeType: string; mtime: number }>();
+let staticFileCacheSize = 0;
+
+/** Get cached static file or read from disk */
+function getCachedStaticFile(filePath: string): { content: Buffer; mimeType: string } | null {
+  try {
+    const stats = fs.statSync(filePath);
+    if (!stats.isFile()) return null;
+
+    const cached = staticFileCache.get(filePath);
+    const mtime = stats.mtimeMs;
+
+    // Return cached if valid and not modified
+    if (cached && cached.mtime === mtime) {
+      return { content: cached.content, mimeType: cached.mimeType };
+    }
+
+    // Read file
+    const content = fs.readFileSync(filePath);
+    const ext = pathModule.extname(filePath).toLowerCase();
+    const mimeType = MIME_TYPES[ext] || 'application/octet-stream';
+
+    // Cache if within size limit (evict old entries if needed)
+    if (content.length < STATIC_FILE_CACHE_MAX_SIZE / 10) { // Max 10% of cache per file
+      // Remove old entry size if updating
+      if (cached) {
+        staticFileCacheSize -= cached.content.length;
+      }
+
+      // Evict oldest entries if over limit (LRU via Map insertion order)
+      while (staticFileCacheSize + content.length > STATIC_FILE_CACHE_MAX_SIZE && staticFileCache.size > 0) {
+        const firstKey = staticFileCache.keys().next().value;
+        if (firstKey) {
+          const entry = staticFileCache.get(firstKey);
+          if (entry) staticFileCacheSize -= entry.content.length;
+          staticFileCache.delete(firstKey);
+        }
+      }
+
+      staticFileCache.set(filePath, { content, mimeType, mtime });
+      staticFileCacheSize += content.length;
+    }
+
+    return { content, mimeType };
+  } catch {
+    return null;
+  }
+}
+
 // Serve static files for WebUI - synchronous setup
 // Built frontend is placed in public/ui by vite build
 if (!isPackaged) {
@@ -144,24 +195,18 @@ if (!isPackaged) {
       return next();
     }
 
-    // Try to serve static file
+    // Try to serve static file (with caching)
     const filePath = pathModule.join(publicUiPath, urlPath === '/' ? '/index.html' : urlPath);
+    const cached = getCachedStaticFile(filePath);
 
-    try {
-      if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-        const ext = pathModule.extname(filePath).toLowerCase();
-        const mimeType = MIME_TYPES[ext] || 'application/octet-stream';
-        const content = fs.readFileSync(filePath);
-
-        return new Response(content, {
-          headers: {
-            'Content-Type': mimeType,
-            'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=31536000',
-          },
-        });
-      }
-    } catch {
-      // Fall through to next handler
+    if (cached) {
+      const ext = pathModule.extname(filePath).toLowerCase();
+      return new Response(cached.content, {
+        headers: {
+          'Content-Type': cached.mimeType,
+          'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=31536000',
+        },
+      });
     }
 
     return next();
@@ -476,17 +521,11 @@ app.notFound(async (c) => {
     }, 404);
   }
 
-  // SPA fallback: serve index.html for frontend routes
-  try {
-    const indexPath = pathModule.join(publicUiPath, 'index.html');
-    if (fs.existsSync(indexPath)) {
-      const html = fs.readFileSync(indexPath, 'utf-8');
-      return c.html(html);
-    } else {
-      logger.debug('SPA fallback failed: index.html not found', { indexPath });
-    }
-  } catch (err) {
-    logger.debug('SPA fallback error', { error: err instanceof Error ? err.message : String(err) });
+  // SPA fallback: serve index.html for frontend routes (with caching)
+  const indexPath = pathModule.join(publicUiPath, 'index.html');
+  const cachedIndex = getCachedStaticFile(indexPath);
+  if (cachedIndex) {
+    return c.html(cachedIndex.content.toString('utf-8'));
   }
 
   return c.json({

@@ -245,6 +245,11 @@ export const ALL_TOOLS: MCPTool[] = [
   listAgentsTool,
 ];
 
+/** Pre-built Map for O(1) tool lookup by name */
+const TOOL_BY_NAME: Map<string, MCPTool> = new Map(
+  ALL_TOOLS.map(tool => [tool.name, tool])
+);
+
 export function getToolByName(name: string): MCPTool | undefined {
-  return ALL_TOOLS.find(tool => tool.name === name);
+  return TOOL_BY_NAME.get(name);
 }

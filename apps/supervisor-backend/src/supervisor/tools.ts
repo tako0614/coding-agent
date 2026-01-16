@@ -311,10 +311,11 @@ function validateCommand(command: string): { valid: boolean; error?: string; war
     }
   }
 
-  // Check for interactive commands
+  // Check for interactive commands (use exec() once instead of test() then match())
   for (const pattern of INTERACTIVE_PATTERNS) {
-    if (pattern.test(command)) {
-      warnings.push(`Command may require interactive input: ${command.match(pattern)?.[0]}`);
+    const match = pattern.exec(command);
+    if (match) {
+      warnings.push(`Command may require interactive input: ${match[0]}`);
       logger.warn('Command may require interactive input', { command: command.slice(0, 50) });
     }
   }

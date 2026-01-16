@@ -8,12 +8,33 @@ import { startHTTPServer } from './http-server.js';
 
 const args = process.argv.slice(2);
 
-const mode = args.includes('--http') ? 'http' : 'stdio';
-const port = parseInt(args.find(a => a.startsWith('--port='))?.split('=')[1] ?? '3001', 10);
-const supervisorUrl = args.find(a => a.startsWith('--supervisor='))?.split('=')[1] ?? 'http://localhost:3000';
-const accessToken = args.find(a => a.startsWith('--token='))?.split('=')[1];
+// Single-pass argument parsing for O(n) instead of O(n*m)
+let isHttpMode = false;
+let portValue = '3001';
+let supervisorValue = 'http://localhost:3000';
+let tokenValue: string | undefined;
+let showHelp = false;
 
-if (args.includes('--help') || args.includes('-h')) {
+for (const arg of args) {
+  if (arg === '--http') {
+    isHttpMode = true;
+  } else if (arg === '--help' || arg === '-h') {
+    showHelp = true;
+  } else if (arg.startsWith('--port=')) {
+    portValue = arg.slice(7);
+  } else if (arg.startsWith('--supervisor=')) {
+    supervisorValue = arg.slice(13);
+  } else if (arg.startsWith('--token=')) {
+    tokenValue = arg.slice(8);
+  }
+}
+
+const mode = isHttpMode ? 'http' : 'stdio';
+const port = parseInt(portValue, 10);
+const supervisorUrl = supervisorValue;
+const accessToken = tokenValue;
+
+if (showHelp) {
   console.log(`
 Supervisor MCP Server
 

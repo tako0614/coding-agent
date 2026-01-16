@@ -295,7 +295,11 @@ function executeComplete(input: Record<string, unknown>): ToolResult {
 
   let output = `Specification complete: ${summary}`;
   if (filesCreated && filesCreated.length > 0) {
-    output += `\n\nFiles created/modified:\n${filesCreated.map(f => `- ${f}`).join('\n')}`;
+    // Build string directly instead of map().join() to avoid intermediate array
+    output += '\n\nFiles created/modified:';
+    for (const f of filesCreated) {
+      output += `\n- ${f}`;
+    }
   }
 
   return { success: true, output };

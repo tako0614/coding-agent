@@ -177,7 +177,8 @@ export class ClaudeAdapter {
     const startTime = new Date();
 
     const prompt = this.buildPrompt(order);
-    const filesModified: string[] = [];
+    /** Use Set for O(1) duplicate check */
+    const filesModifiedSet = new Set<string>();
     const commandsRun: Array<{ command: string; exitCode: number; output: string }> = [];
     let sessionId: string | undefined;
     let finalResult: string | undefined;
@@ -266,8 +267,8 @@ export class ClaudeAdapter {
 
               if ((toolName === 'Edit' || toolName === 'Write') && toolInput) {
                 const filePath = getProp<string>(toolInput, 'file_path');
-                if (filePath && !filesModified.includes(filePath)) {
-                  filesModified.push(filePath);
+                if (filePath) {
+                  filesModifiedSet.add(filePath);  // O(1) - Set ignores duplicates
                 }
               }
 
@@ -324,6 +325,7 @@ export class ClaudeAdapter {
 
           // Determine status
           const status: WorkReport['status'] = hasError ? 'failed' : 'done';
+          const filesModified = Array.from(filesModifiedSet);
 
           return {
             report_id: createWorkReportId(),
@@ -402,7 +404,8 @@ export class ClaudeAdapter {
     options: ClaudeExecutionOptions
   ): AsyncGenerator<ClaudeAgentMessage, ClaudeExecutionResult> {
     const prompt = this.buildPrompt(order);
-    const filesModified: string[] = [];
+    /** Use Set for O(1) duplicate check */
+    const filesModifiedSet = new Set<string>();
     const commandsRun: Array<{ command: string; exitCode: number; output: string }> = [];
     let sessionId: string | undefined;
     let finalResult: string | undefined;
@@ -441,8 +444,8 @@ export class ClaudeAdapter {
 
           if ((toolName === 'Edit' || toolName === 'Write') && toolInput) {
             const filePath = getProp<string>(toolInput, 'file_path');
-            if (filePath && !filesModified.includes(filePath)) {
-              filesModified.push(filePath);
+            if (filePath) {
+              filesModifiedSet.add(filePath);  // O(1) - Set ignores duplicates
             }
           }
 
@@ -476,14 +479,14 @@ export class ClaudeAdapter {
         success: !hasError,
         result: finalResult,
         sessionId,
-        filesModified,
+        filesModified: Array.from(filesModifiedSet),
         commandsRun,
         error: errorMessage,
       };
     } catch (error) {
       return {
         success: false,
-        filesModified,
+        filesModified: Array.from(filesModifiedSet),
         commandsRun,
         error: error instanceof Error ? error.message : String(error),
       };
